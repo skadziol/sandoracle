@@ -1,0 +1,193 @@
+# Overview
+SandoSeer is an autonomous MEV (Maximal Extractable Value) detection and execution system for the Solana blockchain. It leverages AI-powered decision making through the `rig` framework and real-time transaction monitoring via the `listen` engine to identify and capitalize on MEV opportunities including sandwich trading, arbitrage, and token sniping.
+
+The system solves the challenge of efficiently identifying and executing profitable MEV opportunities on Solana by combining real-time transaction monitoring with AI-driven decision making. It's designed for traders and DeFi participants who want to automate MEV extraction while managing risks effectively.
+
+# Core Features
+
+## Listen Bot
+- Real-time transaction monitoring from major Solana DEXes
+- Extracts and parses swap transactions, token pairs, and pool data
+- Sub-500ms latency for transaction processing
+- Automatic connection management and error recovery
+- Configurable filters for transaction types and sizes
+
+## RIG Agent
+- AI-powered opportunity evaluation using market data and transaction patterns
+- Generates opportunity scores with confidence ratings (0-1 scale)
+- Adapts to changing market conditions through continuous learning
+- Provides explainable decision reasoning
+- Fallback to rule-based decisions when needed
+
+## Opportunity Evaluator
+- Multi-factor MEV scoring system
+- Risk assessment and profitability estimation
+- Strategy-specific scoring algorithms
+- Configurable execution thresholds
+- Real-time go/no-go decision making
+
+## Transaction Executor
+- Supports multiple MEV strategies (sandwich, arbitrage, sniping)
+- Transaction simulation before execution
+- Gas optimization and priority fee management
+- Detailed execution tracking and confirmation
+- Simulation mode for testing
+
+## Monitoring System
+- Comprehensive trade logging
+- Real-time Telegram notifications
+- Performance metrics tracking
+- System health monitoring
+- Model feedback collection
+
+# User Experience
+
+## Primary Users
+- MEV traders and arbitrage bots
+- DeFi protocol operators
+- Automated trading systems
+
+## Key User Flows
+1. System Configuration
+   - Set up API keys and wallet connections
+   - Configure risk parameters and strategy preferences
+   - Set notification preferences
+
+2. Operation Monitoring
+   - View real-time opportunity detection
+   - Monitor trade execution and results
+   - Track performance metrics
+   - Receive alerts and notifications
+
+3. Strategy Management
+   - Enable/disable specific MEV strategies
+   - Adjust risk parameters
+   - Configure token pairs and DEXes
+   - Set profit thresholds
+
+# Technical Architecture
+
+## System Components
+```
+src/
+├── config.rs            # Configuration
+├── error.rs            # Error handling
+├── evaluator/          # Opportunity evaluation
+├── listen_bot/         # Transaction monitoring
+├── rig_agent/         # AI decision making
+├── monitoring/        # Logging and notifications
+└── main.rs            # Entry point
+```
+
+## External Dependencies
+- listen-engine: Transaction monitoring framework
+- rig: AI decision-making framework
+- Solana SDK and RPC Client
+- Tokio async runtime
+- External APIs (DEX, Telegram)
+
+# Development Roadmap
+
+## Phase 1: MVP Foundation
+1. Project Setup
+   - Repository initialization
+   - Dependency configuration
+   - Basic project structure
+
+2. Listen Bot Core
+   - RPC connection setup
+   - Basic transaction streaming
+   - Transaction parsing
+
+3. Basic Decision Making
+   - Simple opportunity detection
+   - Initial scoring system
+   - Basic risk checks
+
+4. Transaction Execution
+   - Wallet integration
+   - Simple trade execution
+   - Transaction simulation
+
+5. Essential Monitoring
+   - Basic logging
+   - Simple notifications
+   - Error tracking
+
+## Phase 2: Enhanced Features
+1. Advanced AI Integration
+   - RIG agent implementation
+   - Market data integration
+   - Sentiment analysis
+
+2. Strategy Expansion
+   - Multiple MEV strategies
+   - Advanced risk management
+   - Performance optimization
+
+3. Monitoring Improvements
+   - Telegram integration
+   - Detailed analytics
+   - Advanced alerting
+
+## Phase 3: Production Optimization
+1. Performance Enhancements
+   - Latency optimization
+   - Parallel processing
+   - Connection management
+
+2. Advanced Features
+   - Strategy automation
+   - Dynamic risk adjustment
+   - Self-improvement system
+
+# Logical Dependency Chain
+
+1. Foundation Layer
+   - Basic project setup
+   - RPC connectivity
+   - Transaction monitoring
+
+2. Core Systems
+   - Transaction parsing
+   - Opportunity detection
+   - Basic execution
+
+3. Strategy Layer
+   - MEV implementations
+   - Risk management
+   - Performance tracking
+
+4. Enhancement Layer
+   - AI integration
+   - Advanced features
+   - Optimization
+
+# Risks and Mitigations
+
+## Technical Risks
+- RPC failures: Implement connection pooling and failover
+- High latency: Optimize critical paths and use parallel processing
+- Transaction failures: Comprehensive simulation and validation
+- Smart contract risks: Thorough testing and gradual deployment
+
+## Operational Risks
+- Market volatility: Dynamic risk adjustment and position sizing
+- MEV competition: Strategy adaptation and unique opportunity focus
+- Resource constraints: Efficient processing and selective execution
+- System reliability: Robust error handling and recovery mechanisms
+
+# Appendix
+
+## Performance Requirements
+- Transaction processing: <500ms
+- Trade execution: <2s
+- System uptime: 99.9%
+- Successful trade rate: >90%
+
+## Technical Specifications
+- Language: Rust
+- Runtime: Tokio
+- Blockchain: Solana
+- AI Framework: RIG
+- Monitoring: Custom + Telegram 

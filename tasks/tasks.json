@@ -1,0 +1,235 @@
+{
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Project Setup and Repository Initialization",
+      "description": "Initialize the project repository with necessary dependencies, configuration files, and basic project structure.",
+      "status": "done",
+      "dependencies": [],
+      "priority": "high",
+      "details": "Create a new Rust project with Cargo. Set up the project structure as outlined in the Technical Architecture section. Initialize Git repository. Configure Cargo.toml with all required dependencies including Solana SDK, RPC Client, Tokio async runtime, listen-engine, and rig framework. Create basic configuration files for environment variables. Implement error handling module (error.rs) with custom error types for different system components.",
+      "testStrategy": "Verify that the project builds successfully with cargo build. Ensure all dependencies resolve correctly. Check that the directory structure matches the specified architecture.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Initialize Rust Project with Git Repository and Core Dependencies",
+          "description": "Create a new Rust project using Cargo, set up Git version control, and configure essential dependencies in Cargo.toml including Solana SDK and RPC Client.",
+          "dependencies": [],
+          "details": "1. Create a new Rust project using `cargo new project_name --lib` command\n2. Initialize Git repository with `git init`\n3. Create a comprehensive .gitignore file for Rust projects (include target/, Cargo.lock for libraries, .env files, etc.)\n4. Configure Cargo.toml with metadata (name, version, authors, edition, description)\n5. Add core dependencies to Cargo.toml:\n   - solana-sdk = \"~1.16.0\"\n   - solana-client = \"~1.16.0\"\n   - solana-program = \"~1.16.0\"\n   - tokio = { version = \"1.28.0\", features = [\"full\"] }\n6. Add development dependencies:\n   - anyhow = \"1.0\"\n   - thiserror = \"1.0\"\n7. Create README.md with project description, setup instructions, and basic usage\n8. Make initial commit with descriptive message\nTesting approach: Verify project builds successfully with `cargo check` and `cargo build`. Ensure Git repository is properly initialized by checking `git status` and `git log`.",
+          "status": "done",
+          "parentTaskId": 1
+        },
+        {
+          "id": 2,
+          "title": "Implement Project Directory Structure and Configuration Management",
+          "description": "Set up the project's directory structure according to the Technical Architecture, implement configuration management for environment variables, and add additional specialized dependencies.",
+          "dependencies": [
+            1
+          ],
+          "details": "1. Create the following directory structure under src/:\n   - lib.rs (main entry point)\n   - error.rs (for error handling)\n   - config.rs (for configuration)\n   - models/ (for data models)\n   - services/ (for business logic)\n   - utils/ (for utility functions)\n2. Add specialized dependencies to Cargo.toml:\n   - listen-engine (ensure correct version)\n   - rig (ensure correct version)\n   - serde = { version = \"1.0\", features = [\"derive\"] }\n   - serde_json = \"1.0\"\n   - dotenv = \"0.15.0\"\n   - config = \"0.13.3\"\n3. Implement config.rs with:\n   - Environment variable loading using dotenv\n   - Configuration struct with all required settings\n   - Function to load configuration from environment or files\n4. Create .env.example file with all required environment variables (without actual values)\n5. Add tests directory with basic test setup\nTesting approach: Write unit tests for configuration loading. Test with different environment variables to ensure proper loading and fallback to defaults.",
+          "status": "done",
+          "parentTaskId": 1
+        },
+        {
+          "id": 3,
+          "title": "Implement Error Handling Module and Project Integration",
+          "description": "Create a comprehensive error handling module with custom error types for different system components, and ensure all project components are properly integrated.",
+          "dependencies": [
+            1,
+            2
+          ],
+          "details": "1. Implement error.rs module with:\n   - Create a custom Error enum using thiserror for type-safe error handling\n   - Define specific error variants for different components:\n     - ConfigError for configuration issues\n     - SolanaClientError for Solana RPC client errors\n     - ValidationError for input validation errors\n     - ServiceError for business logic errors\n   - Implement From traits for converting standard errors to custom errors\n   - Add context methods for adding additional information to errors\n2. Update lib.rs to:\n   - Export all public modules\n   - Provide a clean API surface\n   - Include high-level documentation\n3. Create a minimal working example in examples/ directory demonstrating basic functionality\n4. Implement CI/CD setup with GitHub Actions:\n   - Create .github/workflows/ci.yml for continuous integration\n   - Configure workflow to run tests, linting, and build checks\n5. Finalize README.md with complete setup and usage instructions\nTesting approach: Write unit tests for error handling scenarios. Ensure errors propagate correctly and contain helpful information. Verify the CI/CD pipeline runs successfully.",
+          "status": "done",
+          "parentTaskId": 1
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Implement Listen Bot Core",
+      "description": "Develop the core functionality of the Listen Bot to monitor and parse transactions from Solana DEXes.",
+      "status": "done",
+      "dependencies": [
+        1
+      ],
+      "priority": "high",
+      "details": "Create the listen_bot module with RPC connection management. Implement transaction streaming with configurable filters for transaction types and sizes. Develop parsers for swap transactions, token pairs, and pool data. Ensure sub-500ms latency for transaction processing. Implement automatic connection management and error recovery mechanisms. Create an interface for other components to subscribe to transaction events.",
+      "testStrategy": "Test RPC connection stability with mock Solana endpoints. Measure transaction processing latency to ensure it meets the <500ms requirement. Verify correct parsing of different transaction types using known transaction examples.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Implement WebSocket Connection Management",
+          "description": "Create the listen_bot module with robust RPC connection management to establish and maintain WebSocket connections to the Solana blockchain. Implement automatic reconnection and error recovery mechanisms.",
+          "dependencies": [],
+          "details": "1. Create a `ConnectionManager` class that handles WebSocket connections to Solana RPC endpoints.\n2. Implement connection pooling with multiple RPC endpoints for failover.\n3. Add automatic reconnection logic with exponential backoff.\n4. Implement health checks to monitor connection status.\n5. Create connection configuration options including commitment level, rate limiting, and timeout settings.\n6. Add logging and metrics collection for connection events.\n7. Implement error handling for network issues and RPC errors.\n8. Testing approach: Create unit tests using mocked RPC responses and integration tests with testnet connections. Test reconnection under various failure scenarios and measure connection establishment times to ensure they meet performance requirements.",
+          "status": "done",
+          "parentTaskId": 2
+        },
+        {
+          "id": 2,
+          "title": "Develop Transaction Streaming and Filtering System",
+          "description": "Implement a transaction streaming system with configurable filters for transaction types and sizes. Ensure the system can process transactions with sub-500ms latency.",
+          "dependencies": [
+            1
+          ],
+          "details": "1. Create a `TransactionStreamer` class that uses the ConnectionManager to subscribe to transactions.\n2. Implement filters for transaction types (swaps, adds, removes), token pairs, and minimum transaction sizes.\n3. Develop a pipeline architecture for transaction processing with stages for receiving, filtering, and dispatching.\n4. Use the Observer pattern to notify subscribers of relevant transactions.\n5. Implement batching and throttling mechanisms to handle high volume periods.\n6. Add performance monitoring to ensure sub-500ms latency requirements are met.\n7. Create a configuration system for dynamically updating filters without restarting.\n8. Implement buffer management to prevent memory issues during transaction spikes.\n9. Testing approach: Create performance tests that simulate high transaction volumes. Measure end-to-end latency and throughput. Test filter accuracy by comparing filtered results against expected outcomes. Use recorded transaction data for reproducible testing.",
+          "status": "done",
+          "parentTaskId": 2
+        },
+        {
+          "id": 3,
+          "title": "Implement Transaction Parsers and Event Interface",
+          "description": "Develop parsers for swap transactions, token pairs, and pool data from various Solana DEXes. Create a standardized interface for other components to subscribe to transaction events.",
+          "dependencies": [
+            1,
+            2
+          ],
+          "details": "1. Create DEX-specific parser implementations for major Solana DEXes (Jupiter, Raydium, Orca, etc.).\n2. Implement a `Parser` interface with common methods like `parseSwap()`, `parsePoolData()`, and `parseTokenPair()`.\n3. Develop a factory pattern to select the appropriate parser based on transaction program IDs.\n4. Create a standardized event model that normalizes data across different DEXes.\n5. Implement an event subscription system using the Observer pattern.\n6. Add methods for subscribers to filter events by token, pool, size, or transaction type.\n7. Include metadata in events such as timestamp, block height, and signature.\n8. Create adapters for common event processing frameworks.\n9. Testing approach: Create parser unit tests with real transaction data from each DEX. Verify parsing accuracy by comparing with known transaction details. Test event delivery to ensure all subscribers receive expected notifications. Measure parsing performance to ensure it meets latency requirements.",
+          "status": "done",
+          "parentTaskId": 2
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Develop Basic Opportunity Evaluator",
+      "description": "Create the foundation for the Opportunity Evaluator component with initial scoring system and risk assessment.",
+      "status": "pending",
+      "dependencies": [
+        2
+      ],
+      "priority": "high",
+      "details": "Implement the evaluator module with interfaces for different MEV strategies. Create a basic multi-factor scoring system for MEV opportunities. Develop risk assessment functionality including profitability estimation. Implement configurable execution thresholds. Create a real-time go/no-go decision-making system based on opportunity scores. Design the system to be extensible for future strategy additions.",
+      "testStrategy": "Create unit tests with mock transaction data to verify scoring accuracy. Test different risk scenarios to ensure proper risk assessment. Validate that execution decisions align with configured thresholds.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Implement Core Evaluator Interface and Strategy Abstraction",
+          "description": "Create the foundational structure for the Opportunity Evaluator with interfaces for different MEV strategies and the core evaluation pipeline.",
+          "dependencies": [],
+          "details": "Implementation steps:\n1. Define an `OpportunityEvaluator` interface with methods like `evaluateOpportunity()` and `makeDecision()`.\n2. Create an abstract `MevStrategy` class/interface that specific strategies will implement.\n3. Implement a strategy registry that allows registering and retrieving different MEV strategy implementations.\n4. Design the core evaluation pipeline that processes incoming opportunities.\n5. Implement a basic opportunity data structure with essential fields like type, assets involved, estimated profit, etc.\n6. Create unit tests for the interfaces and registry using mock strategies.\n7. Implement logging for evaluation steps to aid debugging.\n\nTesting approach: Write unit tests for the registry functionality and the core pipeline using mock strategy implementations to verify the architecture works as expected.",
+          "status": "done",
+          "parentTaskId": 3
+        },
+        {
+          "id": 2,
+          "title": "Develop Multi-Factor Scoring System",
+          "description": "Create a configurable scoring system that evaluates opportunities based on multiple factors and calculates an overall opportunity score.",
+          "dependencies": [
+            1
+          ],
+          "details": "Implementation steps:\n1. Define a `ScoringFactor` interface that individual scoring components will implement.\n2. Implement basic scoring factors such as:\n   - Profitability factor (expected profit vs gas costs)\n   - Risk factor (likelihood of success)\n   - Complexity factor (computational requirements)\n   - Time sensitivity factor (how quickly opportunity expires)\n3. Create a weighted scoring algorithm that combines individual factor scores.\n4. Implement configuration options for factor weights and thresholds.\n5. Add methods to the core evaluator that utilize the scoring system.\n6. Develop unit tests with various test cases for each factor.\n7. Create integration tests that verify the combined scoring system produces expected results for sample opportunities.\n\nTesting approach: Test each scoring factor individually with boundary cases, then test the combined scoring system with realistic opportunity data to verify it produces sensible scores.",
+          "status": "done",
+          "parentTaskId": 3
+        },
+        {
+          "id": 3,
+          "title": "Implement Decision-Making System with Execution Thresholds",
+          "description": "Create a real-time go/no-go decision-making system based on opportunity scores with configurable execution thresholds.",
+          "dependencies": [
+            1,
+            2
+          ],
+          "details": "Implementation steps:\n1. Design a `DecisionEngine` component that takes scoring results and makes execution decisions.\n2. Implement configurable thresholds for different strategy types and market conditions.\n3. Create a risk assessment module that estimates:\n   - Probability of success\n   - Potential downside if transaction fails\n   - Gas price impact on profitability\n4. Develop a profitability calculator that factors in gas costs, slippage, and other execution costs.\n5. Implement a threshold configuration system that allows adjusting parameters without code changes.\n6. Add circuit breakers for extreme market conditions or when consecutive failures occur.\n7. Create comprehensive logging for decision rationale to aid in system improvement.\n8. Develop integration tests that simulate various market scenarios and verify decisions.\n\nTesting approach: Create a test suite with various opportunity scenarios (highly profitable, marginally profitable, unprofitable) and verify the decision engine makes appropriate go/no-go decisions based on configured thresholds.",
+          "status": "pending",
+          "parentTaskId": 3
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Implement Transaction Executor",
+      "description": "Build the Transaction Executor component to simulate and execute trades based on identified opportunities.",
+      "status": "pending",
+      "dependencies": [
+        3
+      ],
+      "priority": "high",
+      "details": "Create the transaction execution module with wallet integration. Implement transaction simulation before execution to validate profitability and safety. Develop gas optimization and priority fee management. Build support for basic MEV strategies (start with arbitrage). Implement detailed execution tracking and confirmation. Create a simulation mode for testing without actual execution. Include retry mechanisms for failed transactions.",
+      "testStrategy": "Test transaction simulation with known profitable and unprofitable scenarios. Verify wallet integration with test wallets. Measure execution time to ensure it meets the <2s requirement. Test the simulation mode to confirm it accurately predicts outcomes."
+    },
+    {
+      "id": 5,
+      "title": "Develop Essential Monitoring System",
+      "description": "Implement basic monitoring and logging functionality to track system performance and operations.",
+      "status": "pending",
+      "dependencies": [
+        4
+      ],
+      "priority": "medium",
+      "details": "Create the monitoring module with comprehensive trade logging. Implement system health monitoring for key components. Develop basic notification system (console/file-based initially). Create performance metrics tracking including latency, success rates, and profitability. Implement error tracking and reporting. Design the monitoring system to be extensible for future enhancements.",
+      "testStrategy": "Verify that all system events are properly logged. Test error scenarios to ensure appropriate error handling and logging. Validate that performance metrics are accurately recorded and can be retrieved for analysis."
+    },
+    {
+      "id": 6,
+      "title": "Implement RIG Agent Integration",
+      "description": "Integrate the RIG AI framework for intelligent opportunity evaluation and decision making.",
+      "status": "pending",
+      "dependencies": [
+        3,
+        5
+      ],
+      "priority": "medium",
+      "details": "Create the rig_agent module with integration to the RIG AI framework. Implement market data integration for AI decision making. Develop opportunity evaluation using transaction patterns and market conditions. Implement confidence rating system (0-1 scale) for opportunities. Create fallback mechanisms to rule-based decisions when needed. Implement explainable decision reasoning for monitoring and debugging.",
+      "testStrategy": "Test AI decision making with historical data to validate accuracy. Compare AI decisions against rule-based approaches to measure improvements. Verify confidence ratings correlate with actual profitability. Test fallback mechanisms by simulating AI failures."
+    },
+    {
+      "id": 7,
+      "title": "Expand MEV Strategies",
+      "description": "Extend the system to support additional MEV strategies including sandwich trading and token sniping.",
+      "status": "pending",
+      "dependencies": [
+        4,
+        6
+      ],
+      "priority": "medium",
+      "details": "Implement sandwich trading strategy with front-running and back-running capabilities. Develop token sniping functionality for new token launches. Enhance the opportunity evaluator to support strategy-specific scoring algorithms. Implement advanced risk management for each strategy type. Create configuration options for enabling/disabling specific strategies. Develop strategy performance tracking and comparison.",
+      "testStrategy": "Test each strategy with historical opportunities to verify profitability. Validate risk management controls prevent excessive losses. Compare strategy performance metrics to identify optimal approaches. Test strategy switching based on market conditions."
+    },
+    {
+      "id": 8,
+      "title": "Enhance Monitoring with Telegram Integration",
+      "description": "Upgrade the monitoring system with Telegram notifications and advanced alerting capabilities.",
+      "status": "pending",
+      "dependencies": [
+        5
+      ],
+      "priority": "low",
+      "details": "Implement Telegram bot integration for notifications. Create configurable alert types and thresholds. Develop real-time trade notifications with performance details. Implement system health alerts for potential issues. Create command interface for basic system control via Telegram. Implement notification preferences and filtering options.",
+      "testStrategy": "Test Telegram notifications for different event types. Verify that alerts are triggered according to configured thresholds. Test command interface functionality. Validate notification preferences are respected."
+    },
+    {
+      "id": 9,
+      "title": "Optimize System Performance",
+      "description": "Enhance system performance focusing on latency optimization, parallel processing, and connection management.",
+      "status": "pending",
+      "dependencies": [
+        2,
+        4,
+        6
+      ],
+      "priority": "medium",
+      "details": "Implement connection pooling and failover for RPC connections. Optimize critical paths for minimal latency. Implement parallel processing for transaction evaluation and execution. Enhance error recovery mechanisms for improved reliability. Implement adaptive rate limiting to prevent API throttling. Create performance benchmarking tools for continuous optimization.",
+      "testStrategy": "Conduct load testing to measure system performance under stress. Compare latency metrics before and after optimization. Test failover scenarios to verify seamless recovery. Measure system uptime during extended operation periods to validate 99.9% uptime target."
+    },
+    {
+      "id": 10,
+      "title": "Implement User Configuration Interface",
+      "description": "Develop a configuration system allowing users to customize strategy preferences, risk parameters, and notification settings.",
+      "status": "pending",
+      "dependencies": [
+        7,
+        8
+      ],
+      "priority": "low",
+      "details": "Create a configuration module with file-based settings. Implement runtime configuration updates without system restart. Develop validation for configuration parameters. Create presets for different risk profiles (conservative, balanced, aggressive). Implement token pair and DEX filtering options. Develop profit threshold configuration. Create documentation for all configuration options.",
+      "testStrategy": "Test configuration loading and validation with various inputs. Verify that runtime configuration updates are applied correctly. Test different configuration presets to ensure they produce expected behavior. Validate that invalid configurations are properly rejected with helpful error messages."
+    }
+  ],
+  "metadata": {
+    "projectName": "SandoSeer MEV System",
+    "totalTasks": 10,
+    "sourceFile": "SandoSeer_PRD.txt",
+    "generatedAt": "2023-11-17"
+  }
+}

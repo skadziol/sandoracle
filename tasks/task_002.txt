@@ -1,0 +1,54 @@
+# Task ID: 2
+# Title: Implement Listen Bot Core
+# Status: done
+# Dependencies: 1
+# Priority: high
+# Description: Develop the core functionality of the Listen Bot to monitor and parse transactions from Solana DEXes.
+# Details:
+Create the listen_bot module with RPC connection management. Implement transaction streaming with configurable filters for transaction types and sizes. Develop parsers for swap transactions, token pairs, and pool data. Ensure sub-500ms latency for transaction processing. Implement automatic connection management and error recovery mechanisms. Create an interface for other components to subscribe to transaction events.
+
+# Test Strategy:
+Test RPC connection stability with mock Solana endpoints. Measure transaction processing latency to ensure it meets the <500ms requirement. Verify correct parsing of different transaction types using known transaction examples.
+
+# Subtasks:
+## 1. Implement WebSocket Connection Management [done]
+### Dependencies: None
+### Description: Create the listen_bot module with robust RPC connection management to establish and maintain WebSocket connections to the Solana blockchain. Implement automatic reconnection and error recovery mechanisms.
+### Details:
+1. Create a `ConnectionManager` class that handles WebSocket connections to Solana RPC endpoints.
+2. Implement connection pooling with multiple RPC endpoints for failover.
+3. Add automatic reconnection logic with exponential backoff.
+4. Implement health checks to monitor connection status.
+5. Create connection configuration options including commitment level, rate limiting, and timeout settings.
+6. Add logging and metrics collection for connection events.
+7. Implement error handling for network issues and RPC errors.
+8. Testing approach: Create unit tests using mocked RPC responses and integration tests with testnet connections. Test reconnection under various failure scenarios and measure connection establishment times to ensure they meet performance requirements.
+
+## 2. Develop Transaction Streaming and Filtering System [done]
+### Dependencies: 2.1
+### Description: Implement a transaction streaming system with configurable filters for transaction types and sizes. Ensure the system can process transactions with sub-500ms latency.
+### Details:
+1. Create a `TransactionStreamer` class that uses the ConnectionManager to subscribe to transactions.
+2. Implement filters for transaction types (swaps, adds, removes), token pairs, and minimum transaction sizes.
+3. Develop a pipeline architecture for transaction processing with stages for receiving, filtering, and dispatching.
+4. Use the Observer pattern to notify subscribers of relevant transactions.
+5. Implement batching and throttling mechanisms to handle high volume periods.
+6. Add performance monitoring to ensure sub-500ms latency requirements are met.
+7. Create a configuration system for dynamically updating filters without restarting.
+8. Implement buffer management to prevent memory issues during transaction spikes.
+9. Testing approach: Create performance tests that simulate high transaction volumes. Measure end-to-end latency and throughput. Test filter accuracy by comparing filtered results against expected outcomes. Use recorded transaction data for reproducible testing.
+
+## 3. Implement Transaction Parsers and Event Interface [done]
+### Dependencies: 2.1, 2.2
+### Description: Develop parsers for swap transactions, token pairs, and pool data from various Solana DEXes. Create a standardized interface for other components to subscribe to transaction events.
+### Details:
+1. Create DEX-specific parser implementations for major Solana DEXes (Jupiter, Raydium, Orca, etc.).
+2. Implement a `Parser` interface with common methods like `parseSwap()`, `parsePoolData()`, and `parseTokenPair()`.
+3. Develop a factory pattern to select the appropriate parser based on transaction program IDs.
+4. Create a standardized event model that normalizes data across different DEXes.
+5. Implement an event subscription system using the Observer pattern.
+6. Add methods for subscribers to filter events by token, pool, size, or transaction type.
+7. Include metadata in events such as timestamp, block height, and signature.
+8. Create adapters for common event processing frameworks.
+9. Testing approach: Create parser unit tests with real transaction data from each DEX. Verify parsing accuracy by comparing with known transaction details. Test event delivery to ensure all subscribers receive expected notifications. Measure parsing performance to ensure it meets latency requirements.
+

@@ -1,0 +1,488 @@
+# SandoSeer Product Requirements Document (PRD)
+
+## 🧠 Project Overview
+
+**Product Name:** SandoSeer - AI MEV Oracle for Solana
+**Codename:** SandoSeer
+**Version:** 0.1.0
+
+## 📋 Executive Summary
+
+SandoSeer is an autonomous MEV (Maximal Extractable Value) detection and execution system for the Solana blockchain. It leverages AI-powered decision making through the `rig` framework and real-time transaction monitoring via the `listen` engine to identify and capitalize on MEV opportunities including sandwich trading, arbitrage, and token sniping. The system aims to provide a reliable, risk-adjusted trading mechanism for extracting value from the Solana DeFi ecosystem.
+
+## 🎯 Goals and Objectives
+
+### Primary Goals
+1. Build an autonomous system that can detect and exploit MEV opportunities on Solana
+2. Integrate AI-powered decision making with real-time transaction data
+3. Implement risk management and profit optimization strategies
+4. Create a reliable and extensible architecture for MEV extraction
+
+### Success Metrics
+1. Profitable trades with positive ROI
+2. Minimized failed transactions and gas costs
+3. Accurate prediction of MEV opportunities
+4. Timely execution of trades to capture MEV
+
+## 🧩 Core Components
+
+### 1. 🎧 Listen Bot
+**Purpose:** Monitor Solana DEX transactions and mempool in real-time
+**Features:**
+- Stream and parse swap transactions from major DEXes (Orca, Raydium, Jupiter)
+- Extract relevant transaction data (token pairs, swap sizes, pool depths, slippage)
+- Identify potential MEV opportunities in the transaction stream
+
+**Technical Integration:**
+- Built on the [`listen-engine`](https://github.com/piotrostr/listen/tree/main/listen-engine) framework
+- Connects to Solana RPC endpoints for transaction data
+- Streams transaction data to the Opportunity Evaluator
+
+### 2. 🧠 RIG Agent (LLM)
+**Purpose:** Provide AI-driven forecasting and decision-making
+**Features:**
+- Analyze transaction patterns and market conditions
+- Generate opportunity scores and confidence ratings
+- Predict the profitability of potential MEV strategies
+- Recommend optimal MEV extraction strategies
+
+**Technical Integration:**
+- Built on the [`rig`](https://github.com/piotrostr/rig) framework
+- Integrates with sentiment analysis and market data
+- Returns structured decision recommendations
+
+### 3. 📊 Opportunity Evaluator
+**Purpose:** Calculate risk-adjusted profitability of MEV opportunities
+**Features:**
+- Score opportunities based on multiple factors
+- Calculate confidence and risk levels
+- Determine profitability estimates
+- Make go/no-go decisions for trade execution
+
+**Technical Integration:**
+- Combines input from RIG Agent, sentiment analyzer, and market data
+- Implements scoring algorithms and risk analyses
+- Feeds decisions to the Transaction Executor
+
+### 4. 💸 Transaction Executor
+**Purpose:** Execute profitable trades based on identified opportunities
+**Features:**
+- Create and sign transactions for various MEV strategies
+- Simulate transactions before execution
+- Optimize gas fees and transaction priority
+- Handle transaction errors and failures
+
+**Technical Integration:**
+- Uses Solana client libraries for transaction creation and signing
+- Connects to the Solana blockchain via RPC
+- Supports simulation mode for testing
+
+### 5. 📱 Monitoring & Feedback
+**Purpose:** Track performance and provide alerts
+**Features:**
+- Log all trades and opportunities
+- Send notifications via Telegram
+- Record outcomes for model improvement
+- Provide performance metrics and statistics
+
+**Technical Integration:**
+- Implements logging to files and databases
+- Integrates with Telegram API for notifications
+- Captures performance data for model training
+
+## 🔍 Detailed Requirements
+
+### Functional Requirements
+
+#### Listen Bot Requirements
+- [LB-1] Stream and parse swap transactions from at least 3 major Solana DEXes
+- [LB-2] Extract token pairs, amounts, slippage, and wallet information from transactions
+- [LB-3] Filter transactions by configurable criteria (size, tokens, DEXes)
+- [LB-4] Handle connection interruptions and reconnect automatically
+- [LB-5] Process transactions with minimal latency (<500ms)
+
+#### RIG Agent Requirements
+- [RA-1] Evaluate opportunities based on transaction data, market conditions, and sentiment
+- [RA-2] Generate opportunity scores on a 0-1 scale with confidence ratings
+- [RA-3] Provide reasoning for decisions
+- [RA-4] Adapt to changing market conditions
+- [RA-5] Support fallback to rule-based decisions when AI is unavailable
+
+#### Opportunity Evaluator Requirements
+- [OE-1] Calculate comprehensive MEV scores based on multiple factors
+- [OE-2] Assess risk levels on a 1-3 scale
+- [OE-3] Estimate profitability with confidence intervals
+- [OE-4] Apply configurable thresholds for execution decisions
+- [OE-5] Support different scoring strategies for different MEV types
+
+#### Transaction Executor Requirements
+- [TE-1] Support sandwich, arbitrage, and snipe transaction strategies
+- [TE-2] Simulate transactions before execution to verify profitability
+- [TE-3] Optimize transaction fees and priority for MEV capture
+- [TE-4] Execute transactions with minimal latency
+- [TE-5] Provide detailed execution results and confirmation
+- [TE-6] Support simulation mode for testing without actual execution
+
+#### Monitoring Requirements
+- [MO-1] Log all trades with detailed information
+- [MO-2] Send real-time notifications for opportunities and executions
+- [MO-3] Track performance metrics (success rate, profitability, latency)
+- [MO-4] Provide feedback for model improvement
+- [MO-5] Alert on system issues or unexpected conditions
+
+### Non-Functional Requirements
+
+#### Performance Requirements
+- [PF-1] Process transactions with latency under 500ms
+- [PF-2] Execute trades within 2 seconds of opportunity detection
+- [PF-3] Handle at least the streaming throughput through our solana RPC node
+- [PF-4] Support multiple simultaneous trading strategies
+- [PF-5] Operate 24/7 with minimal downtime
+
+#### Security Requirements
+- [SE-1] Secure storage of wallet keys and API credentials
+- [SE-2] Transaction amount limits and risk controls
+- [SE-3] Validate all transactions before execution
+- [SE-4] Implement circuit breakers for adverse market conditions
+- [SE-5] Log all security-relevant events
+
+#### Reliability Requirements
+- [RE-1] Automatic recovery from connection failures
+- [RE-2] Graceful handling of API rate limits
+- [RE-3] Fallback strategies for component failures
+- [RE-4] Consistent state management across restarts
+- [RE-5] Comprehensive error handling and reporting
+
+## 🚧 Implementation Plan
+
+### Phase 1: MVP Development
+1. Set up basic project structure and dependencies
+2. Implement Listen Bot for transaction streaming
+3. Create simplified RIG Agent with basic decision logic
+4. Build Opportunity Evaluator with core scoring algorithms
+5. Develop Transaction Executor with simulation capabilities
+6. Implement basic logging and monitoring
+
+### Phase 2: Enhanced Features
+1. Improve RIG Agent with advanced AI integration
+2. Add sentiment analysis and social media monitoring
+3. Implement more sophisticated MEV strategies
+4. Enhance monitoring with Telegram notifications
+5. Add performance tracking and analytics
+
+### Phase 3: Optimization & Scaling
+1. Optimize performance for lower latency
+2. Implement parallel processing for multiple strategies
+3. Add advanced risk management features
+4. Create dashboard for monitoring and control
+5. Implement self-improving feedback loop
+
+## 🔧 Technical Architecture
+
+### System Architecture
+```
+┌────────────────────────┐
+│ RIG AGENT (LLM)        │
+│ "Sees the future"      │
+└────────┬───────────────┘
+         │
+         ▼
+┌────────────────────┐ ┌─────────────┐ ┌───────────────────────┐
+│ Social + Token     │ │ Market Data │ │ Mempool / TX Signals  │
+│ Sentiment Scanner  │ │ (Orca etc)  │ │ (via Listen)          │
+└────────┬───────────┘ └─────┬───────┘ └──────────────┬────────┘
+         ▼                   ▼                        ▼
+┌────────────────────────────────────────────────────────────┐
+│ Opportunity Evaluator                                      │
+│ - Predicts MEV chance                                      │
+│ - Calculates confidence + profitability                    │
+│ - Adjusts risk parameters dynamically                      │
+└────────────┬──────────────────────────────────────────────┘
+             ▼
+┌───────────────┐
+│ LISTEN BOT    │ <-- Executes trades (swap, arb, sandwich)
+└───────────────┘
+```
+
+### Component Interaction
+1. Listen Bot streams transaction data from Solana DEXes
+2. Market Data Collector gathers price and liquidity information
+3. Sentiment Analyzer processes token sentiment and trends
+4. RIG Agent evaluates opportunities using collected data
+5. Opportunity Evaluator scores and filters opportunities
+6. Transaction Executor executes profitable trades
+7. Monitoring components log and notify about activities
+
+### Data Flow
+1. Incoming transaction data → Listen Bot
+2. Transaction data + Market data + Sentiment data → RIG Agent
+3. RIG Agent decision + Transaction data → Opportunity Evaluator
+4. Opportunity score + Transaction details → Decision Maker
+5. Trade decision → Transaction Executor
+6. Execution results → Monitoring & Logging
+
+## 📝 Task Breakdown
+
+### Listen Bot Module Tasks
+- [ ] Set up connection to Solana RPC endpoints
+- [ ] Implement transaction streaming from major DEXes
+- [ ] Create parsers for different DEX transaction formats
+- [ ] Build filters for relevant transactions
+- [ ] Implement reliable connection handling and reconnection logic
+- [ ] Create transaction data structures and storage
+
+### RIG Agent Module Tasks
+- [ ] Set up RIG framework integration
+- [ ] Implement agent decision-making logic
+- [ ] Create context formatting for AI inputs
+- [ ] Build response parsing and decision extraction
+- [ ] Implement fallback mechanisms for AI unavailability
+- [ ] Create simulation mode for testing
+
+### Market Data Module Tasks
+- [ ] Implement DEX API connections for price data
+- [ ] Create token registry and lookup services
+- [ ] Build pool data collection and analysis
+- [ ] Implement caching for frequently used data
+- [ ] Create market condition evaluation mechanisms
+
+### Sentiment Analysis Module Tasks
+- [ ] Set up social media monitoring (Discord, Twitter, Telegram)
+- [ ] Implement sentiment scoring algorithms
+- [ ] Create token mention tracking and trending detection
+- [ ] Build volume and momentum analysis
+- [ ] Implement data aggregation and scoring
+
+### Opportunity Evaluator Module Tasks
+- [ ] Build scoring algorithms for different MEV types
+- [ ] Implement risk analysis and scoring
+- [ ] Create profitability calculation mechanisms
+- [ ] Build decision-making logic with configurable thresholds
+- [ ] Implement strategy selection based on opportunity type
+
+### Transaction Executor Module Tasks
+- [ ] Set up Solana wallet and transaction signing
+- [ ] Implement token handling and conversion
+- [ ] Build transaction creation for different strategies
+- [ ] Create transaction simulation capabilities
+- [ ] Implement execution with priority fee adjustment
+- [ ] Build error handling and confirmation mechanisms
+
+### Monitoring Module Tasks
+- [ ] Create comprehensive logging system
+- [ ] Implement Telegram notification service
+- [ ] Build trade history and performance tracking
+- [ ] Create analytics for strategy effectiveness
+- [ ] Implement alerting for system issues
+
+## 🏗️ Code Structure
+
+```
+src/
+├── config.rs            # Configuration handling
+├── error.rs             # Error types and handling
+├── evaluator/           # Opportunity evaluation
+│   ├── mod.rs
+│   ├── scorer.rs        # Opportunity scoring
+│   ├── risk_analyzer.rs # Risk analysis
+│   └── decision_maker.rs # Trade decision making
+├── listen_bot/          # Transaction monitoring
+│   ├── mod.rs
+│   ├── mempool_scanner.rs # Transaction scanning
+│   ├── transaction.rs    # Transaction execution
+│   ├── utils.rs         # Utility functions
+│   └── opportunity.rs   # Opportunity detection
+├── rig_agent/           # AI decision making
+│   ├── mod.rs
+│   ├── agent.rs         # Main agent logic
+│   ├── sentiment.rs     # Sentiment analysis
+│   └── market_data.rs   # Market data collection
+├── monitoring/          # Logging and notifications
+│   ├── mod.rs
+│   ├── logger.rs        # Logging functionality
+│   └── telegram.rs      # Telegram notifications
+└── main.rs              # Application entry point
+```
+
+## 🔩 Dependencies
+
+### External Libraries and Repositories
+- [listen-engine](https://github.com/piotrostr/listen/tree/main/listen-engine) - Core framework for monitoring Solana transactions
+- [rig](https://github.com/piotrostr/rig) - AI framework for decision making and agent-based operations
+- Solana SDK and RPC Client
+- Tokio for async runtime
+- Serde for serialization
+- Clap for CLI arguments
+- Tracing for logging
+- Reqwest for HTTP requests
+- Anyhow for error handling
+- Chrono for time handling
+- Rand for randomization
+
+### External Services
+- Solana RPC endpoints (public or private)
+- OpenAI API (for RIG agent)
+- Telegram API (for notifications)
+- DEX APIs (Orca, Raydium, Jupiter)
+
+## 📈 Key Features by Priority
+
+### Must Have (P0)
+- Transaction monitoring and parsing
+- Basic opportunity detection
+- Trade simulation
+- Safe execution mechanism
+- Logging and error handling
+
+### Should Have (P1)
+- AI-powered decision making
+- Multiple MEV strategies
+- Risk adjustment
+- Performance tracking
+- Telegram notifications
+
+### Nice to Have (P2)
+- Social media sentiment analysis
+- Advanced market data analysis
+- Web dashboard
+- Self-improving feedback loop
+- Multiple wallet support
+
+## 🚀 Future Enhancements
+
+### Performance Optimizations
+- Optimize transaction parsing for lower latency
+- Implement parallel strategy execution
+- Add more efficient RPC handling
+- Optimize AI inference time
+
+### Feature Enhancements
+- Add more DEX integrations
+- Implement advanced MEV strategies
+- Create token-specific strategies
+- Add cross-chain MEV opportunities
+- Implement sandwich protection for users
+
+### UI and Monitoring
+- Create web dashboard for monitoring
+- Add real-time analytics
+- Implement strategy performance visualization
+- Create alerts and notifications system
+
+## 🧪 Testing Plan
+
+### Unit Testing
+- Test individual components in isolation
+- Mock external dependencies
+- Verify algorithm correctness
+- Test error handling
+
+### Integration Testing
+- Test component interaction
+- Verify data flow between modules
+- Test complete execution paths
+- Verify system stability
+
+### Simulation Testing
+- Test in simulation mode without real execution
+- Use historical data for benchmarking
+- Measure performance metrics
+- Verify profitability under different conditions
+
+### Production Testing
+- Start with small trade amounts
+- Gradually increase exposure
+- Monitor performance and adjust
+- Implement circuit breakers for safety
+
+## 📊 Success Evaluation
+
+### Performance Metrics
+- Number of opportunities detected
+- Percentage of profitable trades
+- Average profit per trade
+- System latency and throughput
+- Uptime and reliability
+
+### Business Metrics
+- Total profit generated
+- Return on investment
+- Risk-adjusted return
+- Cost of operation (gas, API fees)
+- Comparison to market benchmarks
+
+## 🔒 Risk Management
+
+### Technical Risks
+- RPC connection failures or latency
+- API rate limiting
+- Transaction failures or reverts
+- Smart contract bugs or vulnerabilities
+- System resource exhaustion
+
+### Financial Risks
+- Failed transactions leading to losses
+- Market volatility impacting profitability
+- MEV competition reducing opportunities
+- Front-running or sandwich risk to our own transactions
+- Smart contract exploits
+
+### Mitigation Strategies
+- Implement comprehensive simulation before execution
+- Use conservative risk parameters
+- Implement circuit breakers for adverse conditions
+- Monitor and adjust strategies based on performance
+- Set strict limits on trade sizes and exposure
+
+## 👥 Team Structure and Responsibilities
+
+### Development Team
+- Core developers: Implement main functionality
+- AI specialists: Work on RIG agent integration
+- Blockchain developers: Focus on Solana integration
+- DevOps: Ensure system reliability and monitoring
+
+### Operations Team
+- Strategy managers: Define and tune trading strategies
+- Risk managers: Monitor and adjust risk parameters
+- Performance analysts: Track and report system performance
+
+## 📅 Timeline and Milestones
+
+### Milestone 1: Basic Infrastructure (Week 1-2)
+- Project setup and dependencies
+- RPC connection and basic scanning
+- Simple opportunity detection
+
+### Milestone 2: Core Functionality (Week 3-4)
+- Transaction parsing and analysis
+- Basic scoring and decision making
+- Simulation and test execution
+
+### Milestone 3: AI Integration (Week 5-6)
+- RIG agent integration
+- Market data collection
+- Sentiment analysis
+
+### Milestone 4: Full System (Week 7-8)
+- Complete integration of all components
+- Advanced strategies implementation
+- Monitoring and notification system
+
+### Milestone 5: Testing and Optimization (Week 9-10)
+- Comprehensive testing
+- Performance optimization
+- Risk management fine-tuning
+
+## 📜 Glossary
+
+- **MEV (Maximal Extractable Value)**: Value that can be extracted from block production beyond standard block rewards and gas fees.
+- **Sandwich Attack**: A trading strategy where a trader places orders before and after a large trade to profit from the price impact.
+- **Arbitrage**: Profiting from price differences for the same asset across different markets.
+- **Token Snipe**: Quickly buying tokens when new liquidity is added or upon token launch.
+- **Slippage**: The difference between expected and executed prices during a trade.
+- **DEX**: Decentralized Exchange, a platform for trading cryptocurrencies without intermediaries.
+- **RPC (Remote Procedure Call)**: A protocol that allows a program to request a service from another program located on another computer on a network.
+- **LLM (Large Language Model)**: AI models like GPT that can process and generate human-like text.
+- **RIG**: The AI framework used for decision making in this project.
+- **Listen Engine**: The framework used for monitoring Solana transactions in this project.
