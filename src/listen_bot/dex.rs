@@ -41,17 +41,12 @@ impl DexParserFactory {
     }
 }
 
+#[derive(Debug)]
 struct OrcaParser;
-struct RaydiumParser;
-struct JupiterParser;
 
 #[async_trait::async_trait]
 impl DexTransactionParser for OrcaParser {
-    async fn parse_transaction(
-        &self,
-        _tx: Transaction,
-        _meta: UiTransactionStatusMeta,
-    ) -> Result<Option<DexTransaction>> {
+    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<DexTransaction>> {
         // TODO: Implement Orca transaction parsing
         Ok(None)
     }
@@ -61,13 +56,12 @@ impl DexTransactionParser for OrcaParser {
     }
 }
 
+#[derive(Debug)]
+struct RaydiumParser;
+
 #[async_trait::async_trait]
 impl DexTransactionParser for RaydiumParser {
-    async fn parse_transaction(
-        &self,
-        _tx: Transaction,
-        _meta: UiTransactionStatusMeta,
-    ) -> Result<Option<DexTransaction>> {
+    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<DexTransaction>> {
         // TODO: Implement Raydium transaction parsing
         Ok(None)
     }
@@ -77,13 +71,12 @@ impl DexTransactionParser for RaydiumParser {
     }
 }
 
+#[derive(Debug)]
+struct JupiterParser;
+
 #[async_trait::async_trait]
 impl DexTransactionParser for JupiterParser {
-    async fn parse_transaction(
-        &self,
-        _tx: Transaction,
-        _meta: UiTransactionStatusMeta,
-    ) -> Result<Option<DexTransaction>> {
+    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<DexTransaction>> {
         // TODO: Implement Jupiter transaction parsing
         Ok(None)
     }

@@ -58,6 +58,8 @@ metrics-exporter-prometheus = "0.12"
 # Async traits
 async-trait = "0.1"
 
+curve25519-dalek = "=3.2.1"
+
 [dev-dependencies]
 tokio-test = "0.4"
 pretty_assertions = "1.4"

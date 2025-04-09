@@ -1,6 +1,6 @@
 use crate::error::{Result, SandoError};
-use crate::types::TransactionInfo;
-use crate::config::ListenBotConfig;
+use crate::listen_bot::types::TransactionInfo;
+use crate::listen_bot::config::ListenBotConfig;
 use solana_sdk::{signature::Signature, pubkey::Pubkey};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +11,8 @@ use solana_sdk::{
 };
 use solana_transaction_status::UiTransactionStatusMeta;
 use std::fmt::Debug;
+use crate::listen_bot::DexType;
+use crate::error::TransactionErrorKind;
 
 /// Represents a DEX transaction with relevant MEV information
 #[derive(Debug, Clone)]

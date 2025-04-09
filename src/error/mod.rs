@@ -265,6 +265,17 @@ impl From<reqwest::Error> for SandoError {
     }
 }
 
+pub fn should_retry(err: &SandoError) -> bool {
+    match err {
+        SandoError::TransactionError { kind, .. } => matches!(
+            kind,
+            TransactionErrorKind::Timeout | TransactionErrorKind::RpcError
+        ),
+        SandoError::HttpError { status, .. } => *status >= StatusCode::from_u16(500).unwrap(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
