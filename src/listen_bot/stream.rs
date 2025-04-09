@@ -6,6 +6,8 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
+use solana_transaction_status::TransactionInfo;
 
 /// Configuration for the transaction stream
 #[derive(Debug, Clone)]
@@ -98,34 +100,16 @@ impl TransactionStream {
     }
 
     /// Process a single transaction
-    async fn process_transaction(&self, signature: String) -> Result<()> {
-        let tx = self.rpc_client
-            .get_transaction_with_config(
-                &signature.parse()?,
-                solana_client::rpc_config::RpcTransactionConfig {
-                    encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
-                    commitment: Some(self.config.commitment),
-                    max_supported_transaction_version: Some(0),
-                },
-            )
-            .await?;
+    async fn process_transaction(&self, tx: EncodedConfirmedTransactionWithStatusMeta) -> Result<()> {
+        let tx_info = TransactionInfo::try_from(tx)?;
+        
+        if !self.monitor.should_monitor(&tx_info) {
+            return Ok(());
+        }
 
-        if let Some(tx) = tx {
-            // Check if we should monitor this transaction
-            if !self.monitor.should_monitor(&tx.transaction, &tx.meta.unwrap()) {
-                return Ok(());
-            }
-
-            // Try parsing with each DEX parser
-            for parser in &self.parsers {
-                if let Ok(Some(dex_tx)) = parser.parse_transaction(
-                    tx.transaction.clone(),
-                    tx.meta.unwrap(),
-                ).await {
-                    // Broadcast the parsed transaction
-                    let _ = self.tx_sender.send(dex_tx);
-                    break;
-                }
+        for parser in self.parsers.iter() {
+            if let Ok(Some(dex_tx)) = parser.parse_transaction(tx_info.clone()).await {
+                self.tx_sender.send(dex_tx).await?;
             }
         }
 

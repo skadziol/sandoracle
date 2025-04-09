@@ -115,15 +115,15 @@ impl TransactionEvent {
         tx: EncodedConfirmedTransactionWithStatusMeta,
         timestamp: i64,
     ) -> Option<Self> {
-        let signature = tx.transaction.signatures[0].to_string();
-        let meta = tx.meta?;
+        let signature = tx.transaction.transaction.signatures[0].to_string();
+        let meta = tx.transaction.meta?;
         
         let success = meta.err.is_none();
         let fee = meta.fee;
         
         // Extract program IDs and token mints from the transaction
-        let program_ids = extract_program_ids(&tx);
-        let token_mints = extract_token_mints(&tx);
+        let program_ids = get_program_accounts(&tx);
+        let token_mints = get_token_accounts(&tx);
 
         Some(Self {
             signature,
@@ -162,24 +162,20 @@ impl TransactionEvent {
     }
 }
 
-fn extract_program_ids(tx: &EncodedConfirmedTransactionWithStatusMeta) -> Vec<Pubkey> {
-    tx.transaction.message.account_keys.iter()
-        .filter(|key| tx.meta.as_ref().map_or(false, |meta| {
-            meta.loaded_addresses.writable.contains(key) || 
-            meta.loaded_addresses.readonly.contains(key)
+fn get_program_accounts(tx: &EncodedConfirmedTransactionWithStatusMeta) -> Vec<Pubkey> {
+    tx.transaction.transaction.message.account_keys.iter()
+        .filter(|key| tx.transaction.meta.as_ref().map_or(false, |meta| {
+            meta.post_token_balances.iter().any(|balance| balance.owner == key.to_string())
         }))
         .cloned()
         .collect()
 }
 
-fn extract_token_mints(tx: &EncodedConfirmedTransactionWithStatusMeta) -> Vec<Pubkey> {
-    // Extract token mints from token program instructions
-    let token_program = solana_sdk::spl_token::id();
-    
-    tx.transaction.message.account_keys.iter()
+fn get_token_accounts(tx: &EncodedConfirmedTransactionWithStatusMeta) -> Vec<Pubkey> {
+    tx.transaction.transaction.message.account_keys.iter()
         .filter(|key| {
-            tx.meta.as_ref().map_or(false, |meta| {
-                meta.post_token_balances.iter().any(|balance| balance.mint == key.to_string())
+            tx.transaction.meta.as_ref().map_or(false, |meta| {
+                meta.post_token_balances.iter().any(|balance| balance.account_index == key.to_string())
             })
         })
         .cloned()

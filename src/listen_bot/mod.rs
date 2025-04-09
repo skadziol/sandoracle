@@ -34,11 +34,15 @@ pub struct ListenBot {
     event_tx: mpsc::Sender<TransactionEvent>,
     /// Swap handler
     swap_handler: TokenSwapHandler,
+    /// Command sender
+    cmd_tx: mpsc::Sender<()>,
 }
 
 impl ListenBot {
     /// Creates a new ListenBot instance
-    pub async fn new(config: ListenBotConfig) -> Result<(Self, mpsc::Receiver<TransactionEvent>)> {
+    pub async fn new(config: ListenBotConfig) -> Result<mpsc::Sender<()>> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
+        let (price_tx, price_rx) = mpsc::channel(100);
         let (engine, price_rx) = Engine::from_env().await?;
         let engine = Arc::new(engine);
         let (event_tx, event_rx) = mpsc::channel(1000);
@@ -50,13 +54,7 @@ impl ListenBot {
             engine.privy.clone(),
         );
 
-        Ok((Self {
-            engine,
-            price_rx,
-            config,
-            event_tx,
-            swap_handler,
-        }, event_rx))
+        Ok(cmd_tx.clone())
     }
 
     /// Starts the ListenBot

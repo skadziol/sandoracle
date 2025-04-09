@@ -35,8 +35,7 @@ pub struct Settings {
     pub risk_level: RiskLevel,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy)]
 pub enum RiskLevel {
     Low,
     Medium,
@@ -44,14 +43,14 @@ pub enum RiskLevel {
 }
 
 impl FromStr for RiskLevel {
-    type Err = String;
+    type Err = ConfigError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "low" => Ok(RiskLevel::Low),
             "medium" => Ok(RiskLevel::Medium),
             "high" => Ok(RiskLevel::High),
-            _ => Err(format!("Invalid risk level: {}", s)),
+            _ => Err(ConfigError::Message(format!("Invalid risk level: {}", s))),
         }
     }
 }
