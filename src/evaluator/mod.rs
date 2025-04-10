@@ -29,7 +29,7 @@ pub enum RiskLevel {
     High = 3,
 }
 
-// Implement conversion from config::RiskLevel
+// Update the implementation to use the correct RiskLevel from config
 impl From<config::RiskLevel> for RiskLevel {
     fn from(config_level: config::RiskLevel) -> Self {
         match config_level {
