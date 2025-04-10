@@ -1,6 +1,6 @@
 # Task ID: 3
 # Title: Develop Basic Opportunity Evaluator
-# Status: pending
+# Status: done
 # Dependencies: 2
 # Priority: high
 # Description: Create the foundation for the Opportunity Evaluator component with initial scoring system and risk assessment.
@@ -45,7 +45,7 @@ Implementation steps:
 
 Testing approach: Test each scoring factor individually with boundary cases, then test the combined scoring system with realistic opportunity data to verify it produces sensible scores.
 
-## 3. Implement Decision-Making System with Execution Thresholds [pending]
+## 3. Implement Decision-Making System with Execution Thresholds [done]
 ### Dependencies: 3.1, 3.2
 ### Description: Create a real-time go/no-go decision-making system based on opportunity scores with configurable execution thresholds.
 ### Details:

@@ -1,93 +1,63 @@
-use thiserror::Error;
 use std::fmt;
 use reqwest::StatusCode;
 
 mod utils;
-pub use utils::*;
 
-#[derive(Error, Debug)]
+pub type Result<T> = std::result::Result<T, SandoError>;
+
+#[derive(Debug)]
 pub enum SandoError {
-    #[error("Configuration error: {0}")]
-    Config(#[from] config::ConfigError),
-
-    #[error("Environment error: {0}")]
+    Config(config::ConfigError),
     Environment(String),
-
-    #[error("Solana RPC error: {0}")]
     SolanaRpc(String),
-
-    #[error("Transaction error: {kind} - {message}")]
+    Simulation(String),
+    
     TransactionError {
         kind: TransactionErrorKind,
         message: String,
     },
-
-    #[error("MEV strategy error: {kind} - {message}")]
+    
     Strategy {
         kind: StrategyErrorKind,
         message: String,
     },
-
-    #[error("API error: {service} - {message}")]
+    
     Api {
         service: String,
         message: String,
         status: Option<u16>,
     },
-
-    #[error("Telegram notification error: {0}")]
+    
     Telegram(String),
-
-    #[error("RIG agent error: {kind} - {message}")]
+    
     RigAgent {
         kind: RigErrorKind,
         message: String,
     },
-
-    #[error("Opportunity evaluation error: {kind} - {message}")]
+    
     Evaluation {
         kind: EvalErrorKind,
         message: String,
     },
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    #[error("HTTP client error: {0}")]
-    HttpClient(#[from] reqwest::Error),
-
-    #[error("Unknown error: {0}")]
+    
+    Io(std::io::Error),
+    Serialization(serde_json::Error),
+    HttpClient(reqwest::Error),
     Unknown(String),
-
-    #[error("Timeout error: {0}")]
     Timeout(String),
-
-    #[error("HTTP error: {status} - {message}")]
+    
     HttpError {
         status: StatusCode,
         message: String,
     },
-
-    #[error("Network error: {0}")]
+    
     NetworkError(String),
-
-    #[error("Unexpected error: {0}")]
     Unexpected(String),
-
-    #[error("Invalid configuration: {0}")]
     ConfigError(String),
-
-    #[error("Database error: {0}")]
     DatabaseError(String),
-
-    #[error("Transaction processing error: {0}")]
     TransactionProcessingError(String),
-
-    #[error("Internal error: {0}")]
     InternalError(String),
+    EngineError(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +95,52 @@ pub enum EvalErrorKind {
     RiskTooHigh,
     StrategyUnavailable,
     Other,
+}
+
+impl fmt::Display for SandoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SandoError::Config(err) => write!(f, "Configuration error: {}", err),
+            SandoError::Environment(msg) => write!(f, "Environment error: {}", msg),
+            SandoError::SolanaRpc(msg) => write!(f, "Solana RPC error: {}", msg),
+            SandoError::TransactionError { kind, message } => {
+                write!(f, "Transaction error: {} - {}", kind, message)
+            }
+            SandoError::Strategy { kind, message } => {
+                write!(f, "MEV strategy error: {} - {}", kind, message)
+            }
+            SandoError::Api { service, message, status } => {
+                if let Some(status) = status {
+                    write!(f, "API error ({}): {} - {}", service, status, message)
+                } else {
+                    write!(f, "API error ({}): {}", service, message)
+                }
+            }
+            SandoError::Telegram(msg) => write!(f, "Telegram notification error: {}", msg),
+            SandoError::RigAgent { kind, message } => {
+                write!(f, "RIG agent error: {} - {}", kind, message)
+            }
+            SandoError::Evaluation { kind, message } => {
+                write!(f, "Opportunity evaluation error: {} - {}", kind, message)
+            }
+            SandoError::Io(err) => write!(f, "IO error: {}", err),
+            SandoError::Serialization(err) => write!(f, "Serialization error: {}", err),
+            SandoError::HttpClient(err) => write!(f, "HTTP client error: {}", err),
+            SandoError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
+            SandoError::Timeout(msg) => write!(f, "Timeout error: {}", msg),
+            SandoError::HttpError { status, message } => {
+                write!(f, "HTTP error {}: {}", status, message)
+            }
+            SandoError::NetworkError(msg) => write!(f, "Network error: {}", msg),
+            SandoError::Unexpected(msg) => write!(f, "Unexpected error: {}", msg),
+            SandoError::ConfigError(msg) => write!(f, "Invalid configuration: {}", msg),
+            SandoError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
+            SandoError::TransactionProcessingError(msg) => write!(f, "Transaction processing error: {}", msg),
+            SandoError::InternalError(msg) => write!(f, "Internal error: {}", msg),
+            SandoError::EngineError(msg) => write!(f, "Engine error: {}", msg),
+            SandoError::Simulation(msg) => write!(f, "Simulation error: {}", msg),
+        }
+    }
 }
 
 impl fmt::Display for TransactionErrorKind {
@@ -176,8 +192,6 @@ impl fmt::Display for EvalErrorKind {
     }
 }
 
-pub type Result<T> = std::result::Result<T, SandoError>;
-
 // Helper functions for error conversion
 impl SandoError {
     pub fn from_str(s: &str) -> Self {
@@ -225,17 +239,20 @@ impl SandoError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            SandoError::TransactionError {
+        match self {
+            SandoError::TransactionError { 
                 kind: TransactionErrorKind::Timeout | TransactionErrorKind::RpcError,
                 ..
-            } | SandoError::Api { status: Some(status), .. } if status >= &500
-            | SandoError::RigAgent {
+            } => true,
+            SandoError::HttpError { status, .. } => *status >= StatusCode::from_u16(500).unwrap(),
+            SandoError::RigAgent { 
                 kind: RigErrorKind::ApiError,
                 ..
-            }
-        )
+            } => true,
+            SandoError::NetworkError(_) => true,
+            SandoError::Timeout(_) => true,
+            _ => false,
+        }
     }
 }
 
@@ -254,15 +271,40 @@ impl From<String> for SandoError {
 
 impl From<reqwest::Error> for SandoError {
     fn from(err: reqwest::Error) -> Self {
-        if let Some(status) = err.status() {
+        if err.is_timeout() {
+            SandoError::Timeout(format!("Request timed out: {}", err))
+        } else if let Some(status) = err.status() {
             SandoError::HttpError {
                 status,
-                message: err.to_string(),
+                message: format!("{}", err),
             }
         } else {
-            SandoError::NetworkError(err.to_string())
+            SandoError::HttpClient(err)
         }
     }
+}
+
+impl From<config::ConfigError> for SandoError {
+    fn from(err: config::ConfigError) -> Self {
+        SandoError::Config(err)
+    }
+}
+
+impl From<std::io::Error> for SandoError {
+    fn from(err: std::io::Error) -> Self {
+        SandoError::Io(err)
+    }
+}
+
+impl From<serde_json::Error> for SandoError {
+    fn from(err: serde_json::Error) -> Self {
+        SandoError::Serialization(err)
+    }
+}
+
+// Add EngineError conversion for a generic error type
+pub fn from_engine_error<E: std::fmt::Display>(err: E) -> SandoError {
+    SandoError::EngineError(err.to_string())
 }
 
 pub fn should_retry(err: &SandoError) -> bool {
@@ -272,7 +314,52 @@ pub fn should_retry(err: &SandoError) -> bool {
             TransactionErrorKind::Timeout | TransactionErrorKind::RpcError
         ),
         SandoError::HttpError { status, .. } => *status >= StatusCode::from_u16(500).unwrap(),
+        SandoError::RigAgent { kind, .. } => matches!(kind, RigErrorKind::ApiError),
+        SandoError::NetworkError(_) => true,
+        SandoError::Timeout(_) => true,
         _ => false,
+    }
+}
+
+pub fn is_retryable(err: &SandoError) -> bool {
+    should_retry(err)
+}
+
+// Implement From trait for anyhow::Error
+impl From<anyhow::Error> for SandoError {
+    fn from(err: anyhow::Error) -> Self {
+        SandoError::InternalError(format!("{:?}", err)) // Use debug format for more details
+    }
+}
+
+// Standard error trait implementation
+impl std::error::Error for SandoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SandoError::Config(err) => Some(err),
+            SandoError::Environment(_) => None,
+            SandoError::SolanaRpc(_) => None,
+            SandoError::Simulation(_) => None,
+            SandoError::TransactionError { .. } => None,
+            SandoError::Strategy { .. } => None,
+            SandoError::Api { .. } => None,
+            SandoError::Telegram(_) => None,
+            SandoError::RigAgent { .. } => None,
+            SandoError::Evaluation { .. } => None,
+            SandoError::Io(err) => Some(err),
+            SandoError::Serialization(err) => Some(err),
+            SandoError::HttpClient(err) => Some(err),
+            SandoError::Unknown(_) => None,
+            SandoError::Timeout(_) => None,
+            SandoError::HttpError { .. } => None,
+            SandoError::NetworkError(_) => None,
+            SandoError::Unexpected(_) => None,
+            SandoError::ConfigError(_) => None,
+            SandoError::DatabaseError(_) => None,
+            SandoError::TransactionProcessingError(_) => None,
+            SandoError::InternalError(_) => None,
+            SandoError::EngineError(_) => None,
+        }
     }
 }
 

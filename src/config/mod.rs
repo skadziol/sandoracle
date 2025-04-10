@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use config::{Config, ConfigBuilder, ConfigError, Environment, File};
 use config::builder::DefaultState;
-use std::path::Path;
 use std::env;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -35,7 +34,8 @@ pub struct Settings {
     pub risk_level: RiskLevel,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RiskLevel {
     Low,
     Medium,
@@ -50,7 +50,7 @@ impl FromStr for RiskLevel {
             "low" => Ok(RiskLevel::Low),
             "medium" => Ok(RiskLevel::Medium),
             "high" => Ok(RiskLevel::High),
-            _ => Err(ConfigError::Message(format!("Invalid risk level: {}", s))),
+            _ => Err(ConfigError::Message(format!("Invalid risk level: {}", s)))
         }
     }
 }

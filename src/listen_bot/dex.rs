@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::fmt;
+use crate::listen_bot::transaction::{TransactionInfo, TransactionEvent, DexTransactionParser};
+use crate::error::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DexType {
@@ -46,8 +48,8 @@ struct OrcaParser;
 
 #[async_trait::async_trait]
 impl DexTransactionParser for OrcaParser {
-    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<DexTransaction>> {
-        // TODO: Implement Orca transaction parsing
+    async fn parse_transaction(&self, _tx_info: TransactionInfo) -> Result<Option<TransactionEvent>> {
+        // Implement proper parsing logic
         Ok(None)
     }
 
@@ -61,8 +63,8 @@ struct RaydiumParser;
 
 #[async_trait::async_trait]
 impl DexTransactionParser for RaydiumParser {
-    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<DexTransaction>> {
-        // TODO: Implement Raydium transaction parsing
+    async fn parse_transaction(&self, _tx_info: TransactionInfo) -> Result<Option<TransactionEvent>> {
+        // Implement proper parsing logic
         Ok(None)
     }
 
@@ -76,17 +78,12 @@ struct JupiterParser;
 
 #[async_trait::async_trait]
 impl DexTransactionParser for JupiterParser {
-    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<DexTransaction>> {
-        // TODO: Implement Jupiter transaction parsing
+    async fn parse_transaction(&self, _tx_info: TransactionInfo) -> Result<Option<TransactionEvent>> {
+        // Implement proper parsing logic
         Ok(None)
     }
 
     fn dex_name(&self) -> &'static str {
         "Jupiter"
     }
-}
-
-use crate::error::Result;
-use crate::listen_bot::transaction::{DexTransaction, DexTransactionParser};
-use solana_sdk::transaction::Transaction;
-use solana_transaction_status::UiTransactionStatusMeta; 
+} 

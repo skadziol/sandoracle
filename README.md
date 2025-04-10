@@ -24,24 +24,24 @@ SandoSeer is an autonomous MEV (Maximal Extractable Value) detection and executi
 ## Setup
 
 1. Clone the repository:
-   ```bash
+```bash
    git clone https://github.com/yourusername/sandoseer.git
    cd sandoseer
    ```
 
 2. Install dependencies:
-   ```bash
+```bash
    cargo build
    ```
 
 3. Create and configure `.env` file:
-   ```bash
+```bash
    cp .env.example .env
    # Edit .env with your configuration
    ```
 
 4. Run tests:
-   ```bash
+```bash
    cargo test
    ```
 

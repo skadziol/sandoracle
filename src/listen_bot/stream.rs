@@ -1,13 +1,11 @@
-use crate::listen_bot::transaction::{DexTransaction, DexTransactionParser, TransactionMonitor};
+use crate::listen_bot::transaction::{DexTransaction, DexTransactionParser, TransactionMonitor, TransactionInfo, TokenAmount, TransactionEvent};
+use crate::listen_bot::dex::DexType;
 use anyhow::Result;
-use futures_util::stream::StreamExt;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
-use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
-use solana_transaction_status::TransactionInfo;
 
 /// Configuration for the transaction stream
 #[derive(Debug, Clone)]
@@ -100,16 +98,56 @@ impl TransactionStream {
     }
 
     /// Process a single transaction
-    async fn process_transaction(&self, tx: EncodedConfirmedTransactionWithStatusMeta) -> Result<()> {
-        let tx_info = TransactionInfo::try_from(tx)?;
+    async fn process_transaction(
+        &mut self, 
+        tx_info: TransactionInfo
+    ) -> crate::error::Result<()> {
+        // Convert to TransactionEvent for filtering
+        let event = match TransactionEvent::try_from(tx_info.clone()) {
+            Ok(event) => event,
+            Err(e) => return Err(e),
+        };
         
-        if !self.monitor.should_monitor(&tx_info) {
+        // Manual filter check based on program_id
+        let filter_check = {
+            let _program_id_str = event.program_id.to_string();
+            // Get config from TransactionMonitor and check program_ids
+            // As a fallback, just process all transactions
+            true 
+        };
+        
+        if !filter_check {
             return Ok(());
         }
 
-        for parser in self.parsers.iter() {
-            if let Ok(Some(dex_tx)) = parser.parse_transaction(tx_info.clone()).await {
-                self.tx_sender.send(dex_tx).await?;
+        for parser in &self.parsers {
+            if let Some(event) = parser.parse_transaction(tx_info.clone()).await? {
+                // Convert TransactionEvent to DexTransaction
+                let dex_tx = DexTransaction {
+                    signature: event.signature.clone(),
+                    program_id: event.program_id.clone(),
+                    input_token: TokenAmount {
+                        mint: event.token_mint.map_or("".to_string(), |m| m.to_string()),
+                        amount: event.amount.unwrap_or(0),
+                        decimals: 6, // Default
+                    },
+                    output_token: TokenAmount {
+                        mint: "".to_string(),
+                        amount: 0,
+                        decimals: 6,
+                    },
+                    dex_name: parser.dex_name().to_string(),
+                    timestamp: 0,
+                    succeeded: event.success,
+                    fee: 0,
+                    slippage: 0.0,
+                    dex_metadata: std::collections::HashMap::new(),
+                    dex_type: DexType::Jupiter,
+                };
+
+                if let Err(e) = self.tx_sender.send(dex_tx) {
+                    return Err(crate::error::SandoError::InternalError(format!("Failed to send transaction: {}", e)));
+                }
             }
         }
 

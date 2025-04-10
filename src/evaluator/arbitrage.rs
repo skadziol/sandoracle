@@ -151,6 +151,8 @@ impl MevStrategyEvaluator for ArbitrageEvaluator {
             required_capital: amounts_clone[0],
             execution_time: (token_path.len() as u64) * 500, // Rough estimate: 500ms per hop
             metadata: serde_json::to_value(metadata)?,
+            score: None,
+            decision: None,
         };
 
         Ok(Some(opportunity))

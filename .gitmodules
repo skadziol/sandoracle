@@ -1,3 +1,6 @@
 [submodule "listen"]
 	path = listen
 	url = https://github.com/piotrostr/listen.git
+[submodule "rig"]
+	path = rig
+	url = https://github.com/piotrostr/rig.git

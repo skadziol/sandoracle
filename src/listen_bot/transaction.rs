@@ -1,5 +1,5 @@
-use crate::error::{Result, SandoError};
-use crate::listen_bot::types::TransactionInfo;
+use crate::error::{Result, SandoError, TransactionErrorKind};
+use crate::listen_bot::dex::DexType;
 use crate::listen_bot::config::ListenBotConfig;
 use solana_sdk::{signature::Signature, pubkey::Pubkey};
 use std::collections::HashMap;
@@ -11,8 +11,7 @@ use solana_sdk::{
 };
 use solana_transaction_status::UiTransactionStatusMeta;
 use std::fmt::Debug;
-use crate::listen_bot::DexType;
-use crate::error::TransactionErrorKind;
+use tracing::{debug};
 
 /// Represents a DEX transaction with relevant MEV information
 #[derive(Debug, Clone)]
@@ -126,27 +125,33 @@ impl TransactionMonitor {
     async fn should_process_transaction(&self, event: &TransactionEvent) -> bool {
         let filter = &self.config.filter;
 
-        // Check program ID filter
-        if !filter.program_ids.contains(&event.program_id.to_string()) {
+        // Check if transaction is from a monitored program
+        let program_id_str = event.program_id.to_string();
+        if !filter.program_ids.iter().any(|id| id.to_string() == program_id_str) {
+            debug!("Skipping transaction: program_id not monitored");
             return false;
         }
 
-        // Check token mint filter if specified
+        // If the transaction involves tokens, check if any monitored tokens are involved
         if let Some(token_mint) = &event.token_mint {
-            if !filter.token_mints.contains(&token_mint.to_string()) {
+            let token_mint_str = token_mint.to_string();
+            if !filter.token_mints.iter().any(|mint| mint.to_string() == token_mint_str) {
+                debug!("Skipping transaction: token_mint not monitored");
                 return false;
             }
         }
 
-        // Check minimum size
+        // Check minimum transaction size if applicable
         if let Some(amount) = event.amount {
-            if amount < filter.min_size {
+            if filter.min_size > 0 && amount < filter.min_size {
+                debug!("Skipping transaction: amount {} below minimum {}", amount, filter.min_size);
                 return false;
             }
         }
 
-        // Check transaction success
-        if !filter.include_failed && !event.success {
+        // Check if we should include failed transactions
+        if !event.success && !filter.include_failed {
+            debug!("Skipping failed transaction");
             return false;
         }
 
@@ -162,7 +167,18 @@ impl Default for TransactionMonitor {
 
 /// Trait for parsing DEX-specific transactions
 #[async_trait]
-pub trait DexTransactionParser: std::fmt::Debug {
-    /// Parse a transaction to extract DEX-specific information
+pub trait DexTransactionParser: Send + Sync + std::fmt::Debug {
+    fn dex_name(&self) -> &'static str;
     async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<TransactionEvent>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionInfo {
+    pub transaction: Transaction,
+    pub meta: Option<UiTransactionStatusMeta>,
+    pub signature: String,
+    pub program_id: String,
+    pub token_mint: Option<String>,
+    pub amount: Option<u64>,
+    pub success: bool,
 } 
