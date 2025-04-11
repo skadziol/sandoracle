@@ -58,6 +58,7 @@ pub enum SandoError {
     TransactionProcessingError(String),
     InternalError(String),
     EngineError(String),
+    DependencyError(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +140,7 @@ impl fmt::Display for SandoError {
             SandoError::InternalError(msg) => write!(f, "Internal error: {}", msg),
             SandoError::EngineError(msg) => write!(f, "Engine error: {}", msg),
             SandoError::Simulation(msg) => write!(f, "Simulation error: {}", msg),
+            SandoError::DependencyError(msg) => write!(f, "Dependency error: {}", msg),
         }
     }
 }
@@ -251,6 +253,9 @@ impl SandoError {
             } => true,
             SandoError::NetworkError(_) => true,
             SandoError::Timeout(_) => true,
+            SandoError::Io(_) => true,
+            SandoError::EngineError(_) => true,
+            SandoError::DependencyError(_) => false,
             _ => false,
         }
     }
@@ -359,6 +364,7 @@ impl std::error::Error for SandoError {
             SandoError::TransactionProcessingError(_) => None,
             SandoError::InternalError(_) => None,
             SandoError::EngineError(_) => None,
+            SandoError::DependencyError(_) => None,
         }
     }
 }
