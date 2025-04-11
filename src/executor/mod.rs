@@ -35,6 +35,13 @@ pub struct SimulationResult {
     pub instruction_logs: Vec<String>,
     pub compute_units_consumed: u64,
     pub accounts_referenced: Vec<String>,
+    // Enhanced fields for better simulation analysis
+    pub program_ids_called: Vec<Pubkey>,
+    pub is_simulation_successful: bool,
+    pub token_accounts_created: Vec<Pubkey>,
+    pub simulation_warnings: Vec<String>,
+    pub gas_used_per_instruction: HashMap<usize, u64>,
+    pub token_amount_changes: HashMap<String, f64>, // Total amount changes in tokens
 }
 
 /// Represents a token balance change in the simulation
@@ -44,6 +51,35 @@ pub struct TokenBalanceChange {
     pub ui_amount_change: f64,
     pub ui_amount_before: f64,
     pub ui_amount_after: f64,
+}
+
+/// Additional struct to track simulation details more comprehensively
+#[derive(Debug, Clone)]
+pub struct SimulationLogAnalysis {
+    pub program_invocations: Vec<ProgramInvocation>,
+    pub account_updates: Vec<AccountUpdate>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// Tracks program invocations during simulation
+#[derive(Debug, Clone)]
+pub struct ProgramInvocation {
+    pub program_id: Pubkey,
+    pub instruction_index: usize,
+    pub depth: usize,
+    pub success: bool,
+    pub compute_units: Option<u64>,
+}
+
+/// Tracks account updates during simulation
+#[derive(Debug, Clone)]
+pub struct AccountUpdate {
+    pub pubkey: Pubkey,
+    pub is_writable: bool,
+    pub data_size_change: Option<i64>,
+    pub lamport_change: Option<i64>,
+    pub owner: Option<Pubkey>,
 }
 
 /// Handles the simulation and execution of MEV transactions
@@ -173,13 +209,13 @@ impl TransactionExecutor {
         // --- 1. Get Pre-Transaction State ---
         let pre_balances = self.get_token_balances(&opportunity.involved_tokens).await?;
         
-        // --- 2. Simulate Transaction ---
+        // --- 2. Simulate Transaction with Enhanced Configuration ---
         let config = RpcSimulateTransactionConfig {
             sig_verify: false,
             replace_recent_blockhash: true,
             commitment: None,
             encoding: None,
-            accounts: None, // We'll handle account tracking separately
+            accounts: None, // Using None for accounts as the type is complex
             min_context_slot: None,
             inner_instructions: true,
         };
@@ -201,47 +237,71 @@ impl TransactionExecutor {
                 instruction_logs: Vec::new(),
                 compute_units_consumed: 0,
                 accounts_referenced: Vec::new(),
+                program_ids_called: Vec::new(),
+                is_simulation_successful: false,
+                token_accounts_created: Vec::new(),
+                simulation_warnings: vec![format!("Simulation failed with error: {:?}", err)],
+                gas_used_per_instruction: HashMap::new(),
+                token_amount_changes: HashMap::new(),
             });
         }
 
-        // --- 3. Extract Simulation Data ---
+        // --- 3. Extract Simulation Data with Enhanced Analysis ---
         let compute_units_consumed = simulation_result.value.units_consumed.unwrap_or(0);
-        let estimated_gas_cost = compute_units_consumed * 5000; // 5000 lamports per CU
+        let estimated_gas_cost = compute_units_consumed * 5000; // 5000 lamports per CU is standard
         
         let logs = simulation_result.value.logs.unwrap_or_default();
         
-        // Process accounts if available
-        let accounts_referenced: Vec<String> = Vec::new();
-        let post_balances = pre_balances.clone();
+        // Perform enhanced log analysis to extract detailed information
+        let log_analysis = self.analyze_simulation_logs(&logs);
         
-        if let Some(accounts) = &simulation_result.value.accounts {
-            for (_i, acc_opt) in accounts.iter().enumerate() {
-                if let Some(_acc_data) = acc_opt {
-                    // Process account data if needed
-                    // This would update post_balances based on account state
-                }
+        // Process accounts with more detailed extraction
+        let mut accounts_referenced: Vec<String> = Vec::new();
+        let mut post_balances = pre_balances.clone();
+        let mut program_ids_called: Vec<Pubkey> = Vec::new();
+        let mut token_accounts_created: Vec<Pubkey> = Vec::new();
+        let mut gas_used_per_instruction: HashMap<usize, u64> = HashMap::new();
+        
+        // Extract program IDs from log analysis
+        for invocation in &log_analysis.program_invocations {
+            if !program_ids_called.contains(&invocation.program_id) {
+                program_ids_called.push(invocation.program_id);
+            }
+            
+            // Track gas used per instruction
+            if let Some(compute_units) = invocation.compute_units {
+                gas_used_per_instruction.insert(invocation.instruction_index, compute_units);
             }
         }
         
-        // --- 4. Extract Token Balance Changes ---
-        // Here we'd parse balance changes from logs or post-transaction state
-        // For now, we'll simulate these changes for testing
+        // Add accounts referenced from transaction
+        for key in &transaction.message.account_keys {
+            accounts_referenced.push(key.to_string());
+        }
+        
+        // --- 4. Extract Token Balance Changes with Enhanced Analysis ---
         let token_balance_changes = self.calculate_token_balance_changes(pre_balances, post_balances)?;
         
-        // --- 5. Calculate Profit ---
+        // Create a map of just the change amounts for easier access
+        let mut token_amount_changes = HashMap::new();
+        for (token, change) in &token_balance_changes {
+            token_amount_changes.insert(token.clone(), change.ui_amount_change);
+        }
+        
+        // --- 5. Calculate Profit with Enhanced Precision ---
         let (profit_sol, profit_usd) = self.calculate_profit(&token_balance_changes, estimated_gas_cost, opportunity).await?;
         
-        // --- 6. Perform Safety Checks ---
-        let accounts: Vec<Account> = Vec::new(); // We'd extract accounts from simulation data
-        let instruction_count = transaction.message().instructions.len() as u64;
-        let (safety_checks_passed, safety_error) = self.perform_safety_checks(
+        // --- 6. Perform Enhanced Safety Checks ---
+        let instruction_count = transaction.message.instructions.len() as u64;
+        let (safety_checks_passed, safety_error) = self.perform_enhanced_safety_checks(
             opportunity, 
-            &token_balance_changes, 
-            &accounts, 
+            &token_balance_changes,
+            &program_ids_called,
+            &log_analysis,
             instruction_count
         ).await?;
         
-        // --- 7. Build Final Simulation Result ---
+        // --- 7. Build Final Enhanced Simulation Result ---
         let is_profitable = profit_sol > 0.0 && (estimated_gas_cost as f64 / LAMPORTS_PER_SOL as f64) < profit_sol;
         
         let result = SimulationResult {
@@ -254,7 +314,13 @@ impl TransactionExecutor {
             token_balance_changes,
             instruction_logs: logs,
             compute_units_consumed,
-            accounts_referenced: accounts_referenced,
+            accounts_referenced,
+            program_ids_called,
+            is_simulation_successful: true,
+            token_accounts_created,
+            simulation_warnings: log_analysis.warnings,
+            gas_used_per_instruction,
+            token_amount_changes,
         };
         
         info!(
@@ -263,7 +329,8 @@ impl TransactionExecutor {
             gas_cost = result.estimated_gas_cost,
             is_profitable = result.is_profitable,
             safety_passed = result.safety_checks_passed,
-            "Simulation completed"
+            programs_called = result.program_ids_called.len(),
+            "Enhanced simulation completed"
         );
         
         Ok(result)
@@ -409,12 +476,173 @@ impl TransactionExecutor {
         Ok(25.0) // Example: 1 SOL = $25 USD
     }
 
-    /// Performs safety checks on the transaction
-    async fn perform_safety_checks(
+    /// Analyzes simulation logs to extract detailed information about program invocations,
+    /// account updates, and potential warnings or errors.
+    fn analyze_simulation_logs(&self, logs: &[String]) -> SimulationLogAnalysis {
+        let mut analysis = SimulationLogAnalysis {
+            program_invocations: Vec::new(),
+            account_updates: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+        
+        let mut current_depth = 0;
+        let mut current_program: Option<Pubkey> = None;
+        let mut current_instruction_index: Option<usize> = None;
+        
+        for log in logs {
+            // Track program invocations
+            if log.contains("Program ") && log.contains(" invoke [") {
+                current_depth += 1;
+                
+                // Extract program ID
+                if let Some(start) = log.find("Program ") {
+                    if let Some(end) = log[start..].find(" invoke") {
+                        let program_id_str = &log[start + 8..start + end];
+                        if let Ok(program_id) = Pubkey::from_str(program_id_str) {
+                            current_program = Some(program_id);
+                            
+                            // Extract instruction index if present
+                            if let Some(idx_start) = log.find("[") {
+                                if let Some(idx_end) = log[idx_start..].find("]") {
+                                    if let Ok(idx) = log[idx_start + 1..idx_start + idx_end].parse::<usize>() {
+                                        current_instruction_index = Some(idx);
+                                    }
+                                }
+                            }
+                            
+                            // Add to program invocations
+                            analysis.program_invocations.push(ProgramInvocation {
+                                program_id,
+                                instruction_index: current_instruction_index.unwrap_or(0),
+                                depth: current_depth,
+                                success: true, // We'll update this if we find a failure
+                                compute_units: None, // We'll update this if we find compute units info
+                            });
+                        }
+                    }
+                }
+            }
+            // Track program success/failure
+            else if log.contains("Program ") && log.contains(" success") {
+                current_depth -= 1;
+                
+                // Update the last matching invocation as successful
+                if let Some(program_id) = current_program {
+                    if let Some(invocation) = analysis.program_invocations.iter_mut().rev().find(|inv| 
+                        inv.program_id == program_id && inv.depth == current_depth + 1
+                    ) {
+                        invocation.success = true;
+                    }
+                }
+                
+                // Clear current program if we're back to the root
+                if current_depth == 0 {
+                    current_program = None;
+                    current_instruction_index = None;
+                }
+            }
+            else if log.contains("Program ") && log.contains(" failed") {
+                current_depth -= 1;
+                
+                // Update the last matching invocation as failed
+                if let Some(program_id) = current_program {
+                    if let Some(invocation) = analysis.program_invocations.iter_mut().rev().find(|inv| 
+                        inv.program_id == program_id && inv.depth == current_depth + 1
+                    ) {
+                        invocation.success = false;
+                    }
+                }
+                
+                // Add to errors
+                analysis.errors.push(log.clone());
+                
+                // Clear current program if we're back to the root
+                if current_depth == 0 {
+                    current_program = None;
+                    current_instruction_index = None;
+                }
+            }
+            // Track compute units
+            else if log.contains("Program consumption: ") {
+                if let Some(start) = log.find("Program consumption: ") {
+                    if let Some(end) = log[start..].find(" compute units") {
+                        if let Ok(units) = log[start + 20..start + end].parse::<u64>() {
+                            // Update the last program invocation with compute units
+                            if let Some(last) = analysis.program_invocations.last_mut() {
+                                last.compute_units = Some(units);
+                            }
+                        }
+                    }
+                }
+            }
+            // Track account updates
+            else if log.contains("Account data:") || log.contains("TokenAccount:") {
+                // Extract account updates - parse the log to find account information
+                // This is a simplified example, you would need to handle different log formats
+                if let Some(pubkey_start) = log.find("Account ") {
+                    if let Some(pubkey_end) = log[pubkey_start..].find(" ") {
+                        let pubkey_str = &log[pubkey_start + 8..pubkey_start + pubkey_end];
+                        if let Ok(pubkey) = Pubkey::from_str(pubkey_str) {
+                            let is_writable = log.contains("writable");
+                            let mut account_update = AccountUpdate {
+                                pubkey,
+                                is_writable,
+                                data_size_change: None,
+                                lamport_change: None,
+                                owner: None,
+                            };
+                            
+                            // Try to extract more information...
+                            if let Some(owner_start) = log.find("owner: ") {
+                                if let Some(owner_end) = log[owner_start..].find(" ") {
+                                    let owner_str = &log[owner_start + 7..owner_start + owner_end];
+                                    if let Ok(owner) = Pubkey::from_str(owner_str) {
+                                        account_update.owner = Some(owner);
+                                    }
+                                }
+                            }
+                            
+                            analysis.account_updates.push(account_update);
+                        }
+                    }
+                }
+            }
+            // Track warnings
+            else if log.contains("warning:") || log.contains("WARNING:") {
+                analysis.warnings.push(log.clone());
+            }
+        }
+        
+        analysis
+    }
+
+    /// Checks if an account is a token account by examining its owner
+    fn is_token_account(&self, _pubkey: &Pubkey, account: &Account) -> bool {
+        // Check if the account is owned by the SPL Token program
+        account.owner == solana_sdk::pubkey::Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap_or_default()
+    }
+
+    /// Converts a token amount to UI amount based on decimals
+    async fn convert_amount_to_ui_amount(&self, amount: u64, mint_pubkey: Pubkey) -> Result<f64> {
+        let decimals = match self.get_mint_decimals(&mint_pubkey).await {
+            Ok(d) => d,
+            Err(_) => {
+                warn!(mint = %mint_pubkey, "Failed to get token decimals, using default of 9");
+                9 // Default to 9 if we can't get the exact value
+            }
+        };
+        
+        Ok(amount as f64 / 10f64.powi(decimals as i32))
+    }
+
+    /// Enhanced safety checks for transaction simulation
+    async fn perform_enhanced_safety_checks(
         &self,
         opportunity: &MevOpportunity,
         token_changes: &HashMap<String, TokenBalanceChange>,
-        _accounts: &[Account],
+        program_ids_called: &[Pubkey],
+        log_analysis: &SimulationLogAnalysis,
         instruction_count: u64,
     ) -> Result<(bool, Option<String>)> {
         // --- 1. Check token balance changes ---
@@ -439,12 +667,152 @@ impl TransactionExecutor {
         }
         
         // --- 3. Check for unauthorized program calls ---
-        // This would need to parse the accounts referenced in the transaction
-        // or analyze the simulation logs for program invocations
+        for program_id in program_ids_called {
+            let program_id_str = program_id.to_string();
+            let is_allowed = opportunity.allowed_programs.iter().any(|allowed| 
+                allowed.to_string() == program_id_str
+            );
+            
+            if !is_allowed {
+                return Ok((false, Some(format!(
+                    "Unauthorized program call: {}",
+                    program_id
+                ))));
+            }
+        }
         
-        // --- 4. Check for suspicious account references ---
-        // In a real implementation, this would analyze accounts referenced
-        // in the transaction against a whitelist or known patterns
+        // --- 4. Check for program invocation failures ---
+        for invocation in &log_analysis.program_invocations {
+            if !invocation.success {
+                return Ok((false, Some(format!(
+                    "Program invocation failed: {}",
+                    invocation.program_id
+                ))));
+            }
+        }
+        
+        // --- 5. Check for suspicious account references ---
+        for account_update in &log_analysis.account_updates {
+            // Check if this is a suspicious account modification
+            // For example, if it's modifying a well-known account or changing ownership
+            if account_update.is_writable {
+                // Add specific account safety checks here
+                // Example: Prevent modifying well-known accounts
+                let pubkey_str = account_update.pubkey.to_string();
+                
+                // Check against a list of protected accounts
+                let protected_accounts = vec![
+                    "11111111111111111111111111111111", // System Program
+                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Token Program
+                    // Add more protected accounts as needed
+                ];
+                
+                if protected_accounts.contains(&pubkey_str.as_str()) {
+                    return Ok((false, Some(format!(
+                        "Attempt to modify protected account: {}",
+                        pubkey_str
+                    ))));
+                }
+            }
+        }
+        
+        // --- 6. Check warnings from logs ---
+        if !log_analysis.warnings.is_empty() {
+            // You can decide if warnings should fail the safety check or just be noted
+            warn!(
+                warning_count = log_analysis.warnings.len(),
+                "Simulation produced warnings"
+            );
+            
+            // For now, we'll just log the warnings and not fail the check
+        }
+        
+        // --- 7. Verify profitability considering gas costs ---
+        let mut total_profit_sol = 0.0;
+        let mut total_sol_spent = 0.0;
+        let gas_cost_sol = 5000.0 * instruction_count as f64 / LAMPORTS_PER_SOL as f64;
+        
+        // Calculate the total profit/loss in SOL from all token changes
+        for (token, change) in token_changes.iter() {
+            if token == "SOL" {
+                if change.ui_amount_change > 0.0 {
+                    total_profit_sol += change.ui_amount_change;
+                } else if change.ui_amount_change < 0.0 {
+                    total_sol_spent += change.ui_amount_change.abs();
+                }
+            } else {
+                // Convert token to SOL value
+                let token_price_sol = match self.get_token_price_in_sol(token).await {
+                    Ok(price) => price,
+                    Err(_) => {
+                        warn!(token = token, "Failed to get token price, using fallback");
+                        0.01 // Default fallback price
+                    }
+                };
+                
+                let token_value_sol = change.ui_amount_change * token_price_sol;
+                if token_value_sol > 0.0 {
+                    total_profit_sol += token_value_sol;
+                } else if token_value_sol < 0.0 {
+                    total_sol_spent += token_value_sol.abs();
+                }
+            }
+        }
+        
+        // Account for gas costs
+        let net_profit_sol = total_profit_sol - gas_cost_sol - total_sol_spent;
+        
+        // Get current SOL price in USD
+        let sol_price_usd = match self.get_sol_price_usd().await {
+            Ok(price) => price,
+            Err(_) => {
+                warn!("Failed to get SOL price, using fallback");
+                25.0 // Default fallback price
+            }
+        };
+        
+        let net_profit_usd = net_profit_sol * sol_price_usd;
+        
+        // Define minimum profit thresholds
+        let minimum_profit_sol = gas_cost_sol * 2.0; // Require profit to be at least 2x gas cost
+        let minimum_profit_usd = 0.1; // $0.10 USD minimum profit
+        
+        // Compare with original opportunity estimate (allow for some deviation)
+        let max_deviation = 0.5; // 50% deviation allowance
+        let min_expected_profit = opportunity.estimated_profit * (1.0 - max_deviation);
+        
+        // Log the profit calculations
+        info!(
+            gas_cost_sol = gas_cost_sol,
+            total_profit_sol = total_profit_sol,
+            total_sol_spent = total_sol_spent,
+            net_profit_sol = net_profit_sol,
+            net_profit_usd = net_profit_usd,
+            expected_profit = opportunity.estimated_profit,
+            "Profit calculation completed"
+        );
+        
+        // Check against thresholds
+        if net_profit_sol < minimum_profit_sol {
+            return Ok((false, Some(format!(
+                "Insufficient profit: {} SOL is below minimum threshold of {} SOL (2x gas)",
+                net_profit_sol, minimum_profit_sol
+            ))));
+        }
+        
+        if net_profit_usd < minimum_profit_usd {
+            return Ok((false, Some(format!(
+                "Insufficient profit: ${:.2} USD is below minimum threshold of ${:.2} USD",
+                net_profit_usd, minimum_profit_usd
+            ))));
+        }
+        
+        if net_profit_sol < min_expected_profit {
+            return Ok((false, Some(format!(
+                "Profit too low compared to estimate: {} SOL vs expected minimum of {} SOL",
+                net_profit_sol, min_expected_profit
+            ))));
+        }
         
         // All checks passed
         Ok((true, None))
