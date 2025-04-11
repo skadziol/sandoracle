@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use crate::config; // Import config module to access config::RiskLevel
+use tracing::{info, warn, debug, error};
 
 /// Represents different types of MEV strategies
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -187,12 +188,49 @@ pub trait MevStrategyEvaluator: Send + Sync {
     async fn validate(&self, opportunity: &MevOpportunity) -> Result<bool>;
 }
 
+/// Registry for MEV strategy evaluators
+#[derive(Default)]
+pub struct StrategyRegistry {
+    evaluators: HashMap<MevStrategy, Box<dyn MevStrategyEvaluator>>,
+}
+
+impl StrategyRegistry {
+    pub fn new() -> Self {
+        Self {
+            evaluators: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, evaluator: Box<dyn MevStrategyEvaluator>) -> Option<Box<dyn MevStrategyEvaluator>> {
+        let strategy_type = evaluator.strategy_type();
+        debug!(strategy = ?strategy_type, "Registering strategy evaluator");
+        self.evaluators.insert(strategy_type, evaluator)
+    }
+
+    pub fn get(&self, strategy: &MevStrategy) -> Option<&dyn MevStrategyEvaluator> {
+        self.evaluators.get(strategy).map(|e| e.as_ref())
+    }
+
+    pub fn contains_strategy(&self, strategy: &MevStrategy) -> bool {
+        self.evaluators.contains_key(strategy)
+    }
+
+    pub fn remove(&mut self, strategy: &MevStrategy) -> Option<Box<dyn MevStrategyEvaluator>> {
+        debug!(strategy = ?strategy, "Removing strategy evaluator");
+        self.evaluators.remove(strategy)
+    }
+
+    pub fn strategies(&self) -> Vec<MevStrategy> {
+        self.evaluators.keys().cloned().collect()
+    }
+}
+
 /// Main opportunity evaluator that coordinates different strategy evaluators
 pub struct OpportunityEvaluator {
     /// The underlying listen-engine instance
     engine: Arc<Engine>,
-    /// Strategy evaluators
-    evaluators: Vec<Box<dyn MevStrategyEvaluator>>,
+    /// Strategy registry
+    strategy_registry: StrategyRegistry,
     /// Minimum confidence threshold for opportunities
     min_confidence: f64,
     /// Maximum risk level allowed
@@ -212,14 +250,24 @@ impl OpportunityEvaluator {
         max_risk_level: RiskLevel,
         min_profit_threshold: f64,
     ) -> Result<Self> {
+        info!(
+            min_confidence = min_confidence,
+            risk_level = ?max_risk_level,
+            min_profit = min_profit_threshold,
+            "Creating new OpportunityEvaluator"
+        );
+
         // Instantiate Engine using from_env()
         let (engine_instance, _receiver) = Engine::from_env().await
-            .map_err(|e| anyhow::anyhow!("Failed to create listen-engine Engine from env: {}", e))?;
+            .map_err(|e| {
+                error!(error = %e, "Failed to create listen-engine Engine");
+                anyhow::anyhow!("Failed to create listen-engine Engine from env: {}", e)
+            })?;
         let engine = Arc::new(engine_instance);
         
         Ok(Self {
-            engine, // Use the created engine instance
-            evaluators: Vec::new(),
+            engine,
+            strategy_registry: StrategyRegistry::new(),
             min_confidence,
             max_risk_level,
             min_profit_threshold,
@@ -258,30 +306,76 @@ impl OpportunityEvaluator {
 
     /// Registers a new strategy evaluator
     pub fn register_evaluator(&mut self, evaluator: Box<dyn MevStrategyEvaluator>) {
-        self.evaluators.push(evaluator);
+        let strategy_type = evaluator.strategy_type();
+        info!(strategy = ?strategy_type, "Registering new strategy evaluator");
+        if let Some(old_evaluator) = self.strategy_registry.register(evaluator) {
+            warn!(
+                strategy = ?strategy_type,
+                "Replaced existing evaluator for strategy"
+            );
+        }
     }
 
     /// Evaluates incoming data for MEV opportunities across all registered strategies
     pub async fn evaluate_opportunity(&self, data: serde_json::Value) -> Result<Vec<MevOpportunity>> {
+        debug!(data = ?data, "Evaluating opportunity data");
         let mut opportunities = Vec::new();
 
-        for evaluator in &self.evaluators {
-            if let Some(mut opportunity) = evaluator.evaluate(&data).await? {
+        for strategy in self.strategy_registry.strategies() {
+            if let Some(evaluator) = self.strategy_registry.get(&strategy) {
+                debug!(strategy = ?strategy, "Evaluating with strategy");
+                match evaluator.evaluate(&data).await {
+                    Ok(Some(mut opportunity)) => {
                 // Calculate opportunity score
                 let score = self.calculate_opportunity_score(&opportunity);
                 opportunity.score = Some(score);
+                        debug!(
+                            strategy = ?strategy,
+                            score = score,
+                            "Calculated opportunity score"
+                        );
                 
                 // Make execution decision
                 let decision = self.make_execution_decision(&opportunity);
                 opportunity.decision = Some(decision);
+                        debug!(
+                            strategy = ?strategy,
+                            decision = ?decision,
+                            "Made execution decision"
+                        );
                 
                 // Apply filtering based on configured thresholds
                 if self.meets_thresholds(&opportunity) {
+                            debug!(
+                                strategy = ?strategy,
+                                "Opportunity meets thresholds, adding to results"
+                            );
                     opportunities.push(opportunity);
+                        } else {
+                            debug!(
+                                strategy = ?strategy,
+                                "Opportunity does not meet thresholds, skipping"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(strategy = ?strategy, "No opportunity found for strategy");
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            strategy = ?strategy,
+                            "Error evaluating opportunity"
+                        );
+                    }
                 }
             }
         }
 
+        info!(
+            opportunities_found = opportunities.len(),
+            "Completed opportunity evaluation"
+        );
         Ok(opportunities)
     }
 
@@ -419,7 +513,154 @@ impl OpportunityEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio; // Ensure tokio is available for async tests
+    use std::sync::Arc;
+    use tokio;
+    use anyhow::Result;
+
+    // Mock strategy evaluator for testing
+    struct MockEvaluator {
+        strategy: MevStrategy,
+        should_succeed: bool,
+    }
+
+    impl MockEvaluator {
+        fn new(strategy: MevStrategy, should_succeed: bool) -> Self {
+            Self {
+                strategy,
+                should_succeed,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MevStrategyEvaluator for MockEvaluator {
+        fn strategy_type(&self) -> MevStrategy {
+            self.strategy.clone()
+        }
+
+        async fn evaluate(&self, _data: &serde_json::Value) -> Result<Option<MevOpportunity>> {
+            if self.should_succeed {
+                Ok(Some(MevOpportunity {
+                    strategy: self.strategy.clone(),
+                    estimated_profit: 100.0,
+                    confidence: 0.9,
+                    risk_level: RiskLevel::Low,
+                    required_capital: 1000.0,
+                    execution_time: 500,
+                    metadata: serde_json::json!({}),
+                    score: None,
+                    decision: None,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn validate(&self, _opportunity: &MevOpportunity) -> Result<bool> {
+            Ok(self.should_succeed)
+        }
+    }
+
+    #[test]
+    fn test_strategy_registry_operations() {
+        let mut registry = StrategyRegistry::new();
+        
+        // Test registration
+        let evaluator = Box::new(MockEvaluator::new(MevStrategy::Arbitrage, true));
+        assert!(registry.register(evaluator).is_none());
+        
+        // Test contains_strategy
+        assert!(registry.contains_strategy(&MevStrategy::Arbitrage));
+        assert!(!registry.contains_strategy(&MevStrategy::Sandwich));
+        
+        // Test get
+        assert!(registry.get(&MevStrategy::Arbitrage).is_some());
+        assert!(registry.get(&MevStrategy::Sandwich).is_none());
+        
+        // Test strategies list
+        let strategies = registry.strategies();
+        assert_eq!(strategies.len(), 1);
+        assert_eq!(strategies[0], MevStrategy::Arbitrage);
+        
+        // Test remove
+        let removed = registry.remove(&MevStrategy::Arbitrage);
+        assert!(removed.is_some());
+        assert!(!registry.contains_strategy(&MevStrategy::Arbitrage));
+    }
+
+    #[tokio::test]
+    async fn test_evaluator_with_multiple_strategies() {
+        let mut evaluator = create_test_evaluator().await;
+        
+        // Register multiple strategies
+        evaluator.register_evaluator(Box::new(MockEvaluator::new(MevStrategy::Arbitrage, true)));
+        evaluator.register_evaluator(Box::new(MockEvaluator::new(MevStrategy::Sandwich, true)));
+        evaluator.register_evaluator(Box::new(MockEvaluator::new(MevStrategy::TokenSnipe, false)));
+        
+        // Test evaluation
+        let test_data = serde_json::json!({
+            "test": "data"
+        });
+        
+        let opportunities = evaluator.evaluate_opportunity(test_data).await.unwrap();
+        
+        // Should get opportunities from Arbitrage and Sandwich, but not TokenSnipe
+        assert_eq!(opportunities.len(), 2);
+        
+        // Verify opportunities have scores and decisions
+        for opportunity in opportunities {
+            assert!(opportunity.score.is_some());
+            assert!(opportunity.decision.is_some());
+            assert!(matches!(
+                opportunity.strategy,
+                MevStrategy::Arbitrage | MevStrategy::Sandwich
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evaluator_threshold_filtering() {
+        let mut evaluator = create_test_evaluator().await;
+        
+        // Create custom thresholds
+        let mut thresholds = ExecutionThresholds::default();
+        thresholds.min_confidence = 0.95; // Set high confidence requirement
+        evaluator.update_execution_thresholds(thresholds);
+        
+        // Register a strategy that produces opportunities with 0.9 confidence
+        evaluator.register_evaluator(Box::new(MockEvaluator::new(MevStrategy::Arbitrage, true)));
+        
+        let test_data = serde_json::json!({
+            "test": "data"
+        });
+        
+        let opportunities = evaluator.evaluate_opportunity(test_data).await.unwrap();
+        
+        // Should get no opportunities due to confidence threshold
+        assert_eq!(opportunities.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_strategy_replacement() {
+        let mut evaluator = create_test_evaluator().await;
+        
+        // Register initial strategy
+        evaluator.register_evaluator(Box::new(MockEvaluator::new(MevStrategy::Arbitrage, false)));
+        
+        // Test with initial strategy
+        let test_data = serde_json::json!({
+            "test": "data"
+        });
+        let opportunities = evaluator.evaluate_opportunity(test_data.clone()).await.unwrap();
+        assert_eq!(opportunities.len(), 0);
+        
+        // Replace with new strategy that succeeds
+        evaluator.register_evaluator(Box::new(MockEvaluator::new(MevStrategy::Arbitrage, true)));
+        
+        // Test with replaced strategy
+        let opportunities = evaluator.evaluate_opportunity(test_data).await.unwrap();
+        assert_eq!(opportunities.len(), 1);
+    }
 
     // Helper to create evaluator for tests (panics on error for simplicity)
     async fn create_test_evaluator() -> OpportunityEvaluator {
@@ -427,7 +668,7 @@ mod tests {
             .expect("Engine creation failed in test - check environment variables");
         OpportunityEvaluator {
             engine: Arc::new(engine_instance),
-            evaluators: Vec::new(),
+            strategy_registry: StrategyRegistry::new(),
             min_confidence: 0.7, // Default test confidence
             max_risk_level: RiskLevel::High, // Default test risk level
             min_profit_threshold: 50.0, // Default test profit threshold
