@@ -225,6 +225,128 @@ impl StrategyRegistry {
     }
 }
 
+/// Represents a scoring factor that contributes to the overall opportunity score
+#[async_trait::async_trait]
+pub trait ScoringFactor: Send + Sync {
+    /// Returns the name of this scoring factor
+    fn name(&self) -> &'static str;
+    
+    /// Returns the weight of this factor (0.0 to 1.0)
+    fn weight(&self) -> f64;
+    
+    /// Calculate the score contribution for this factor
+    async fn calculate_score(&self, opportunity: &MevOpportunity, thresholds: &ExecutionThresholds) -> f64;
+    
+    /// Returns true if this factor is critical (i.e., if it fails, the opportunity should be rejected)
+    fn is_critical(&self) -> bool {
+        false
+    }
+}
+
+/// Profit-based scoring factor
+pub struct ProfitFactor {
+    weight: f64,
+}
+
+#[async_trait::async_trait]
+impl ScoringFactor for ProfitFactor {
+    fn name(&self) -> &'static str {
+        "profit"
+    }
+    
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+    
+    async fn calculate_score(&self, opportunity: &MevOpportunity, thresholds: &ExecutionThresholds) -> f64 {
+        let min_profit = thresholds.strategy_params
+            .get(&opportunity.strategy)
+            .map(|params| params.min_profit)
+            .unwrap_or_else(|| {
+                // If no params in thresholds, use default
+                let default_params = OpportunityEvaluator::get_strategy_params(&opportunity.strategy);
+                default_params.min_profit
+            });
+            
+        if opportunity.estimated_profit < min_profit {
+            return 0.0;
+        }
+        
+        // Score based on how much the profit exceeds the minimum threshold
+        let profit_ratio = opportunity.estimated_profit / min_profit;
+        (1.0 - (1.0 / profit_ratio)).min(1.0)
+    }
+    
+    fn is_critical(&self) -> bool {
+        true
+    }
+}
+
+/// Time sensitivity scoring factor
+pub struct TimeSensitivityFactor {
+    weight: f64,
+}
+
+#[async_trait::async_trait]
+impl ScoringFactor for TimeSensitivityFactor {
+    fn name(&self) -> &'static str {
+        "time_sensitivity"
+    }
+    
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+    
+    async fn calculate_score(&self, opportunity: &MevOpportunity, thresholds: &ExecutionThresholds) -> f64 {
+        let max_time = thresholds.max_execution_time as f64;
+        let time = opportunity.execution_time as f64;
+        
+        if time > max_time {
+            return 0.0;
+        }
+        
+        // Score based on how quickly we can execute compared to max time
+        1.0 - (time / max_time)
+    }
+}
+
+/// Risk-adjusted return scoring factor
+pub struct RiskAdjustedReturnFactor {
+    weight: f64,
+}
+
+#[async_trait::async_trait]
+impl ScoringFactor for RiskAdjustedReturnFactor {
+    fn name(&self) -> &'static str {
+        "risk_adjusted_return"
+    }
+    
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+    
+    async fn calculate_score(&self, opportunity: &MevOpportunity, thresholds: &ExecutionThresholds) -> f64 {
+        let risk_multiplier = match opportunity.risk_level {
+            RiskLevel::Low => 1.0,
+            RiskLevel::Medium => 0.7,
+            RiskLevel::High => 0.4,
+        };
+        
+        let profit_ratio = opportunity.estimated_profit / opportunity.required_capital;
+        let risk_adjusted_ratio = profit_ratio * risk_multiplier;
+        
+        if risk_adjusted_ratio < thresholds.min_profit_risk_ratio {
+            return 0.0;
+        }
+        
+        (1.0 - (thresholds.min_profit_risk_ratio / risk_adjusted_ratio)).min(1.0)
+    }
+    
+    fn is_critical(&self) -> bool {
+        true
+    }
+}
+
 /// Main opportunity evaluator that coordinates different strategy evaluators
 pub struct OpportunityEvaluator {
     /// The underlying listen-engine instance
@@ -308,7 +430,7 @@ impl OpportunityEvaluator {
     pub fn register_evaluator(&mut self, evaluator: Box<dyn MevStrategyEvaluator>) {
         let strategy_type = evaluator.strategy_type();
         info!(strategy = ?strategy_type, "Registering new strategy evaluator");
-        if let Some(old_evaluator) = self.strategy_registry.register(evaluator) {
+        if let Some(_) = self.strategy_registry.register(evaluator) {
             warn!(
                 strategy = ?strategy_type,
                 "Replaced existing evaluator for strategy"
@@ -326,31 +448,31 @@ impl OpportunityEvaluator {
                 debug!(strategy = ?strategy, "Evaluating with strategy");
                 match evaluator.evaluate(&data).await {
                     Ok(Some(mut opportunity)) => {
-                // Calculate opportunity score
-                let score = self.calculate_opportunity_score(&opportunity);
-                opportunity.score = Some(score);
+                        // Calculate opportunity score
+                        let score = self.calculate_opportunity_score(&opportunity).await;
+                        opportunity.score = Some(score);
                         debug!(
                             strategy = ?strategy,
                             score = score,
                             "Calculated opportunity score"
                         );
                 
-                // Make execution decision
-                let decision = self.make_execution_decision(&opportunity);
-                opportunity.decision = Some(decision);
+                        // Make execution decision
+                        let decision = self.make_execution_decision(&opportunity);
+                        opportunity.decision = Some(decision);
                         debug!(
                             strategy = ?strategy,
                             decision = ?decision,
                             "Made execution decision"
                         );
                 
-                // Apply filtering based on configured thresholds
-                if self.meets_thresholds(&opportunity) {
+                        // Apply filtering based on configured thresholds
+                        if self.meets_thresholds(&opportunity) {
                             debug!(
                                 strategy = ?strategy,
                                 "Opportunity meets thresholds, adding to results"
                             );
-                    opportunities.push(opportunity);
+                            opportunities.push(opportunity);
                         } else {
                             debug!(
                                 strategy = ?strategy,
@@ -379,60 +501,50 @@ impl OpportunityEvaluator {
         Ok(opportunities)
     }
 
-    /// Calculates a composite score for an opportunity based on multiple factors
-    pub fn calculate_opportunity_score(&self, opportunity: &MevOpportunity) -> f64 {
-        let strategy_params = self.execution_thresholds.strategy_params
-            .get(&opportunity.strategy)
-            .unwrap_or_else(|| {
-                match opportunity.strategy {
-                    MevStrategy::Arbitrage => 
-                        &self.execution_thresholds.strategy_params[&MevStrategy::Arbitrage],
-                    MevStrategy::Sandwich => 
-                        &self.execution_thresholds.strategy_params[&MevStrategy::Sandwich],
-                    MevStrategy::TokenSnipe => 
-                        &self.execution_thresholds.strategy_params[&MevStrategy::TokenSnipe],
-                }
-            });
+    /// Creates a new instance with default scoring factors
+    fn create_default_scoring_factors() -> Vec<Box<dyn ScoringFactor>> {
+        vec![
+            Box::new(ProfitFactor { weight: 0.4 }),
+            Box::new(TimeSensitivityFactor { weight: 0.2 }),
+            Box::new(RiskAdjustedReturnFactor { weight: 0.4 }),
+        ]
+    }
 
-        // Calculate profit score (0-1)
-        let profit_score = (opportunity.estimated_profit / self.execution_thresholds.min_profit_threshold)
-            .min(2.0) / 2.0;  // Cap at 1.0 for profits >= 2x threshold
+    /// Calculate the overall opportunity score using multiple weighted factors
+    pub async fn calculate_opportunity_score(&self, opportunity: &MevOpportunity) -> f64 {
+        let scoring_factors = Self::create_default_scoring_factors();
+        let mut total_score = 0.0;
+        let mut total_weight = 0.0;
         
-        // Risk level score (0-1) - lower risk = higher score
-        let risk_score = 1.0 - (opportunity.risk_level as u8 as f64 / 3.0);
+        for factor in scoring_factors.iter() {
+            let factor_score = factor.calculate_score(opportunity, &self.execution_thresholds).await;
+            debug!(
+                factor = factor.name(),
+                score = factor_score,
+                weight = factor.weight(),
+                "Factor score calculated"
+            );
+            
+            // If a critical factor returns 0, reject the opportunity
+            if factor.is_critical() && factor_score == 0.0 {
+                warn!(
+                    factor = factor.name(),
+                    "Critical factor returned zero score, rejecting opportunity"
+                );
+                return 0.0;
+            }
+            
+            total_score += factor_score * factor.weight();
+            total_weight += factor.weight();
+        }
         
-        // Confidence score is already 0-1
-        let confidence_score = opportunity.confidence;
+        let final_score = total_score / total_weight;
+        info!(
+            score = final_score,
+            "Final opportunity score calculated"
+        );
         
-        // Execution time score (0-1) - faster = higher score
-        let execution_time_score = 1.0 - (opportunity.execution_time as f64 / 
-            self.execution_thresholds.max_execution_time as f64).min(1.0);
-        
-        // Capital efficiency score (0-1) - less capital = higher score
-        let capital_score = 1.0 - (opportunity.required_capital / 
-            self.execution_thresholds.max_capital_allocation).min(1.0);
-        
-        // Calculate profit-to-risk ratio score (0-1)
-        let risk_factor = match opportunity.risk_level {
-            RiskLevel::Low => 1.0,
-            RiskLevel::Medium => 2.0,
-            RiskLevel::High => 3.0,
-        };
-        let profit_risk_ratio = opportunity.estimated_profit / (risk_factor * opportunity.required_capital);
-        let profit_risk_score = (profit_risk_ratio / self.execution_thresholds.min_profit_risk_ratio)
-            .min(2.0) / 2.0;  // Cap at 1.0 for ratios >= 2x threshold
-        
-        // Calculate weighted composite score (0-1)
-        let score = 
-            profit_score * 0.3 +
-            risk_score * 0.15 +
-            confidence_score * 0.25 +
-            execution_time_score * 0.1 +
-            capital_score * 0.1 +
-            profit_risk_score * 0.1;
-        
-        // Apply strategy-specific weighting
-        score * strategy_params.weight
+        final_score
     }
 
     /// Makes a go/no-go decision based on the opportunity and thresholds
@@ -470,8 +582,17 @@ impl OpportunityEvaluator {
         }
         
         // Check for hold conditions (e.g., good opportunity but not optimal)
-        let opportunity_score = opportunity.score.unwrap_or_else(|| 
-            self.calculate_opportunity_score(opportunity));
+        let opportunity_score = match opportunity.score {
+            Some(score) => score,
+            None => {
+                // Create a future and immediately await it
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        self.calculate_opportunity_score(opportunity)
+                    )
+                })
+            }
+        };
             
         if opportunity_score >= 0.5 && opportunity_score < 0.7 {
             return ExecutionDecision::Hold;
@@ -507,6 +628,15 @@ impl OpportunityEvaluator {
         self.active_opportunities.write().await.push(opportunity);
         
         Ok(())
+    }
+
+    // Fix the ProfitFactor implementation to handle temporary values correctly
+    fn get_strategy_params(strategy: &MevStrategy) -> StrategyExecutionParams {
+        match strategy {
+            MevStrategy::Arbitrage => StrategyExecutionParams::default_for_arbitrage(),
+            MevStrategy::Sandwich => StrategyExecutionParams::default_for_sandwich(),
+            MevStrategy::TokenSnipe => StrategyExecutionParams::default_for_token_snipe(),
+        }
     }
 }
 
@@ -776,5 +906,152 @@ mod tests {
         // default min_confidence for the Sandwich strategy (0.9) in StrategyExecutionParams.
         // assert_eq!(hold_decision, ExecutionDecision::Hold, "Hold opportunity decision failed"); 
         assert_eq!(hold_decision, ExecutionDecision::Decline, "Hold opportunity should decline due to low confidence for strategy");
+    }
+
+    #[tokio::test]
+    async fn test_profit_factor() {
+        let factor = ProfitFactor { weight: 0.4 };
+        let thresholds = ExecutionThresholds::default();
+        
+        // Test opportunity with profit exactly at minimum
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            20.0,  // min_profit for arbitrage
+            0.9,
+            RiskLevel::Low,
+            1000.0,
+            500,
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert_eq!(score, 0.0);
+        
+        // Test opportunity with profit 2x minimum
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            40.0,
+            0.9,
+            RiskLevel::Low,
+            1000.0,
+            500,
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert!(score > 0.0 && score < 1.0);
+        
+        // Test opportunity with profit 4x minimum
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            80.0,
+            0.9,
+            RiskLevel::Low,
+            1000.0,
+            500,
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert_eq!(score, 1.0);
+    }
+    
+    #[tokio::test]
+    async fn test_time_sensitivity_factor() {
+        let factor = TimeSensitivityFactor { weight: 0.2 };
+        let thresholds = ExecutionThresholds::default();
+        
+        // Test opportunity with execution time at maximum
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            100.0,
+            0.9,
+            RiskLevel::Low,
+            1000.0,
+            2000,  // max_execution_time
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert_eq!(score, 0.0);
+        
+        // Test opportunity with execution time at half maximum
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            100.0,
+            0.9,
+            RiskLevel::Low,
+            1000.0,
+            1000,
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert_eq!(score, 0.5);
+        
+        // Test opportunity with very fast execution time
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            100.0,
+            0.9,
+            RiskLevel::Low,
+            1000.0,
+            200,
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert_eq!(score, 0.9);
+    }
+    
+    #[tokio::test]
+    async fn test_risk_adjusted_return_factor() {
+        let factor = RiskAdjustedReturnFactor { weight: 0.4 };
+        let thresholds = ExecutionThresholds::default();
+        
+        // Test low risk opportunity with good profit ratio
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            150.0,  // 15% return
+            0.9,
+            RiskLevel::Low,
+            1000.0,
+            500,
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert!(score > 0.8);
+        
+        // Test high risk opportunity with same profit ratio
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            150.0,  // 15% return
+            0.9,
+            RiskLevel::High,
+            1000.0,
+            500,
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert!(score < 0.5);
+        
+        // Test opportunity below minimum profit-risk ratio
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            10.0,  // 1% return
+            0.9,
+            RiskLevel::Medium,
+            1000.0,
+            500,
+        );
+        let score = factor.calculate_score(&opportunity, &thresholds).await;
+        assert_eq!(score, 0.0);
+    }
+    
+    fn create_test_opportunity(
+        strategy: MevStrategy,
+        estimated_profit: f64,
+        confidence: f64,
+        risk_level: RiskLevel,
+        required_capital: f64,
+        execution_time: u64,
+    ) -> MevOpportunity {
+        MevOpportunity {
+            strategy,
+            estimated_profit,
+            confidence,
+            risk_level,
+            required_capital,
+            execution_time,
+            metadata: serde_json::json!({}),
+            score: None,
+            decision: None,
+        }
     }
 } 
