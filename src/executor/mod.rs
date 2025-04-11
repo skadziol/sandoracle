@@ -121,19 +121,38 @@ impl TransactionExecutor {
             .map_err(|e| SandoError::SolanaRpc(format!("Failed to get wallet balance: {}", e)))
     }
 
-    /// Gets the associated token account address
+    /// Gets the associated token account address - static method using token program's functions
     fn get_associated_token_address(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-        // Directly calculate the address using the solana_sdk functions
-        let seeds = &[
-            owner.as_ref(),
-            spl_token::id().as_ref(),
-            mint.as_ref(),
-        ];
+        // Use a more compatible approach to get the associated token address
+        let owner_key = owner.to_string();
+        let mint_key = mint.to_string();
         
-        let (associated_token_address, _bump_seed) = 
-            Pubkey::find_program_address(seeds, &spl_associated_token_account::id());
+        // Convert back to SDK pubkey since we're working with SDK APIs
+        if let (Ok(owner_pubkey), Ok(mint_pubkey)) = (Pubkey::from_str(&owner_key), Pubkey::from_str(&mint_key)) {
+            // Use the SDK version of associated token program
+            let program_id = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap_or_default();
             
-        associated_token_address
+            // Use the token program ID
+            let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap_or_default();
+            
+            // Hard-code the derivation logic for associated token accounts
+            let seeds = &[
+                owner_pubkey.as_ref(),
+                token_program_id.as_ref(),
+                mint_pubkey.as_ref(),
+            ];
+            
+            // Make sure both program_id and return value are solana_sdk::pubkey::Pubkey
+            let (associated_token_address, _bump_seed) = solana_sdk::pubkey::Pubkey::find_program_address(
+                seeds, 
+                &program_id
+            );
+            
+            return associated_token_address;
+        }
+        
+        // Fallback in case of error
+        Pubkey::default()
     }
 
     /// Simulates a potential MEV transaction before execution
