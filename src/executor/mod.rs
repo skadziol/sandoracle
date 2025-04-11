@@ -24,12 +24,16 @@ use spl_associated_token_account::solana_program::program_pack::Pack;
 // Export the strategies module
 pub mod strategies;
 
+// Export the strategy execution service
+pub mod strategy_execution;
+
 // Include tests module when running tests
 #[cfg(test)]
 pub mod tests;
 
 // Re-export the strategy types used by this module
 pub use self::strategies::{ArbitragePath, ArbitrageStep};
+pub use self::strategy_execution::ExecutionService;
 
 /// Represents the result of a transaction simulation
 #[derive(Debug, Clone)]
@@ -942,6 +946,29 @@ impl TransactionExecutor {
 
         info!("Arbitrage transaction built successfully (using placeholders)");
         Ok(transaction)
+    }
+
+    /// Creates a new TransactionExecutor for testing with a mock RPC client
+    #[cfg(test)]
+    pub fn new_for_tests() -> Self {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::signer::keypair::Keypair;
+        use std::sync::Arc;
+        
+        // Use default test RPC URL
+        let rpc_client = Arc::new(RpcClient::new("https://api.testnet.solana.com".to_string()));
+        
+        // Generate a random keypair for testing
+        let signer = Arc::new(Keypair::new());
+        
+        // Always use simulation mode for tests
+        let simulation_mode = true;
+        
+        Self {
+            rpc_client,
+            signer,
+            simulation_mode,
+        }
     }
 }
 

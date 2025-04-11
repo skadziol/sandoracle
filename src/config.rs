@@ -109,6 +109,39 @@ impl Settings {
         })
     }
 
+    #[cfg(test)]
+    pub fn default_for_tests() -> Self {
+        Self {
+            solana_rpc_url: "https://api.testnet.solana.com".to_string(),
+            wallet_private_key: "Test1111111111111111111111111111111111111111111".to_string(),
+            simulation_mode: true,
+            rig_api_key: Some("test_api_key".to_string()),
+            rig_model_provider: Some("anthropic".to_string()),
+            rig_model_name: Some("claude-3-opus".to_string()),
+            telegram_bot_token: Some("test_bot_token".to_string()),
+            telegram_chat_id: Some("test_chat_id".to_string()),
+            log_level: "info".to_string(),
+            risk_level: RiskLevel::Medium,
+            max_concurrent_trades: 3,
+            min_profit_threshold: 10.0,
+            max_slippage: 0.01,
+            max_position_size: 1000.0,
+            whitelisted_dexes: Some(vec!["Jupiter".to_string(), "Orca".to_string(), "Raydium".to_string()]),
+            allowed_tokens: Some(vec!["SOL".to_string(), "USDC".to_string(), "ETH".to_string()]),
+            blocked_tokens: Some(vec![]),
+            request_timeout_secs: Some(30),
+            max_retries: Some(3),
+            retry_backoff_ms: Some(500),
+            orca_api_url: Some("https://api.testnet.orca.so".to_string()),
+            raydium_api_url: Some("https://api.testnet.raydium.io".to_string()),
+            jupiter_api_url: Some("https://quotes.jup.ag/v4".to_string()),
+            arbitrage_min_profit: Some(10.0),
+            sandwich_min_profit: Some(20.0),
+            snipe_min_profit: Some(50.0),
+            geyser_plugin_endpoint_url: "ws://localhost:8900/".to_string(),
+        }
+    }
+
     // Optional: Add getter methods if needed, e.g., for log level parsing
     // pub fn get_log_level(&self) -> tracing::Level {
     //     match self.log_level.as_deref() {

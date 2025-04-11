@@ -146,9 +146,14 @@ pub struct StrategyExecutor {
 }
 
 impl StrategyExecutor {
-    /// Creates a new StrategyExecutor
+    /// Create a new strategy executor with the given transaction executor
     pub fn new(executor: TransactionExecutor) -> Self {
         Self { executor }
+    }
+    
+    /// Get a reference to the underlying TransactionExecutor
+    pub fn get_executor(&self) -> &TransactionExecutor {
+        &self.executor
     }
 
     /// Executes an MEV opportunity
@@ -331,12 +336,6 @@ impl StrategyExecutor {
                  }
             }
         }
-    }
-
-    /// Returns the underlying transaction executor for testing
-    #[cfg(test)]
-    pub fn get_executor(&self) -> &TransactionExecutor {
-        &self.executor
     }
 }
 

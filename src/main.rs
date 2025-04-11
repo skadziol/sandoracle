@@ -11,9 +11,10 @@ mod jupiter_client;
 use crate::config::Settings;
 use crate::error::{Result as SandoResult, SandoError};
 use crate::monitoring::init_logging;
+use crate::monitoring::log_utils::{check_log_directory, rotate_logs, clear_debug_logs};
 use crate::listen_bot::{ListenBot, ListenBotCommand};
 use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds};
-use crate::executor::{TransactionExecutor, strategies::StrategyExecutor};
+use crate::executor::{TransactionExecutor, ExecutionService};
 use tracing::{info, error};
 use dotenv::dotenv;
 use tokio::signal;
@@ -28,10 +29,28 @@ async fn main() -> SandoResult<()> {
 
     // Initialize logging
     let log_dir = "./logs";
-    let file_level = "debug";
+    let file_level = std::env::var("FILE_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     let console_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    let _guard = init_logging(log_dir, file_level, &console_level)?;
+    
+    // Rotate logs before starting a new session
+    if let Err(e) = rotate_logs(log_dir) {
+        eprintln!("Warning: Failed to rotate log files: {}", e);
+    }
+    
+    let _guard = init_logging(log_dir, &file_level, &console_level)?;
 
+    // Check log directory size
+    if let Err(e) = check_log_directory(log_dir) {
+        error!(error = %e, "Failed to check log directory");
+    }
+    
+    // Clean up old debug logs if running at info level or higher
+    if file_level != "debug" && file_level != "trace" {
+        if let Err(e) = clear_debug_logs(log_dir) {
+            error!(error = %e, "Failed to clear debug logs");
+        }
+    }
+    
     // Enter span if needed:
     let main_span = tracing::info_span!("main_execution");
     let _main_span_guard = main_span.enter(); // Keep guard
@@ -58,12 +77,14 @@ async fn main() -> SandoResult<()> {
     )
     .map_err(|e| SandoError::DependencyError(format!("Failed to create TransactionExecutor: {}", e)))?;
     
-    // Initialize Strategy Executor
-    info!("Initializing StrategyExecutor...");
-    let strategy_executor = StrategyExecutor::new(transaction_executor.clone());
+    // Initialize Strategy Execution Service
+    info!("Initializing ExecutionService...");
+    let execution_service = ExecutionService::new(transaction_executor.clone())
+        .with_max_retries(settings.max_retries.unwrap_or(3))
+        .with_simulation(!settings.simulation_mode); // Only simulate if not in simulation mode
     
-    // Wrap the strategy executor in an Arc for safe sharing between threads
-    let strategy_executor_arc = Arc::new(strategy_executor);
+    // Wrap the execution service in an Arc for safe sharing between threads
+    let execution_service_arc = Arc::new(execution_service);
     
     // Initialize the OpportunityEvaluator
     info!("Initializing OpportunityEvaluator...");
@@ -80,8 +101,8 @@ async fn main() -> SandoResult<()> {
     .await
     .map_err(|e| SandoError::DependencyError(format!("Failed to create OpportunityEvaluator: {}", e)))?;
     
-    // Set the strategy executor on the evaluator
-    evaluator.set_strategy_executor(strategy_executor_arc.clone()).await;
+    // Set the execution service on the evaluator
+    evaluator.set_strategy_executor(execution_service_arc.clone()).await;
 
     // Wrap the evaluator in an Arc for safe sharing between threads
     let evaluator_arc = Arc::new(evaluator);
@@ -106,6 +127,24 @@ async fn main() -> SandoResult<()> {
     let listen_bot_handle = tokio::spawn(async move {
         if let Err(e) = listen_bot.start().await {
             error!(error = %e, "ListenBot failed to start or encountered an error");
+        }
+    });
+
+    // Spawn a task to periodically check and clean logs
+    let log_dir_clone = log_dir.to_string();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // Every hour
+        loop {
+            interval.tick().await;
+            info!(target: "log_management", "Running scheduled log cleanup...");
+            
+            if let Err(e) = rotate_logs(&log_dir_clone) {
+                error!(target: "log_management", error = %e, "Failed to rotate log files");
+            }
+            
+            if let Err(e) = check_log_directory(&log_dir_clone) {
+                error!(target: "log_management", error = %e, "Failed to check log directory");
+            }
         }
     });
 
