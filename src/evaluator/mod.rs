@@ -1,18 +1,24 @@
 pub mod arbitrage;
+pub mod sandwich;
+pub mod token_snipe;
+
+use arbitrage::{ArbitrageConfig, ArbitrageEvaluator};
+use sandwich::{SandwichConfig, SandwichEvaluator};
+use token_snipe::{TokenSnipeConfig, TokenSnipeEvaluator};
+
 // Removed unused: pub use arbitrage::{ArbitrageConfig, ArbitrageEvaluator, ArbitrageMetadata};
 
 use anyhow::Result;
-use listen_engine::{
-    engine::Engine,
-    // Removed unused and non-existent pipeline imports
-    // engine::pipeline::{Pipeline, PipelineBuilder},
-};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
+use listen_engine::Engine;
 use crate::config; // Import config module to access config::RiskLevel
-use tracing::{info, warn, debug, error};
+use std::time::{SystemTime, UNIX_EPOCH};
+use chrono;
 
 /// Represents different types of MEV strategies
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -248,6 +254,12 @@ pub struct ProfitFactor {
     weight: f64,
 }
 
+impl ProfitFactor {
+    pub fn new(weight: f64) -> Self {
+        Self { weight }
+    }
+}
+
 #[async_trait::async_trait]
 impl ScoringFactor for ProfitFactor {
     fn name(&self) -> &'static str {
@@ -287,6 +299,12 @@ pub struct TimeSensitivityFactor {
     weight: f64,
 }
 
+impl TimeSensitivityFactor {
+    pub fn new(weight: f64) -> Self {
+        Self { weight }
+    }
+}
+
 #[async_trait::async_trait]
 impl ScoringFactor for TimeSensitivityFactor {
     fn name(&self) -> &'static str {
@@ -313,6 +331,12 @@ impl ScoringFactor for TimeSensitivityFactor {
 /// Risk-adjusted return scoring factor
 pub struct RiskAdjustedReturnFactor {
     weight: f64,
+}
+
+impl RiskAdjustedReturnFactor {
+    pub fn new(weight: f64) -> Self {
+        Self { weight }
+    }
 }
 
 #[async_trait::async_trait]
@@ -342,6 +366,306 @@ impl ScoringFactor for RiskAdjustedReturnFactor {
         (1.0 - (thresholds.min_profit_risk_ratio / risk_adjusted_ratio)).min(1.0)
     }
     
+    fn is_critical(&self) -> bool {
+        true
+    }
+}
+
+/// Represents market conditions that might trigger circuit breakers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketConditions {
+    /// Volatility index (0-100)
+    pub volatility_index: f64,
+    /// Recent price change percentage
+    pub price_change_percent: f64,
+    /// Trading volume in USD
+    pub volume_usd: f64,
+    /// Liquidity depth in USD
+    pub liquidity_depth: f64,
+    /// Number of similar transactions in mempool
+    pub mempool_density: u32,
+    /// Gas price in GWEI
+    pub gas_price_gwei: u64,
+    /// Timestamp of the conditions
+    pub timestamp: i64,
+}
+
+/// Circuit breaker status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitBreakerStatus {
+    /// Normal operation
+    Normal,
+    /// Warning level - increased scrutiny needed
+    Warning,
+    /// Critical level - halt operations
+    Critical,
+    /// Temporary pause
+    Paused,
+}
+
+/// Circuit breaker for monitoring specific market conditions
+#[async_trait::async_trait]
+pub trait CircuitBreaker: Send + Sync {
+    /// Returns the name of this circuit breaker
+    fn name(&self) -> &'static str;
+    
+    /// Check if the circuit breaker should be triggered
+    async fn check(&self, conditions: &MarketConditions) -> CircuitBreakerStatus;
+    
+    /// Returns true if this is a critical circuit breaker
+    fn is_critical(&self) -> bool {
+        false
+    }
+}
+
+/// Monitors extreme volatility conditions
+pub struct VolatilityBreaker {
+    /// Volatility threshold for warning level
+    warning_threshold: f64,
+    /// Volatility threshold for critical level
+    critical_threshold: f64,
+}
+
+impl VolatilityBreaker {
+    pub fn default() -> Self {
+        Self {
+            warning_threshold: 25.0,  // 25% volatility
+            critical_threshold: 40.0,  // 40% volatility
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CircuitBreaker for VolatilityBreaker {
+    fn name(&self) -> &'static str {
+        "volatility"
+    }
+    
+    async fn check(&self, conditions: &MarketConditions) -> CircuitBreakerStatus {
+        if conditions.volatility_index >= self.critical_threshold {
+            warn!(
+                volatility = conditions.volatility_index,
+                threshold = self.critical_threshold,
+                "Volatility circuit breaker triggered: Critical"
+            );
+            CircuitBreakerStatus::Critical
+        } else if conditions.volatility_index >= self.warning_threshold {
+            warn!(
+                volatility = conditions.volatility_index,
+                threshold = self.warning_threshold,
+                "Volatility circuit breaker triggered: Warning"
+            );
+            CircuitBreakerStatus::Warning
+        } else {
+            CircuitBreakerStatus::Normal
+        }
+    }
+    
+    fn is_critical(&self) -> bool {
+        true
+    }
+}
+
+/// Monitors gas price spikes
+pub struct GasPriceBreaker {
+    /// Gas price threshold for warning level (in GWEI)
+    warning_threshold: u64,
+    /// Gas price threshold for critical level (in GWEI)
+    critical_threshold: u64,
+}
+
+impl GasPriceBreaker {
+    pub fn default() -> Self {
+        Self {
+            warning_threshold: 200,  // 200 GWEI
+            critical_threshold: 500,  // 500 GWEI
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CircuitBreaker for GasPriceBreaker {
+    fn name(&self) -> &'static str {
+        "gas_price"
+    }
+    
+    async fn check(&self, conditions: &MarketConditions) -> CircuitBreakerStatus {
+        if conditions.gas_price_gwei >= self.critical_threshold {
+            warn!(
+                gas_price = conditions.gas_price_gwei,
+                threshold = self.critical_threshold,
+                "Gas price circuit breaker triggered: Critical"
+            );
+            CircuitBreakerStatus::Critical
+        } else if conditions.gas_price_gwei >= self.warning_threshold {
+            warn!(
+                gas_price = conditions.gas_price_gwei,
+                threshold = self.warning_threshold,
+                "Gas price circuit breaker triggered: Warning"
+            );
+            CircuitBreakerStatus::Warning
+        } else {
+            CircuitBreakerStatus::Normal
+        }
+    }
+}
+
+/// Monitors mempool congestion
+pub struct MempoolBreaker {
+    /// Mempool density threshold for warning level
+    warning_threshold: u32,
+    /// Mempool density threshold for critical level
+    critical_threshold: u32,
+}
+
+impl MempoolBreaker {
+    pub fn default() -> Self {
+        Self {
+            warning_threshold: 50,   // 50 similar transactions
+            critical_threshold: 100,  // 100 similar transactions
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CircuitBreaker for MempoolBreaker {
+    fn name(&self) -> &'static str {
+        "mempool"
+    }
+    
+    async fn check(&self, conditions: &MarketConditions) -> CircuitBreakerStatus {
+        if conditions.mempool_density >= self.critical_threshold {
+            warn!(
+                density = conditions.mempool_density,
+                threshold = self.critical_threshold,
+                "Mempool circuit breaker triggered: Critical"
+            );
+            CircuitBreakerStatus::Critical
+        } else if conditions.mempool_density >= self.warning_threshold {
+            warn!(
+                density = conditions.mempool_density,
+                threshold = self.warning_threshold,
+                "Mempool circuit breaker triggered: Warning"
+            );
+            CircuitBreakerStatus::Warning
+        } else {
+            CircuitBreakerStatus::Normal
+        }
+    }
+}
+
+/// Monitors strategy-specific market conditions
+pub struct StrategyBreaker {
+    /// Thresholds for arbitrage opportunities
+    arbitrage_thresholds: ArbitrageThresholds,
+    /// Thresholds for sandwich opportunities
+    sandwich_thresholds: SandwichThresholds,
+    /// Thresholds for token snipe opportunities
+    token_snipe_thresholds: TokenSnipeThresholds,
+}
+
+#[derive(Clone)]
+struct ArbitrageThresholds {
+    max_price_deviation: f64,
+    min_liquidity_ratio: f64,
+}
+
+#[derive(Clone)]
+struct SandwichThresholds {
+    max_pending_txs: u32,
+    min_target_tx_size: f64,
+}
+
+#[derive(Clone)]
+struct TokenSnipeThresholds {
+    min_holder_count: u32,
+    min_liquidity_percentage: f64,
+}
+
+impl StrategyBreaker {
+    pub fn default() -> Self {
+        Self {
+            arbitrage_thresholds: ArbitrageThresholds {
+                max_price_deviation: 0.05, // 5%
+                min_liquidity_ratio: 0.1,  // 10%
+            },
+            sandwich_thresholds: SandwichThresholds {
+                max_pending_txs: 5,
+                min_target_tx_size: 5000.0, // $5k
+            },
+            token_snipe_thresholds: TokenSnipeThresholds {
+                min_holder_count: 50,
+                min_liquidity_percentage: 0.2, // 20%
+            },
+        }
+    }
+
+    fn check_arbitrage(&self, conditions: &MarketConditions) -> CircuitBreakerStatus {
+        // Check price deviation
+        if conditions.price_change_percent.abs() > self.arbitrage_thresholds.max_price_deviation {
+            return CircuitBreakerStatus::Warning;
+        }
+
+        // Check liquidity ratio
+        let liquidity_ratio = conditions.liquidity_depth / conditions.volume_usd;
+        if liquidity_ratio < self.arbitrage_thresholds.min_liquidity_ratio {
+            return CircuitBreakerStatus::Warning;
+        }
+
+        CircuitBreakerStatus::Normal
+    }
+
+    fn check_sandwich(&self, conditions: &MarketConditions) -> CircuitBreakerStatus {
+        // Check mempool density
+        if conditions.mempool_density > self.sandwich_thresholds.max_pending_txs {
+            return CircuitBreakerStatus::Warning;
+        }
+
+        // Check if gas price is too high for profitable sandwich
+        if conditions.gas_price_gwei > 300 {
+            return CircuitBreakerStatus::Critical;
+        }
+
+        CircuitBreakerStatus::Normal
+    }
+
+    fn check_token_snipe(&self, conditions: &MarketConditions) -> CircuitBreakerStatus {
+        // Token snipe opportunities are more sensitive to market conditions
+        if conditions.volatility_index > 30.0 {
+            return CircuitBreakerStatus::Critical;
+        }
+
+        if conditions.price_change_percent.abs() > 0.1 {
+            return CircuitBreakerStatus::Warning;
+        }
+
+        CircuitBreakerStatus::Normal
+    }
+}
+
+#[async_trait::async_trait]
+impl CircuitBreaker for StrategyBreaker {
+    fn name(&self) -> &'static str {
+        "strategy_breaker"
+    }
+
+    async fn check(&self, conditions: &MarketConditions) -> CircuitBreakerStatus {
+        // Check all strategies and return the most severe status
+        let statuses = vec![
+            self.check_arbitrage(conditions),
+            self.check_sandwich(conditions),
+            self.check_token_snipe(conditions),
+        ];
+
+        if statuses.iter().any(|s| matches!(s, CircuitBreakerStatus::Critical)) {
+            CircuitBreakerStatus::Critical
+        } else if statuses.iter().any(|s| matches!(s, CircuitBreakerStatus::Warning)) {
+            CircuitBreakerStatus::Warning
+        } else {
+            CircuitBreakerStatus::Normal
+        }
+    }
+
     fn is_critical(&self) -> bool {
         true
     }
@@ -379,23 +703,23 @@ impl OpportunityEvaluator {
             "Creating new OpportunityEvaluator"
         );
 
-        // Instantiate Engine using from_env()
-        let (engine_instance, _receiver) = Engine::from_env().await
-            .map_err(|e| {
-                error!(error = %e, "Failed to create listen-engine Engine");
-                anyhow::anyhow!("Failed to create listen-engine Engine from env: {}", e)
-            })?;
-        let engine = Arc::new(engine_instance);
-        
-        Ok(Self {
-            engine,
+        let (engine_instance, _) = Engine::from_env().await?;
+        let mut evaluator = Self {
+            engine: Arc::new(engine_instance),
             strategy_registry: StrategyRegistry::new(),
             min_confidence,
             max_risk_level,
             min_profit_threshold,
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
             execution_thresholds: ExecutionThresholds::default(),
-        })
+        };
+
+        // Register default evaluators
+        evaluator.register_evaluator(Box::new(ArbitrageEvaluator::new(ArbitrageConfig::default())));
+        evaluator.register_evaluator(Box::new(SandwichEvaluator::new(SandwichConfig::default())));
+        evaluator.register_evaluator(Box::new(TokenSnipeEvaluator::new(TokenSnipeConfig::default())));
+
+        Ok(evaluator)
     }
 
     /// Gets the minimum confidence threshold.
@@ -458,7 +782,7 @@ impl OpportunityEvaluator {
                         );
                 
                         // Make execution decision
-                        let decision = self.make_execution_decision(&opportunity);
+                        let decision = self.make_execution_decision(&opportunity).await;
                         opportunity.decision = Some(decision);
                         debug!(
                             strategy = ?strategy,
@@ -501,54 +825,112 @@ impl OpportunityEvaluator {
         Ok(opportunities)
     }
 
-    /// Creates a new instance with default scoring factors
+    /// Creates the default set of scoring factors
     fn create_default_scoring_factors() -> Vec<Box<dyn ScoringFactor>> {
         vec![
-            Box::new(ProfitFactor { weight: 0.4 }),
-            Box::new(TimeSensitivityFactor { weight: 0.2 }),
-            Box::new(RiskAdjustedReturnFactor { weight: 0.4 }),
+            Box::new(ProfitFactor::new(0.3)),
+            Box::new(TimeSensitivityFactor::new(0.2)),
+            Box::new(RiskAdjustedReturnFactor::new(0.3)),
+            Box::new(StrategySpecificFactor::new(0.2)),
         ]
     }
 
-    /// Calculate the overall opportunity score using multiple weighted factors
+    /// Calculates the final opportunity score
     pub async fn calculate_opportunity_score(&self, opportunity: &MevOpportunity) -> f64 {
         let scoring_factors = Self::create_default_scoring_factors();
         let mut total_score = 0.0;
         let mut total_weight = 0.0;
-        
+        let mut has_critical_failure = false;
+
         for factor in scoring_factors.iter() {
             let factor_score = factor.calculate_score(opportunity, &self.execution_thresholds).await;
-            debug!(
-                factor = factor.name(),
-                score = factor_score,
-                weight = factor.weight(),
-                "Factor score calculated"
-            );
             
-            // If a critical factor returns 0, reject the opportunity
             if factor.is_critical() && factor_score == 0.0 {
-                warn!(
-                    factor = factor.name(),
-                    "Critical factor returned zero score, rejecting opportunity"
-                );
-                return 0.0;
+                has_critical_failure = true;
+                break;
             }
             
             total_score += factor_score * factor.weight();
             total_weight += factor.weight();
         }
-        
-        let final_score = total_score / total_weight;
-        info!(
-            score = final_score,
-            "Final opportunity score calculated"
-        );
-        
-        final_score
+
+        if has_critical_failure {
+            return 0.0;
+        }
+
+        // Normalize score
+        if total_weight > 0.0 {
+            total_score / total_weight
+        } else {
+            0.0
+        }
     }
 
-    /// Makes a go/no-go decision based on the opportunity and thresholds
-    pub fn make_execution_decision(&self, opportunity: &MevOpportunity) -> ExecutionDecision {
+    /// Creates the default set of circuit breakers
+    fn create_default_circuit_breakers() -> Vec<Box<dyn CircuitBreaker>> {
+        vec![
+            Box::new(VolatilityBreaker::default()),
+            Box::new(GasPriceBreaker::default()),
+            Box::new(MempoolBreaker::default()),
+            Box::new(StrategyBreaker::default()),
+        ]
+    }
+
+    /// Check all circuit breakers and return the most severe status
+    pub async fn check_circuit_breakers(&self, conditions: &MarketConditions) -> CircuitBreakerStatus {
+        let breakers = Self::create_default_circuit_breakers();
+        let mut status = CircuitBreakerStatus::Normal;
+        
+        for breaker in breakers.iter() {
+            let breaker_status = breaker.check(conditions).await;
+            debug!(
+                breaker = breaker.name(),
+                status = ?breaker_status,
+                "Circuit breaker check"
+            );
+            
+            // Update to most severe status
+            status = match (status, breaker_status) {
+                (_, CircuitBreakerStatus::Critical) => CircuitBreakerStatus::Critical,
+                (CircuitBreakerStatus::Normal, CircuitBreakerStatus::Warning) => CircuitBreakerStatus::Warning,
+                (current, _) => current,
+            };
+            
+            // Early exit on critical status from critical breakers
+            if breaker.is_critical() && breaker_status == CircuitBreakerStatus::Critical {
+                error!(
+                    breaker = breaker.name(),
+                    "Critical circuit breaker triggered - halting operations"
+                );
+                return CircuitBreakerStatus::Critical;
+            }
+        }
+        
+        status
+    }
+
+    /// Makes a go/no-go decision based on the opportunity, thresholds, and circuit breakers
+    pub async fn make_execution_decision(&self, opportunity: &MevOpportunity) -> ExecutionDecision {
+        // First check circuit breakers if market conditions are available
+        if let Some(conditions) = self.get_market_conditions().await {
+            let breaker_status = self.check_circuit_breakers(&conditions).await;
+            match breaker_status {
+                CircuitBreakerStatus::Critical => {
+                    warn!("Circuit breaker status Critical - declining opportunity");
+                    return ExecutionDecision::Decline;
+                }
+                CircuitBreakerStatus::Warning => {
+                    // Increase scrutiny for warning status
+                    if opportunity.confidence < self.min_confidence * 1.2 {
+                        warn!("Increased confidence threshold not met under circuit breaker warning");
+                        return ExecutionDecision::Decline;
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        // Continue with normal decision logic...
         // Get strategy-specific parameters
         let strategy_params = match self.execution_thresholds.strategy_params.get(&opportunity.strategy) {
             Some(params) => params,
@@ -584,14 +966,7 @@ impl OpportunityEvaluator {
         // Check for hold conditions (e.g., good opportunity but not optimal)
         let opportunity_score = match opportunity.score {
             Some(score) => score,
-            None => {
-                // Create a future and immediately await it
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        self.calculate_opportunity_score(opportunity)
-                    )
-                })
-            }
+            None => self.calculate_opportunity_score(opportunity).await
         };
             
         if opportunity_score >= 0.5 && opportunity_score < 0.7 {
@@ -615,9 +990,11 @@ impl OpportunityEvaluator {
     }
 
     /// Checks if an opportunity should be executed based on the decision system
-    pub fn should_execute(&self, opportunity: &MevOpportunity) -> bool {
-        let decision = opportunity.decision.unwrap_or_else(|| 
-            self.make_execution_decision(opportunity));
+    pub async fn should_execute(&self, opportunity: &MevOpportunity) -> bool {
+        let decision = match opportunity.decision {
+            Some(d) => d,
+            None => self.make_execution_decision(opportunity).await
+        };
             
         decision == ExecutionDecision::Execute
     }
@@ -637,6 +1014,174 @@ impl OpportunityEvaluator {
             MevStrategy::Sandwich => StrategyExecutionParams::default_for_sandwich(),
             MevStrategy::TokenSnipe => StrategyExecutionParams::default_for_token_snipe(),
         }
+    }
+
+    /// Get current market conditions (to be implemented based on your data sources)
+    async fn get_market_conditions(&self) -> Option<MarketConditions> {
+        // Get market data from the engine
+        if let Ok(prices) = self.engine.get_prices().await {
+            let mut volatility_index: f64 = 0.0;
+            let mut price_change_percent: f64 = 0.0;
+            let mut volume_usd: f64 = 0.0;
+            let mut liquidity_depth: f64 = 0.0;
+            let mut mempool_density: u32 = 0;
+            let mut gas_price_gwei: u64 = 0;
+
+            // Calculate volatility and price changes from available price data
+            if let Some(price_history) = self.engine.get_price_history().await.ok() {
+                for (_, history) in price_history {
+                    if history.len() >= 2 {
+                        let latest = history.last().unwrap();
+                        let previous = history.get(history.len() - 2).unwrap();
+                        let change = ((latest - previous) / previous).abs();
+                        volatility_index = if change * 100.0 > volatility_index {
+                            change * 100.0
+                        } else {
+                            volatility_index
+                        };
+                        price_change_percent = if change * 100.0 > price_change_percent {
+                            change * 100.0
+                        } else {
+                            price_change_percent
+                        };
+                    }
+                }
+            }
+
+            // Get volume and liquidity data from prices
+            for price in prices.values() {
+                volume_usd += price * 1000.0; // Rough estimate based on price
+                liquidity_depth += price * 10000.0; // Rough estimate based on price
+            }
+
+            // Get mempool stats from engine status
+            if let Ok(status) = self.engine.get_status().await {
+                mempool_density = status.pending_transactions as u32;
+                gas_price_gwei = status.current_gas_price;
+            }
+
+            Some(MarketConditions {
+                volatility_index,
+                price_change_percent,
+                volume_usd,
+                liquidity_depth,
+                mempool_density,
+                gas_price_gwei,
+                timestamp: chrono::Utc::now().timestamp(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Factor that considers strategy-specific metrics
+pub struct StrategySpecificFactor {
+    weight: f64,
+}
+
+impl StrategySpecificFactor {
+    pub fn new(weight: f64) -> Self {
+        Self { weight }
+    }
+
+    fn calculate_arbitrage_score(&self, opportunity: &MevOpportunity) -> f64 {
+        let metadata: arbitrage::ArbitrageMetadata = 
+            if let Ok(m) = serde_json::from_value(opportunity.metadata.clone()) {
+                m
+            } else {
+                return 0.0;
+            };
+
+        // Score based on number of hops (fewer is better)
+        let hop_score = 1.0 - (metadata.token_path.len() as f64 - 2.0) / 3.0;
+        
+        // Score based on liquidity (more is better)
+        let min_liquidity = metadata.liquidity.iter().copied().fold(f64::INFINITY, f64::min);
+        let liquidity_score = (min_liquidity / 100000.0).min(1.0);
+        
+        // Score based on price impact (less is better)
+        let total_impact: f64 = metadata.price_impacts.iter().sum();
+        let impact_score = (1.0 - total_impact * 10.0).max(0.0);
+
+        // Combine scores with weights
+        let weights = [0.4, 0.3, 0.3];
+        hop_score * weights[0] +
+        liquidity_score * weights[1] +
+        impact_score * weights[2]
+    }
+
+    fn calculate_sandwich_score(&self, opportunity: &MevOpportunity) -> f64 {
+        let metadata: sandwich::SandwichMetadata = 
+            if let Ok(m) = serde_json::from_value(opportunity.metadata.clone()) {
+                m
+            } else {
+                return 0.0;
+            };
+
+        // Score based on target transaction size (larger is better, up to a point)
+        let size_score = (metadata.target_tx_size / 50000.0).min(1.0);
+        
+        // Score based on total price impact (less is better)
+        let total_impact = metadata.front_run_impact + metadata.back_run_impact;
+        let impact_score = (1.0 - total_impact * 20.0).max(0.0);
+        
+        // Score based on gas costs relative to profit (less is better)
+        let gas_ratio = metadata.gas_cost / opportunity.estimated_profit;
+        let gas_score = (1.0 - gas_ratio * 2.0).max(0.0);
+
+        // Combine scores with weights
+        let weights = [0.4, 0.3, 0.3];
+        size_score * weights[0] +
+        impact_score * weights[1] +
+        gas_score * weights[2]
+    }
+
+    fn calculate_token_snipe_score(&self, opportunity: &MevOpportunity) -> f64 {
+        let metadata: token_snipe::TokenSnipeMetadata = 
+            if let Ok(m) = serde_json::from_value(opportunity.metadata.clone()) {
+                m
+            } else {
+                return 0.0;
+            };
+
+        // Score based on verification status
+        let verification_score = if metadata.is_verified { 1.0 } else { 0.0 };
+        
+        // Score based on holder metrics
+        let holder_score = metadata.holder_metrics.unique_holders as f64 / 200.0;
+        let distribution_score = 1.0 - metadata.holder_metrics.top_holder_percentage;
+        let liquidity_score = metadata.holder_metrics.liquidity_percentage;
+
+        // Combine scores with weights
+        let weights = [0.4, 0.2, 0.2, 0.2];
+        verification_score * weights[0] +
+        holder_score * weights[1] +
+        distribution_score * weights[2] +
+        liquidity_score * weights[3]
+    }
+}
+
+#[async_trait::async_trait]
+impl ScoringFactor for StrategySpecificFactor {
+    fn name(&self) -> &'static str {
+        "strategy_specific"
+    }
+
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+
+    async fn calculate_score(&self, opportunity: &MevOpportunity, _thresholds: &ExecutionThresholds) -> f64 {
+        match opportunity.strategy {
+            MevStrategy::Arbitrage => self.calculate_arbitrage_score(opportunity),
+            MevStrategy::Sandwich => self.calculate_sandwich_score(opportunity),
+            MevStrategy::TokenSnipe => self.calculate_token_snipe_score(opportunity),
+        }
+    }
+
+    fn is_critical(&self) -> bool {
+        true
     }
 }
 
@@ -834,21 +1379,17 @@ mod tests {
     #[tokio::test]
     async fn test_opportunity_scoring() {
         let evaluator = create_test_evaluator().await;
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            100.0,  // Good profit
+            0.9,    // High confidence
+            RiskLevel::Low,
+            50.0,   // Low capital requirement
+            1000,   // Fast execution
+        );
         
-        let opportunity = MevOpportunity {
-            strategy: MevStrategy::Arbitrage,
-            estimated_profit: 100.0, // Adjusted to be >= default min_profit_threshold
-            confidence: 0.85,
-            risk_level: RiskLevel::Low,
-            required_capital: 1000.0,
-            execution_time: 300,
-            metadata: serde_json::json!({}),
-            score: None,
-            decision: None,
-        };
-        
-        let score = evaluator.calculate_opportunity_score(&opportunity);
-        assert!(score > 0.0 && score <= 1.0, "Score was {}", score);
+        let score = evaluator.calculate_opportunity_score(&opportunity).await;
+        assert!(score > 0.8, "High quality opportunity should score > 0.8");
     }
     
     #[tokio::test]
@@ -895,9 +1436,9 @@ mod tests {
         };
 
         // Calculate decisions
-        let good_decision = evaluator.make_execution_decision(&good_opportunity);
-        let risky_decision = evaluator.make_execution_decision(&risky_opportunity);
-        let hold_decision = evaluator.make_execution_decision(&hold_opportunity);
+        let good_decision = evaluator.make_execution_decision(&good_opportunity).await;
+        let risky_decision = evaluator.make_execution_decision(&risky_opportunity).await;
+        let hold_decision = evaluator.make_execution_decision(&hold_opportunity).await;
 
 
         assert_eq!(good_decision, ExecutionDecision::Execute, "Good opportunity decision failed");
@@ -1053,5 +1594,130 @@ mod tests {
             score: None,
             decision: None,
         }
+    }
+
+    fn create_test_market_conditions(
+        volatility: f64,
+        gas_price: u64,
+        mempool_density: u32,
+    ) -> MarketConditions {
+        MarketConditions {
+            volatility_index: volatility,
+            price_change_percent: 0.0,  // Not used in current tests
+            volume_usd: 1_000_000.0,    // Default test value
+            liquidity_depth: 500_000.0,  // Default test value
+            mempool_density,
+            gas_price_gwei: gas_price,
+            timestamp: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_volatility_breaker() {
+        let breaker = VolatilityBreaker::default();
+        
+        // Test normal conditions
+        let conditions = create_test_market_conditions(20.0, 100, 20);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Normal);
+        
+        // Test warning conditions
+        let conditions = create_test_market_conditions(30.0, 100, 20);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Warning);
+        
+        // Test critical conditions
+        let conditions = create_test_market_conditions(45.0, 100, 20);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Critical);
+    }
+
+    #[tokio::test]
+    async fn test_gas_price_breaker() {
+        let breaker = GasPriceBreaker::default();
+        
+        // Test normal conditions
+        let conditions = create_test_market_conditions(10.0, 150, 20);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Normal);
+        
+        // Test warning conditions
+        let conditions = create_test_market_conditions(10.0, 300, 20);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Warning);
+        
+        // Test critical conditions
+        let conditions = create_test_market_conditions(10.0, 600, 20);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Critical);
+    }
+
+    #[tokio::test]
+    async fn test_mempool_breaker() {
+        let breaker = MempoolBreaker::default();
+        
+        // Test normal conditions
+        let conditions = create_test_market_conditions(10.0, 100, 30);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Normal);
+        
+        // Test warning conditions
+        let conditions = create_test_market_conditions(10.0, 100, 75);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Warning);
+        
+        // Test critical conditions
+        let conditions = create_test_market_conditions(10.0, 100, 150);
+        assert_eq!(breaker.check(&conditions).await, CircuitBreakerStatus::Critical);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_integration() {
+        let evaluator = create_test_evaluator().await;
+        
+        // Test all normal conditions
+        let conditions = create_test_market_conditions(20.0, 150, 30);
+        assert_eq!(evaluator.check_circuit_breakers(&conditions).await, CircuitBreakerStatus::Normal);
+        
+        // Test warning from one breaker
+        let conditions = create_test_market_conditions(30.0, 150, 30);
+        assert_eq!(evaluator.check_circuit_breakers(&conditions).await, CircuitBreakerStatus::Warning);
+        
+        // Test critical from non-critical breaker
+        let conditions = create_test_market_conditions(20.0, 600, 30);
+        assert_eq!(evaluator.check_circuit_breakers(&conditions).await, CircuitBreakerStatus::Critical);
+        
+        // Test critical from critical breaker (volatility)
+        let conditions = create_test_market_conditions(45.0, 150, 30);
+        assert_eq!(evaluator.check_circuit_breakers(&conditions).await, CircuitBreakerStatus::Critical);
+    }
+
+    #[tokio::test]
+    async fn test_decision_making_with_circuit_breakers() {
+        let evaluator = create_test_evaluator().await;
+        let opportunity = create_test_opportunity(
+            MevStrategy::Arbitrage,
+            100.0,
+            0.9,
+            RiskLevel::Low,
+            1000.0,
+            500,
+        );
+        
+        // Test decision with critical market conditions
+        let conditions = create_test_market_conditions(45.0, 150, 30);
+        assert_eq!(
+            evaluator.make_execution_decision(&opportunity).await,
+            ExecutionDecision::Decline
+        );
+        
+        // Test decision with warning conditions and high confidence
+        let conditions = create_test_market_conditions(30.0, 150, 30);
+        let mut high_confidence_opportunity = opportunity.clone();
+        high_confidence_opportunity.confidence = 0.95;
+        assert_ne!(
+            evaluator.make_execution_decision(&high_confidence_opportunity).await,
+            ExecutionDecision::Decline
+        );
+        
+        // Test decision with warning conditions and lower confidence
+        let mut low_confidence_opportunity = opportunity.clone();
+        low_confidence_opportunity.confidence = 0.75;
+        assert_eq!(
+            evaluator.make_execution_decision(&low_confidence_opportunity).await,
+            ExecutionDecision::Decline
+        );
     }
 } 
