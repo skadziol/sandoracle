@@ -40,3 +40,5 @@ rust-docs-mcp-server/
 
 # Task management files
 tasks/
+logs/
+tmp_test_logs/
