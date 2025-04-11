@@ -239,9 +239,13 @@ impl MevStrategyEvaluator for SandwichEvaluator {
             risk_level: RiskLevel::High, // Sandwich attacks are inherently high risk
             required_capital: front_run_amount,
             execution_time: self.config.max_execution_time,
-            metadata: serde_json::to_value(metadata)?,
+            metadata: serde_json::to_value(&metadata)?,
             score: None,
             decision: None,
+            involved_tokens: vec![metadata.token_pair.0.clone(), metadata.token_pair.1.clone()],
+            allowed_output_tokens: vec![metadata.token_pair.0.clone()], // Only allow spending the input token
+            allowed_programs: vec![metadata.dex.clone()], // Use metadata reference to avoid move
+            max_instructions: 4, // 2 instructions each for front-run and back-run
         };
 
         Ok(Some(opportunity))

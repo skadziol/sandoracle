@@ -140,7 +140,7 @@ impl MevStrategyEvaluator for ArbitrageEvaluator {
             prices: amounts,
             liquidity,
             price_impacts,
-            dexes,
+            dexes: dexes.clone(),
         };
 
         let opportunity = MevOpportunity {
@@ -153,6 +153,10 @@ impl MevStrategyEvaluator for ArbitrageEvaluator {
             metadata: serde_json::to_value(metadata)?,
             score: None,
             decision: None,
+            involved_tokens: token_path.clone(),
+            allowed_output_tokens: vec![token_path[0].clone()], // Only allow spending the first token
+            allowed_programs: dexes.iter().map(|dex| dex.to_string()).collect(),
+            max_instructions: (token_path.len() as u64) * 2, // 2 instructions per hop
         };
 
         Ok(Some(opportunity))

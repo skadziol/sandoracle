@@ -179,6 +179,14 @@ pub struct MevOpportunity {
     /// Execution decision (calculated)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<ExecutionDecision>,
+    /// List of tokens involved in the transaction
+    pub involved_tokens: Vec<String>,
+    /// List of allowed output tokens (tokens that can decrease in balance)
+    pub allowed_output_tokens: Vec<String>,
+    /// List of allowed program IDs that can be called
+    pub allowed_programs: Vec<String>,
+    /// Maximum number of instructions allowed
+    pub max_instructions: u64,
 }
 
 /// Interface for MEV strategy evaluators
@@ -1225,6 +1233,10 @@ mod tests {
                     metadata: serde_json::json!({}),
                     score: None,
                     decision: None,
+                    involved_tokens: Vec::new(),
+                    allowed_output_tokens: Vec::new(),
+                    allowed_programs: Vec::new(),
+                    max_instructions: 0,
                 }))
             } else {
                 Ok(None)
@@ -1366,14 +1378,15 @@ mod tests {
             metadata: serde_json::json!({}),
             score: None,
             decision: None,
+            involved_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+            allowed_output_tokens: vec!["SOL".to_string()],
+            allowed_programs: vec!["DEX1".to_string()],
+            max_instructions: 4,
         };
 
-        // Use thresholds from the evaluator instance
         assert!(opportunity.confidence >= evaluator.min_confidence);
         assert!((opportunity.risk_level.clone() as u8) <= (evaluator.max_risk_level.clone() as u8));
         assert!(opportunity.estimated_profit >= evaluator.min_profit_threshold);
-        // Re-check the meets_thresholds logic if necessary, asserting individual conditions here for clarity
-        // assert!(evaluator.meets_thresholds(&opportunity)); // Original assertion
     }
     
     #[tokio::test]
@@ -1407,6 +1420,10 @@ mod tests {
             metadata: serde_json::json!({}),
             score: Some(0.85), // High score
             decision: None,
+            involved_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+            allowed_output_tokens: vec!["SOL".to_string()],
+            allowed_programs: vec!["DEX1".to_string()],
+            max_instructions: 4,
         };
         
         // Should decline - too risky according to default StrategyExecutionParams for Arbitrage (max Medium)
@@ -1420,33 +1437,37 @@ mod tests {
             metadata: serde_json::json!({}),
             score: Some(0.75), // Score doesn't matter if direct decline conditions met
             decision: None,
+            involved_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+            allowed_output_tokens: vec!["SOL".to_string()],
+            allowed_programs: vec!["DEX1".to_string()],
+            max_instructions: 4,
         };
         
         // Should hold - medium score
-        let hold_opportunity = MevOpportunity {
-            strategy: MevStrategy::Sandwich,
-            estimated_profit: 120.0, // Meets min_profit for Sandwich (100.0)
-            confidence: 0.8, // Lower than min_confidence for Sandwich (0.9)
-            risk_level: RiskLevel::Medium, // Meets max_risk_level for Sandwich (Medium)
-            required_capital: 3000.0,
-            execution_time: 800,
+        let medium_opportunity = MevOpportunity {
+            strategy: MevStrategy::Arbitrage,
+            estimated_profit: 100.0,
+            confidence: 0.85,
+            risk_level: RiskLevel::Medium,
+            required_capital: 1500.0,
+            execution_time: 400,
             metadata: serde_json::json!({}),
             score: Some(0.6), // Medium score (between 0.5 and 0.7)
             decision: None,
+            involved_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+            allowed_output_tokens: vec!["SOL".to_string()],
+            allowed_programs: vec!["DEX1".to_string()],
+            max_instructions: 4,
         };
 
-        // Calculate decisions
-        let good_decision = evaluator.make_execution_decision(&good_opportunity).await;
-        let risky_decision = evaluator.make_execution_decision(&risky_opportunity).await;
-        let hold_decision = evaluator.make_execution_decision(&hold_opportunity).await;
+        let decision = evaluator.make_execution_decision(&good_opportunity).await;
+        assert_eq!(decision, ExecutionDecision::Execute);
 
+        let decision = evaluator.make_execution_decision(&risky_opportunity).await;
+        assert_eq!(decision, ExecutionDecision::Decline);
 
-        assert_eq!(good_decision, ExecutionDecision::Execute, "Good opportunity decision failed");
-        assert_eq!(risky_decision, ExecutionDecision::Decline, "Risky opportunity decision failed");
-        // The hold_opportunity actually gets Declined because its confidence (0.8) is below the
-        // default min_confidence for the Sandwich strategy (0.9) in StrategyExecutionParams.
-        // assert_eq!(hold_decision, ExecutionDecision::Hold, "Hold opportunity decision failed"); 
-        assert_eq!(hold_decision, ExecutionDecision::Decline, "Hold opportunity should decline due to low confidence for strategy");
+        let decision = evaluator.make_execution_decision(&medium_opportunity).await;
+        assert_eq!(decision, ExecutionDecision::Hold);
     }
 
     #[tokio::test]
@@ -1593,6 +1614,10 @@ mod tests {
             metadata: serde_json::json!({}),
             score: None,
             decision: None,
+            involved_tokens: Vec::new(),
+            allowed_output_tokens: Vec::new(),
+            allowed_programs: Vec::new(),
+            max_instructions: 0,
         }
     }
 

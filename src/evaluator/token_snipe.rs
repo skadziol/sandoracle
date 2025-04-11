@@ -214,9 +214,13 @@ impl MevStrategyEvaluator for TokenSnipeEvaluator {
             risk_level,
             required_capital,
             execution_time: self.config.max_execution_time,
-            metadata: serde_json::to_value(metadata)?,
+            metadata: serde_json::to_value(&metadata)?,
             score: None,
             decision: None,
+            involved_tokens: vec!["SOL".to_string(), metadata.token_address.clone()],
+            allowed_output_tokens: vec!["SOL".to_string()], // Only allow spending SOL
+            allowed_programs: vec![metadata.dex.clone()], // Clone dex before using
+            max_instructions: 2, // Usually just a single swap instruction
         };
 
         Ok(Some(opportunity))
