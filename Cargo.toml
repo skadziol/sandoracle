@@ -51,7 +51,7 @@ config = { version = "0.14", features = ["yaml", "toml", "json", "ini"] }
 dotenv = "0.15"
 
 # Utilities
-chrono = "0.4"
+chrono = { version = "0.4.39", features = ["serde"] }
 rand = "0.8"
 dashmap = "5.5"
 parking_lot = "0.12"
@@ -78,6 +78,10 @@ spl-token = "5.0.2"
 # spl-pod = "=0.5.1"
 # spl-discriminator = "=0.4.1"
 # spl-tlv-account-resolution = "=0.9.0"
+
+sandoracle-types = { path = "./sandoracle-types" }
+
+uuid = { version = "1.12.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
