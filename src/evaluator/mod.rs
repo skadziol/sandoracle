@@ -1,4 +1,4 @@
-mod arbitrage;
+pub mod arbitrage;
 // Removed unused: pub use arbitrage::{ArbitrageConfig, ArbitrageEvaluator, ArbitrageMetadata};
 
 use anyhow::Result;

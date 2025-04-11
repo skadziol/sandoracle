@@ -9,11 +9,12 @@ mod executor;
 use crate::config::Settings;
 use crate::error::{Result, SandoError};
 use crate::monitoring::init_logging;
-use crate::evaluator::OpportunityEvaluator;
+use crate::evaluator::{MevStrategyEvaluator, OpportunityEvaluator, arbitrage::ArbitrageEvaluator, arbitrage::ArbitrageConfig};
 use crate::executor::TransactionExecutor;
 use crate::rig_agent::RigAgent;
 use tracing::{info, error};
 use dotenv::dotenv;
+use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,13 +55,22 @@ async fn main() -> Result<()> {
         &settings.wallet_private_key,
         true // Force simulation mode for now
     )?;
-    let evaluator = OpportunityEvaluator::new_with_thresholds(
-        settings.min_profit_threshold, // Using general threshold for now
-        settings.risk_level.into(), // Will use .into() after implementing From
+    
+    // Initialize the main evaluator
+    let mut evaluator = OpportunityEvaluator::new_with_thresholds(
+        settings.min_profit_threshold, 
+        settings.risk_level.into(),
         settings.min_profit_threshold,
-        Default::default() // Using default detailed thresholds for now
+        Default::default() 
     ).await?;
-    // TODO: Initialize Listen Bot
+
+    // Initialize and register strategy-specific evaluators
+    let arbitrage_config = ArbitrageConfig::default(); // Use default config for now
+    let arbitrage_evaluator = ArbitrageEvaluator::new(arbitrage_config);
+    evaluator.register_evaluator(Box::new(arbitrage_evaluator));
+    
+    // TODO: Initialize and register other evaluators (Sandwich, Snipe) when implemented
+
     info!("Components initialized.");
 
     // Run Test Pipeline
@@ -90,8 +100,8 @@ async fn run_test_pipeline(
     executor: TransactionExecutor
 ) -> Result<()> {
     info!(target: "test_pipeline", "Creating mock data...");
-    // Mock data (adjust as needed)
-    let mock_opportunity = crate::rig_agent::RawOpportunityData {
+    // Mock data for RIG Agent (kept for potential future use/context)
+    let mock_opportunity_for_rig = crate::rig_agent::RawOpportunityData {
         source_dex: "MockDex".to_string(),
         transaction_hash: "mock_tx_hash_abc".to_string(),
         input_token: "SOL".to_string(),
@@ -99,57 +109,62 @@ async fn run_test_pipeline(
         input_amount: 10.0,
         output_amount: 1600.0, // 10 SOL -> 1600 USDC
     };
-    let mock_context = crate::rig_agent::MarketContext {
+    let mock_context_for_rig = crate::rig_agent::MarketContext {
         input_token_price_usd: 160.0,
         output_token_price_usd: 1.0,
         pool_liquidity_usd: 1000000.0,
         recent_volatility_percent: 0.5,
     };
 
-    // 1. Evaluate with RIG Agent
-    info!(target: "test_pipeline", "Calling RIG Agent...");
-    let ai_evaluation = rig_agent.evaluate_opportunity(&mock_opportunity, &mock_context).await?; 
-    info!(target: "test_pipeline", ai_evaluation = ?ai_evaluation, "Received AI evaluation");
+    // Mock data specifically for ArbitrageEvaluator::evaluate
+    let mock_arbitrage_data = json!({
+        "token_path": ["USDC", "SOL", "USDC"], // Example path
+        "amounts": [1000.0, 6.25, 1005.0], // Input USDC, intermediate SOL, Output USDC
+        "price_impacts": [0.001, 0.001], // Impact for each step
+        "liquidity": [500000.0, 500000.0], // Liquidity for each pool
+        "dexes": ["Orca", "Raydium"] // DEXes for each step
+    });
 
-    // 2. Evaluate with OpportunityEvaluator (using AI output)
-    // TODO: Refactor OpportunityEvaluator to properly take AI input
-    // For now, we simulate its decision based on AI output + thresholds
-    info!(target: "test_pipeline", "Calling Opportunity Evaluator (simulated decision)...");
-    let final_decision = if ai_evaluation.is_viable 
-                           && ai_evaluation.confidence_score >= evaluator.min_confidence()
-                           // && ai_evaluation.estimated_profit_usd >= evaluator.min_profit_threshold // Maybe check this?
-                        {
-                            // Placeholder: Assume AI suggestion is trustworthy if confidence is high
-                            match ai_evaluation.suggested_action.as_str() {
-                                "Execute Arbitrage" => crate::evaluator::ExecutionDecision::Execute,
-                                "Execute Sandwich" => crate::evaluator::ExecutionDecision::Execute,
-                                _ => crate::evaluator::ExecutionDecision::Decline, 
-                            }
-                        } else {
-                             crate::evaluator::ExecutionDecision::Decline
-                        };
+    // 1. Call RIG Agent (optional for this flow, but kept)
+    info!(target: "test_pipeline", "Calling RIG Agent (for context)...");
+    let ai_evaluation = rig_agent.evaluate_opportunity(&mock_opportunity_for_rig, &mock_context_for_rig).await?;
+    info!(target: "test_pipeline", ai_evaluation = ?ai_evaluation, "Received AI evaluation (context)");
+
+    // 2. Evaluate with OpportunityEvaluator using strategy-specific data
+    info!(target: "test_pipeline", "Calling OpportunityEvaluator with mock arbitrage data...");
+    let opportunities = evaluator.evaluate_opportunity(mock_arbitrage_data).await?;
+
+    if opportunities.is_empty() {
+        info!(target: "test_pipeline", "No viable opportunities found by the evaluator.");
+        return Ok(());
+    }
+
+    // 3. Process the first evaluated opportunity
+    // (In a real scenario, might loop or prioritize)
+    let first_opportunity = &opportunities[0];
+    info!(target: "test_pipeline", opportunity = ?first_opportunity, "Evaluated opportunity details");
+
+    // Use the decision made by the OpportunityEvaluator
+    let final_decision = first_opportunity.decision.unwrap_or(crate::evaluator::ExecutionDecision::Decline);
     info!(target: "test_pipeline", final_decision = ?final_decision, "Evaluator decision made");
 
-    // 3. Execute if viable
+    // 4. Execute if viable
     if final_decision == crate::evaluator::ExecutionDecision::Execute {
         info!(target: "test_pipeline", "Decision is EXECUTE. Proceeding to executor...");
-        // Build mock transaction (based on mock opportunity)
-        // TODO: Extract actual path/strategy from AI evaluation
+        
+        // TODO: Extract actual path/strategy from opportunity.metadata
+        // For now, continue using the dummy path for the executor test
         let mut mock_arbitrage_path = crate::executor::ArbitragePath {
-            steps: vec![/* TODO: Populate with mock steps based on mock_opportunity */]
+            steps: vec![]
         };
-        // Add a dummy step if empty to avoid error in build_arbitrage_transaction
         if mock_arbitrage_path.steps.is_empty() {
-             // Error: Cannot create Pubkey from str "dummy"
-             // let dummy_pubkey = solana_sdk::pubkey::Pubkey::from_str("dummy"); 
-             // Using new_unique instead
             let dummy_pubkey = solana_sdk::pubkey::Pubkey::new_unique();
              mock_arbitrage_path.steps.push(crate::executor::ArbitrageStep {
                 dex_program_id: dummy_pubkey,
                 input_token_mint: dummy_pubkey, 
                 output_token_mint: dummy_pubkey,
-                input_amount: 0,
-                min_output_amount: 0
+                input_amount: 1000_000_000, // Example amount (e.g., 1000 USDC)
+                min_output_amount: 0 // Slippage control needed here
             });
         }
         
@@ -162,7 +177,7 @@ async fn run_test_pipeline(
             Err(e) => error!(target: "test_pipeline", error = %e, "Transaction execution/simulation failed."),
         }
     } else {
-        info!(target: "test_pipeline", "Decision is DECLINE. No execution attempted.");
+        info!(target: "test_pipeline", "Decision was not EXECUTE. No execution attempted.");
     }
 
     Ok(())
