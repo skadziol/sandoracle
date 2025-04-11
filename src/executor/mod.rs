@@ -1,26 +1,49 @@
 use crate::error::{Result, SandoError};
-use crate::evaluator::MevOpportunity; // Removed MevStrategy
-use solana_sdk::transaction::Transaction; // For representing transactions
-use solana_client::rpc_client::RpcClient; // For simulation
-use solana_sdk::signer::keypair::Keypair; // For wallet signing
-use solana_sdk::signer::Signer; // To use pubkey()
+use crate::evaluator::MevOpportunity;
+use solana_sdk::transaction::Transaction;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::signer::keypair::Keypair;
+use solana_sdk::signer::Signer;
 use std::sync::Arc;
-use tracing::{info, error, warn}; // Added warn
-use bs58; // For decoding base58 private keys
+use tracing::{info, error, warn};
+use bs58;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
+use spl_associated_token_account::get_associated_token_address;
+use std::str::FromStr;
+use solana_sdk::native_token::LAMPORTS_PER_SOL;
+use solana_client::rpc_config::{RpcSimulateTransactionConfig};
+use spl_token::state::Mint;
+use spl_token::id as spl_token_id;
+use solana_sdk::account::Account;
+use spl_token::state::Account as TokenAccount;
+use spl_associated_token_account::solana_program::program_pack::Pack;
 
 /// Represents the result of a transaction simulation
 #[derive(Debug, Clone)]
 pub struct SimulationResult {
     pub estimated_gas_cost: u64,
-    pub estimated_profit_sol: f64, // Or native currency
+    pub estimated_profit_sol: f64,
     pub estimated_profit_usd: f64,
     pub is_profitable: bool,
     pub safety_checks_passed: bool,
-    pub error: Option<String>, // Error message if simulation failed
-    // Add more fields as needed, e.g., detailed logs, token balance changes
+    pub error: Option<String>,
+    // Added fields for better simulation tracking
+    pub token_balance_changes: HashMap<String, TokenBalanceChange>,
+    pub instruction_logs: Vec<String>,
+    pub compute_units_consumed: u64,
+    pub accounts_referenced: Vec<String>,
+}
+
+/// Represents a token balance change in the simulation
+#[derive(Debug, Clone, Default)]
+pub struct TokenBalanceChange {
+    pub mint: String,
+    pub ui_amount_change: f64,
+    pub ui_amount_before: f64,
+    pub ui_amount_after: f64,
 }
 
 /// Handles the simulation and execution of MEV transactions
@@ -29,6 +52,15 @@ pub struct TransactionExecutor {
     rpc_client: Arc<RpcClient>,
     signer: Arc<Keypair>,
     simulation_mode: bool, // Added simulation mode flag
+}
+
+impl std::fmt::Debug for TransactionExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionExecutor")
+            .field("rpc_client", &"<RpcClient>")
+            // Add other fields here
+            .finish()
+    }
 }
 
 // --- Structs for Arbitrage Strategy ---
@@ -89,6 +121,21 @@ impl TransactionExecutor {
             .map_err(|e| SandoError::SolanaRpc(format!("Failed to get wallet balance: {}", e)))
     }
 
+    /// Gets the associated token account address
+    fn get_associated_token_address(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+        // Directly calculate the address using the solana_sdk functions
+        let seeds = &[
+            owner.as_ref(),
+            spl_token::id().as_ref(),
+            mint.as_ref(),
+        ];
+        
+        let (associated_token_address, _bump_seed) = 
+            Pubkey::find_program_address(seeds, &spl_associated_token_account::id());
+            
+        associated_token_address
+    }
+
     /// Simulates a potential MEV transaction before execution
     /// 
     /// # Arguments
@@ -99,57 +146,289 @@ impl TransactionExecutor {
     /// A `Result` containing the `SimulationResult`.
     pub async fn simulate_transaction(
         &self,
-        opportunity: &MevOpportunity, // Pass the opportunity for context
-        transaction: &Transaction,    // Pass the constructed unsigned transaction
+        opportunity: &MevOpportunity,
+        transaction: &Transaction,
     ) -> Result<SimulationResult> {
         info!(strategy = ?opportunity.strategy, profit = opportunity.estimated_profit, "Simulating transaction...");
         
-        // --- 1. Estimate Gas Costs ---
-        // Use simulate_transaction to get fee estimate, or use get_fee_for_message
+        // --- 1. Get Pre-Transaction State ---
+        let pre_balances = self.get_token_balances(&opportunity.involved_tokens).await?;
+        
+        // --- 2. Simulate Transaction ---
+        let config = RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: true,
+            commitment: None,
+            encoding: None,
+            accounts: None, // We'll handle account tracking separately
+            min_context_slot: None,
+            inner_instructions: true,
+        };
+
         let simulation_result = self.rpc_client
-            .simulate_transaction(transaction)
+            .simulate_transaction_with_config(transaction, config)
             .map_err(|e| SandoError::Simulation(format!("RPC simulation failed: {}", e)))?;
 
         if let Some(err) = simulation_result.value.err {
             error!(error = ?err, "Transaction simulation returned error");
             return Ok(SimulationResult {
-                estimated_gas_cost: 0, // Or some default/last known fee
+                estimated_gas_cost: 0,
                 estimated_profit_sol: 0.0,
                 estimated_profit_usd: 0.0,
                 is_profitable: false,
                 safety_checks_passed: false,
                 error: Some(format!("Simulation error: {:?}", err)),
+                token_balance_changes: HashMap::new(),
+                instruction_logs: Vec::new(),
+                compute_units_consumed: 0,
+                accounts_referenced: Vec::new(),
             });
         }
+
+        // --- 3. Extract Simulation Data ---
+        let compute_units_consumed = simulation_result.value.units_consumed.unwrap_or(0);
+        let estimated_gas_cost = compute_units_consumed * 5000; // 5000 lamports per CU
         
-        // Extract estimated cost (consider priority fees if applicable)
-        let estimated_gas_cost = simulation_result.value.units_consumed.unwrap_or(0) * 5000; // Placeholder, actual cost depends on fee calculation
-
-        // --- 2. Validate Profitability ---
-        // Requires price data and logic based on the strategy
-        // Placeholder: Compare opportunity.estimated_profit vs estimated_gas_cost
-        let estimated_profit_sol = 0.0; // TODO: Calculate actual profit based on simulation logs/results
-        let estimated_profit_usd = 0.0; // TODO: Convert SOL profit to USD using an oracle
-        let is_profitable = estimated_profit_usd > (estimated_gas_cost as f64 / 1_000_000_000.0); // Basic check
-
-        // --- 3. Ensure Safety ---
-        // - Check for expected balance changes in simulation logs
-        // - Verify no unexpected instructions executed
-        // - Potentially check contract addresses involved
-        let safety_checks_passed = true; // TODO: Implement actual safety checks based on logs
-
-        // --- 4. Construct Result ---
+        let logs = simulation_result.value.logs.unwrap_or_default();
+        
+        // Process accounts if available
+        let accounts_referenced: Vec<String> = Vec::new();
+        let mut post_balances = pre_balances.clone();
+        
+        if let Some(accounts) = &simulation_result.value.accounts {
+            for (i, acc_opt) in accounts.iter().enumerate() {
+                if let Some(acc_data) = acc_opt {
+                    // Process account data if needed
+                    // This would update post_balances based on account state
+                }
+            }
+        }
+        
+        // --- 4. Extract Token Balance Changes ---
+        // Here we'd parse balance changes from logs or post-transaction state
+        // For now, we'll simulate these changes for testing
+        let token_balance_changes = self.calculate_token_balance_changes(pre_balances, post_balances)?;
+        
+        // --- 5. Calculate Profit ---
+        let (profit_sol, profit_usd) = self.calculate_profit(&token_balance_changes, estimated_gas_cost, opportunity).await?;
+        
+        // --- 6. Perform Safety Checks ---
+        let accounts: Vec<Account> = Vec::new(); // We'd extract accounts from simulation data
+        let instruction_count = transaction.message().instructions.len() as u64;
+        let (safety_checks_passed, safety_error) = self.perform_safety_checks(
+            opportunity, 
+            &token_balance_changes, 
+            &accounts, 
+            instruction_count
+        ).await?;
+        
+        // --- 7. Build Final Simulation Result ---
+        let is_profitable = profit_sol > 0.0 && (estimated_gas_cost as f64 / LAMPORTS_PER_SOL as f64) < profit_sol;
+        
         let result = SimulationResult {
             estimated_gas_cost,
-            estimated_profit_sol,
-            estimated_profit_usd,
+            estimated_profit_sol: profit_sol,
+            estimated_profit_usd: profit_usd,
             is_profitable,
             safety_checks_passed,
-            error: None,
+            error: safety_error,
+            token_balance_changes,
+            instruction_logs: logs,
+            compute_units_consumed,
+            accounts_referenced: accounts_referenced,
         };
         
-        info!(result = ?result, "Simulation complete");
+        info!(
+            profit_sol = result.estimated_profit_sol,
+            profit_usd = result.estimated_profit_usd,
+            gas_cost = result.estimated_gas_cost,
+            is_profitable = result.is_profitable,
+            safety_passed = result.safety_checks_passed,
+            "Simulation completed"
+        );
+        
         Ok(result)
+    }
+
+    /// Calculates token balance changes from pre and post simulation states
+    fn calculate_token_balance_changes(
+        &self,
+        pre_balances: HashMap<String, TokenBalanceChange>,
+        post_balances: HashMap<String, TokenBalanceChange>,
+    ) -> Result<HashMap<String, TokenBalanceChange>> {
+        let mut changes = HashMap::new();
+        
+        // Process all tokens from pre-balances
+        for (token, pre_balance) in pre_balances.iter() {
+            let mut change = pre_balance.clone();
+            
+            // If we have post-balance data, calculate the difference
+            if let Some(post_balance) = post_balances.get(token) {
+                change.ui_amount_after = post_balance.ui_amount_after;
+                change.ui_amount_change = post_balance.ui_amount_after - pre_balance.ui_amount_before;
+            }
+            
+            changes.insert(token.clone(), change);
+        }
+        
+        // Add any tokens that only exist in post-balances
+        for (token, post_balance) in post_balances.iter() {
+            if !pre_balances.contains_key(token) {
+                let mut change = post_balance.clone();
+                change.ui_amount_change = post_balance.ui_amount_after; // Assuming started at 0
+                changes.insert(token.clone(), change);
+            }
+        }
+        
+        Ok(changes)
+    }
+
+    /// Gets token balances for a list of tokens
+    async fn get_token_balances(&self, tokens: &[String]) -> Result<HashMap<String, TokenBalanceChange>> {
+        let mut balances = HashMap::new();
+        let owner = self.signer_pubkey();
+        
+        for token_str in tokens {
+            if let Ok(mint) = Pubkey::from_str(token_str) {
+                let token_account = self.get_associated_token_address(&owner, &mint);
+                
+                match self.rpc_client.get_token_account_balance(&token_account) {
+                    Ok(balance) => {
+                        let balance_change = TokenBalanceChange {
+                            mint: token_str.clone(),
+                            ui_amount_change: 0.0, // Will be calculated after simulation
+                            ui_amount_before: balance.ui_amount.unwrap_or(0.0),
+                            ui_amount_after: balance.ui_amount.unwrap_or(0.0), // Same as before, will be updated
+                        };
+                        balances.insert(token_str.clone(), balance_change);
+                    },
+                    Err(e) => {
+                        // Token account may not exist yet, log and continue
+                        warn!(token = token_str, error = %e, "Token account not found or other error");
+                        let balance_change = TokenBalanceChange {
+                            mint: token_str.clone(),
+                            ui_amount_change: 0.0,
+                            ui_amount_before: 0.0,
+                            ui_amount_after: 0.0,
+                        };
+                        balances.insert(token_str.clone(), balance_change);
+                    }
+                }
+            } else {
+                warn!(token = token_str, "Invalid token mint address");
+            }
+        }
+        
+        // Add native SOL balance
+        let sol_balance = self.get_wallet_balance().await?;
+        let sol_balance_change = TokenBalanceChange {
+            mint: "SOL".to_string(),
+            ui_amount_change: 0.0,
+            ui_amount_before: sol_balance as f64 / LAMPORTS_PER_SOL as f64,
+            ui_amount_after: sol_balance as f64 / LAMPORTS_PER_SOL as f64,
+        };
+        balances.insert("SOL".to_string(), sol_balance_change);
+        
+        Ok(balances)
+    }
+
+    /// Gets the decimals of a token mint
+    async fn get_mint_decimals(&self, mint: &Pubkey) -> Result<u8> {
+        let account_info = self.rpc_client.get_account(mint)
+            .map_err(|e| SandoError::SolanaRpc(format!("Failed to get mint account: {}", e)))?;
+            
+        let mint_info = Mint::unpack_from_slice(&account_info.data)
+            .map_err(|e| SandoError::ConfigError(format!("Failed to unpack mint data: {}", e)))?;
+            
+        Ok(mint_info.decimals)
+    }
+
+    /// Calculates profit from token changes and gas cost
+    async fn calculate_profit(
+        &self,
+        token_changes: &HashMap<String, TokenBalanceChange>,
+        gas_cost: u64,
+        _opportunity: &MevOpportunity, // Unused parameter
+    ) -> Result<(f64, f64)> {
+        let mut total_profit_sol = 0.0;
+        
+        // Sum up all token changes in SOL value
+        for (token, change) in token_changes.iter() {
+            if token == "SOL" {
+                total_profit_sol += change.ui_amount_change;
+            } else {
+                // Convert token to SOL value
+                let token_price_sol = self.get_token_price_in_sol(token).await?;
+                total_profit_sol += change.ui_amount_change * token_price_sol;
+            }
+        }
+        
+        // Subtract gas cost
+        total_profit_sol -= gas_cost as f64 / LAMPORTS_PER_SOL as f64;
+        
+        // Convert SOL profit to USD
+        let sol_price_usd = self.get_sol_price_usd().await?;
+        let total_profit_usd = total_profit_sol * sol_price_usd;
+        
+        Ok((total_profit_sol, total_profit_usd))
+    }
+
+    /// Gets token price in SOL (placeholder implementation)
+    async fn get_token_price_in_sol(&self, mint: &str) -> Result<f64> {
+        // In a real implementation, this would fetch token prices from an oracle
+        // For now, we'll use dummy values for demonstration
+        match mint {
+            "USDC" => Ok(0.04), // 1 USDC = 0.04 SOL (example value)
+            "BONK" => Ok(0.0000001), // Just an example rate
+            _ => Ok(0.01), // Default fallback
+        }
+    }
+
+    /// Gets SOL price in USD (placeholder implementation)
+    async fn get_sol_price_usd(&self) -> Result<f64> {
+        // In a real implementation, this would fetch SOL price from an oracle
+        Ok(25.0) // Example: 1 SOL = $25 USD
+    }
+
+    /// Performs safety checks on the transaction
+    async fn perform_safety_checks(
+        &self,
+        opportunity: &MevOpportunity,
+        token_changes: &HashMap<String, TokenBalanceChange>,
+        _accounts: &[Account],
+        instruction_count: u64,
+    ) -> Result<(bool, Option<String>)> {
+        // --- 1. Check token balance changes ---
+        for (token, change) in token_changes.iter() {
+            // Ensure we're only spending allowed output tokens
+            if change.ui_amount_change < 0.0 && !opportunity.allowed_output_tokens.contains(token) {
+                return Ok((false, Some(format!("Unauthorized token spend: {}", token))));
+            }
+            
+            // Check for excessive or unexpected token changes
+            if change.ui_amount_change.abs() > opportunity.required_capital * 2.0 {
+                return Ok((false, Some(format!("Excessive token change: {}", token))));
+            }
+        }
+        
+        // --- 2. Check instruction count ---
+        if instruction_count > opportunity.max_instructions {
+            return Ok((false, Some(format!(
+                "Instruction count ({}) exceeds maximum allowed ({})",
+                instruction_count, opportunity.max_instructions
+            ))));
+        }
+        
+        // --- 3. Check for unauthorized program calls ---
+        // This would need to parse the accounts referenced in the transaction
+        // or analyze the simulation logs for program invocations
+        
+        // --- 4. Check for suspicious account references ---
+        // In a real implementation, this would analyze accounts referenced
+        // in the transaction against a whitelist or known patterns
+        
+        // All checks passed
+        Ok((true, None))
     }
 
     // Updated execute_transaction
@@ -287,17 +566,39 @@ impl TransactionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluator::RiskLevel;
+    use crate::evaluator::{MevOpportunity, RiskLevel, Strategy};
     use solana_sdk::message::Message;
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::{Keypair, Signer};
-    use std::env; // For setting env var in test
+    use std::str::FromStr;
 
     // Helper to get a test keypair
     fn get_test_keypair() -> (Keypair, String) {
         let kp = Keypair::new();
         let b58 = bs58::encode(kp.to_bytes()).into_string();
         (kp, b58)
+    }
+
+    // Helper to create a test opportunity
+    fn create_test_opportunity() -> MevOpportunity {
+        MevOpportunity {
+            strategy: Strategy::Arbitrage,
+            estimated_profit: 0.1,
+            risk_level: RiskLevel::Low,
+            involved_tokens: vec![
+                solana_sdk::native_token::id().to_string(),
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), // USDC
+            ],
+            allowed_output_tokens: vec![
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), // USDC
+            ],
+            allowed_programs: vec![
+                solana_sdk::system_program::id(),
+                Pubkey::from_str("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin").unwrap(), // Serum
+            ],
+            max_instructions: 10,
+            timeout: std::time::Duration::from_secs(30),
+        }
     }
 
     #[test]
@@ -388,5 +689,94 @@ mod tests {
         assert_ne!(signature, solana_sdk::signature::Signature::default()); 
         // We can't easily verify it wasn't sent without more complex mocking or querying the network
         // but the function should return Ok without panicking or hitting the network send.
+    }
+
+    #[tokio::test]
+    async fn test_simulation_success() {
+        let (_kp, b58_key) = get_test_keypair();
+        let rpc_url = "https://api.devnet.solana.com";
+        let executor = TransactionExecutor::new(rpc_url, &b58_key, false).unwrap();
+
+        // Create a simple SOL transfer transaction
+        let recipient = Pubkey::new_unique();
+        let instruction = solana_sdk::system_instruction::transfer(
+            &executor.signer.pubkey(),
+            &recipient,
+            1_000_000, // 0.001 SOL
+        );
+        let message = Message::new(&[instruction], Some(&executor.signer.pubkey()));
+        let transaction = Transaction::new_unsigned(message);
+
+        let opportunity = create_test_opportunity();
+        let result = executor.simulate_transaction(&opportunity, &transaction).await;
+
+        assert!(result.is_ok(), "Simulation failed: {:?}", result.err());
+        let sim_result = result.unwrap();
+
+        // Basic checks
+        assert!(sim_result.compute_units_consumed > 0);
+        assert!(!sim_result.instruction_logs.is_empty());
+        assert!(sim_result.token_balance_changes.contains_key(&solana_sdk::native_token::id().to_string()));
+        assert!(sim_result.safety_checks_passed);
+    }
+
+    #[tokio::test]
+    async fn test_simulation_safety_checks() {
+        let (_kp, b58_key) = get_test_keypair();
+        let rpc_url = "https://api.devnet.solana.com";
+        let executor = TransactionExecutor::new(rpc_url, &b58_key, false).unwrap();
+
+        // Create a transaction that should fail safety checks
+        let unauthorized_program = Pubkey::new_unique();
+        let instruction = Instruction::new_with_bytes(
+            unauthorized_program,
+            &[0],
+            vec![],
+        );
+        let message = Message::new(&[instruction], Some(&executor.signer.pubkey()));
+        let transaction = Transaction::new_unsigned(message);
+
+        let opportunity = create_test_opportunity();
+        let result = executor.simulate_transaction(&opportunity, &transaction).await;
+
+        assert!(result.is_ok());
+        let sim_result = result.unwrap();
+
+        // Should fail safety checks due to unauthorized program
+        assert!(!sim_result.safety_checks_passed);
+        assert!(sim_result.error.unwrap().contains("Unauthorized program"));
+    }
+
+    #[tokio::test]
+    async fn test_profit_calculation() {
+        let (_kp, b58_key) = get_test_keypair();
+        let rpc_url = "https://api.devnet.solana.com";
+        let executor = TransactionExecutor::new(rpc_url, &b58_key, false).unwrap();
+
+        // Create a test token balance change
+        let mut token_changes = HashMap::new();
+        token_changes.insert(
+            solana_sdk::native_token::id().to_string(),
+            TokenBalanceChange {
+                mint: solana_sdk::native_token::id().to_string(),
+                ui_amount_change: 0.1,
+                ui_amount_before: 1_000_000_000, // 1 SOL
+                ui_amount_after: 1_100_000_000, // 1.1 SOL
+            },
+        );
+
+        let opportunity = create_test_opportunity();
+        let gas_cost = 5_000_000; // 0.005 SOL
+
+        let (profit_sol, profit_usd) = executor.calculate_profit(
+            &token_changes,
+            gas_cost,
+            &opportunity,
+        ).await.unwrap();
+
+        // With 0.1 SOL gain and 0.005 SOL gas cost
+        assert!(profit_sol > 0.0);
+        // With placeholder SOL price of 100 USD
+        assert!(profit_usd > 0.0);
     }
 } 

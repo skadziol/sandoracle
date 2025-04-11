@@ -7,18 +7,17 @@ mod monitoring;
 mod executor;
 
 use crate::config::Settings;
-use crate::error::{Result, SandoError};
-use crate::monitoring::{init_logging, ComponentHealth, ComponentStatus, Monitor};
-use crate::evaluator::{MevStrategyEvaluator, OpportunityEvaluator, arbitrage::ArbitrageEvaluator, arbitrage::ArbitrageConfig};
-use crate::executor::TransactionExecutor;
-use crate::rig_agent::RigAgent;
+use crate::error::{Result as SandoResult, SandoError};
+use crate::monitoring::init_logging;
+use crate::listen_bot::{ListenBot, ListenBotCommand};
+use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds, RiskLevel};
 use tracing::{info, error};
 use dotenv::dotenv;
-use crate::listen_bot::{ListenBot, ListenBotCommand};
 use tokio::signal;
+use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> SandoResult<()> {
     // Load .env file first
     dotenv().ok();
 
@@ -26,18 +25,12 @@ async fn main() -> Result<()> {
     let log_dir = "./logs";
     let file_level = "debug";
     let console_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    
-    let _guard = init_logging(log_dir, &file_level, &console_level)
-        .map_err(|e| SandoError::InternalError(format!("Failed to initialize logging: {}", e)))?;
+    let _guard = init_logging(log_dir, file_level, &console_level)?;
 
-    // Remove the async move block, execute directly in main
-    // let main_span = tracing::span!(Level::INFO, "main_execution");
-    // async move {
     // Enter span if needed:
     let main_span = tracing::info_span!("main_execution");
     let _main_span_guard = main_span.enter(); // Keep guard
 
-    info!("SandoSeer logging initialized. Console: {}, File: {} (in {})", console_level, file_level, log_dir);
     info!("Starting SandoSeer MEV Oracle...");
 
     // Load configuration
@@ -51,16 +44,35 @@ async fn main() -> Result<()> {
     // Initialize components
     info!("Initializing components...");
     
+    // Initialize the OpportunityEvaluator
+    info!("Initializing OpportunityEvaluator...");
+    let evaluator = OpportunityEvaluator::new_with_thresholds(
+        settings.min_profit_threshold,  // Use settings for minimum profit threshold
+        settings.risk_level,            // Use settings for risk level
+        settings.min_profit_threshold,  // Duplicate setting as a fallback
+        ExecutionThresholds::default(), // Use default thresholds for now
+    )
+    .await
+    .map_err(|e| SandoError::DependencyError(format!("Failed to create OpportunityEvaluator: {}", e)))?;
+
+    // Wrap the evaluator in an Arc for safe sharing between threads
+    let evaluator_arc = Arc::new(evaluator);
+    
     // Initialize ListenBot (this will internally init listen-engine)
-    let (listen_bot, listen_bot_cmd_tx) = ListenBot::from_settings(&settings).await?;
+    let (mut listen_bot, listen_bot_cmd_tx) = ListenBot::from_settings(&settings).await?;
+    
+    // Set the evaluator on the ListenBot
+    listen_bot.set_evaluator(evaluator_arc.clone());
 
-    // TODO: Initialize evaluator, executor, rig_agent later when needed in the main loop
-    // let mut evaluator = OpportunityEvaluator::new_with_thresholds(...).await?;
-    // Initialize and register strategy-specific evaluators...
-    // let executor = TransactionExecutor::new(...)?;
-    // let rig_agent = RigAgent::from_env()?;
+    // Log detailed information about the initialized components
+    info!(
+        min_confidence = evaluator_arc.min_confidence(),
+        risk_level = ?settings.risk_level,
+        min_profit = settings.min_profit_threshold,
+        "OpportunityEvaluator initialized and connected to ListenBot"
+    );
 
-    info!("Components initialized (ListenBot started). RIG Agent, Executor, Evaluator TBD.");
+    info!("Components initialized successfully");
 
     // Start the ListenBot in its own task
     let listen_bot_handle = tokio::spawn(async move {

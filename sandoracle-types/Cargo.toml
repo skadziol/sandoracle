@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-solana-sdk = "2.2.1" # Match version used elsewhere
+solana-sdk = "=2.2.1" # Match version used in main project
 chrono = { version = "0.4", features = ["serde"] } # Match version used elsewhere
 serde = { version = "1.0", features = ["derive"] } # Match version used elsewhere
 uuid = { version = "1.12.1", features = ["serde", "v4"] } # Needed by listen-engine 

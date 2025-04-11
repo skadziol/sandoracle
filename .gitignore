@@ -37,3 +37,8 @@ node_modules/
 
 # Local directories not meant for Git
 rust-docs-mcp-server/
+
+# Task management files
+tasks/
+logs/
+tmp_test_logs/

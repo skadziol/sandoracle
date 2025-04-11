@@ -6,6 +6,7 @@ use tracing::{info, error, warn}; // Added warn
 use std::sync::Arc;
 use serde::{Deserialize, Serialize}; // For parsing LLM response
 use serde_json; // For JSON handling
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Interface for the RIG AI Agent
 #[derive(Clone)]
@@ -199,13 +200,28 @@ mod tests {
         assert!(agent_result.is_ok(), "Failed to create agent: {:?}", agent_result.err());
         let agent = agent_result.unwrap();
 
-        let prompt = "Explain the concept of MEV in one sentence.";
-        let response_result = agent.evaluate_opportunity(prompt).await;
+        let raw_opportunity = RawOpportunityData {
+            source_dex: "Orca".to_string(),
+            transaction_hash: "test_tx_hash".to_string(),
+            input_token: "SOL".to_string(),
+            output_token: "USDC".to_string(),
+            input_amount: 100.0,
+            output_amount: 10000.0,
+        };
 
-        assert!(response_result.is_ok(), "Agent evaluation failed: {:?}", response_result.err());
+        let market_context = MarketContext {
+            input_token_price_usd: 100.0,
+            output_token_price_usd: 1.0,
+            pool_liquidity_usd: 1_000_000.0,
+            recent_volatility_percent: 5.0,
+        };
+
+        let response_result = agent.evaluate_opportunity(&raw_opportunity, &market_context).await;
+        assert!(response_result.is_ok());
+
         let response = response_result.unwrap();
-        println!("Test prompt response: {}", response);
-        assert!(!response.is_empty());
+        println!("Test prompt response: {:?}", response);
+        assert!(!response.reasoning.is_empty());
     }
 
     #[tokio::test]

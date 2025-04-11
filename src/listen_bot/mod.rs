@@ -5,8 +5,9 @@ use listen_engine::engine::pipeline::{Pipeline, Status};
 
 use crate::config::Settings;
 use crate::error::{Result, SandoError};
+use crate::evaluator::{OpportunityEvaluator, MevOpportunity};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 use std::sync::Arc;
 use chrono;
 use uuid;
@@ -42,6 +43,8 @@ pub struct ListenBot {
     event_rx: mpsc::Receiver<EngineTransactionEvent>,
     /// Command receiver (for shutdown signal)
     cmd_rx: mpsc::Receiver<ListenBotCommand>,
+    /// Opportunity evaluator for MEV detection
+    evaluator: Option<Arc<OpportunityEvaluator>>,
 }
 
 impl ListenBot {
@@ -76,9 +79,16 @@ impl ListenBot {
                 event_tx: internal_event_tx,
                 event_rx: engine_event_rx,
                 cmd_rx,
+                evaluator: None,
             },
             cmd_tx,
         ))
+    }
+
+    /// Set the opportunity evaluator for MEV detection
+    pub fn set_evaluator(&mut self, evaluator: Arc<OpportunityEvaluator>) {
+        info!("Setting OpportunityEvaluator for ListenBot");
+        self.evaluator = Some(evaluator);
     }
 
     /// Starts the ListenBot's main loop and the underlying engine.
@@ -122,6 +132,9 @@ impl ListenBot {
             }
         });
 
+        // Get the evaluator if it exists
+        let evaluator = self.evaluator.clone();
+
         let event_processor_handle = tokio::spawn(async move {
             info!("ListenBot event processor started.");
             loop {
@@ -135,7 +148,7 @@ impl ListenBot {
                         }
                     }
                     Some(engine_event) = self.event_rx.recv() => {
-                        match Self::process_engine_event(engine_event).await {
+                        match Self::process_engine_event(engine_event, evaluator.clone()).await {
                             Ok(Some(processed_event)) => {
                                 if let Err(e) = self.event_tx.send(processed_event).await {
                                     error!("Failed to send processed event internally: {}", e);
@@ -170,7 +183,10 @@ impl ListenBot {
     }
 
     /// Processes an event received from the listen-engine.
-    async fn process_engine_event(event: EngineTransactionEvent) -> Result<Option<TransactionEvent>> {
+    async fn process_engine_event(
+        event: EngineTransactionEvent, 
+        evaluator: Option<Arc<OpportunityEvaluator>>
+    ) -> Result<Option<TransactionEvent>> {
         info!("Processing engine event");
 
         // Convert the engine event to our local TransactionEvent format
@@ -183,6 +199,61 @@ impl ListenBot {
             amount: None, // We don't have this info from the engine event
             success: event.status == "Executed", // Convert status string to boolean
         };
+
+        // If we have an evaluator, evaluate the transaction for MEV opportunities
+        if let Some(evaluator) = evaluator {
+            debug!("Evaluating transaction for MEV opportunities");
+            // Convert the event to a format the evaluator can understand
+            let eval_data = serde_json::json!({
+                "signature": event.transaction_hash,
+                "program_id": event.details,
+                "status": event.status,
+                "timestamp": chrono::Utc::now().timestamp(),
+                // Add any other data needed by evaluator
+            });
+
+            // Evaluate for MEV opportunities
+            match evaluator.evaluate_opportunity(eval_data).await {
+                Ok(opportunities) => {
+                    if !opportunities.is_empty() {
+                        info!(
+                            count = opportunities.len(),
+                            "Found potential MEV opportunities"
+                        );
+                        
+                        // Log details about each opportunity
+                        for (idx, opportunity) in opportunities.iter().enumerate() {
+                            info!(
+                                idx = idx,
+                                strategy = ?opportunity.strategy,
+                                profit = opportunity.estimated_profit,
+                                confidence = opportunity.confidence,
+                                risk = ?opportunity.risk_level,
+                                decision = ?opportunity.decision,
+                                "MEV opportunity details"
+                            );
+                            
+                            // Monitor active opportunities
+                            if let Some(decision) = opportunity.decision {
+                                if decision == crate::evaluator::ExecutionDecision::Execute || 
+                                   decision == crate::evaluator::ExecutionDecision::Hold {
+                                    // Clone for monitoring
+                                    let opp_clone = opportunity.clone();
+                                    if let Err(e) = evaluator.monitor_opportunity(opp_clone).await {
+                                        error!(error = %e, "Failed to monitor opportunity");
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        debug!("No MEV opportunities found");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Error evaluating MEV opportunities");
+                }
+            }
+        }
 
         Ok(Some(processed_event))
     }
