@@ -7,7 +7,7 @@ description = "AI MEV Oracle for Solana - Autonomous MEV detection and execution
 
 [dependencies]
 # Local dependencies
-listen-engine = { path = "./listen/listen-engine" }
+listen-core = { path = "./listen-core" }
 
 # RIG Framework
 rig-core = { git = "https://github.com/piotrostr/rig.git", branch = "main", default-features = false }

@@ -6,17 +6,20 @@ mod rig_agent;
 mod monitoring;
 mod executor;
 mod market_data;
+mod jupiter_client;
 
 use crate::config::Settings;
 use crate::error::{Result as SandoResult, SandoError};
 use crate::monitoring::init_logging;
 use crate::listen_bot::{ListenBot, ListenBotCommand};
-use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds, RiskLevel};
+use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds};
 use crate::executor::{TransactionExecutor, strategies::StrategyExecutor};
 use tracing::{info, error};
 use dotenv::dotenv;
 use tokio::signal;
 use std::sync::Arc;
+use crate::config::RiskLevel as ConfigRiskLevel;
+use crate::evaluator::RiskLevel as EvalRiskLevel;
 
 #[tokio::main]
 async fn main() -> SandoResult<()> {
@@ -64,9 +67,13 @@ async fn main() -> SandoResult<()> {
     
     // Initialize the OpportunityEvaluator
     info!("Initializing OpportunityEvaluator...");
+    
+    // Convert the risk level from config to evaluator type
+    let eval_risk_level = evaluator::RiskLevel::from(settings.risk_level.clone());
+    
     let mut evaluator = OpportunityEvaluator::new_with_thresholds(
         settings.min_profit_threshold,  // Use settings for minimum profit threshold
-        settings.risk_level,            // Use settings for risk level
+        eval_risk_level,                // Use converted risk level
         settings.min_profit_threshold,  // Duplicate setting as a fallback
         ExecutionThresholds::default(), // Use default thresholds for now
     )

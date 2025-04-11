@@ -1,7 +1,8 @@
-use listen_engine::engine::Engine;
-use sandoracle_types::events::TransactionEvent as EngineTransactionEvent;
-use listen_engine::server::state::EngineMessage;
-use listen_engine::engine::pipeline::{Pipeline, Status};
+use listen_core::{
+    ListenEngine, ListenEngineConfig, // Core engine components
+    model::tx::Transaction as ListenTransaction, // Transaction model from listen-core
+    router::dexes::DexName, // DEX enum if needed for configuration
+};
 
 use crate::config::Settings;
 use crate::error::{Result, SandoError};
@@ -15,9 +16,21 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-
-// Import PriceUpdate from listen-engine
-use listen_engine::redis::subscriber::PriceUpdate;
+use futures::stream::StreamExt;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::{RpcBlockConfig, RpcTransactionConfig};
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_transaction_status::{
+    UiTransactionEncoding,
+    TransactionBinaryEncoding,
+    EncodedTransaction,
+    TransactionDetails,
+    option_serializer::OptionSerializer,
+};
+use solana_sdk::transaction::VersionedTransaction;
+use tokio::task; // Import for spawn_blocking
+use base64::prelude::*; // Use base64 prelude for BASE64_STANDARD
+use base64::Engine; // Import Engine trait for decode method
 
 mod config;
 mod types;
@@ -36,14 +49,14 @@ pub enum ListenBotCommand {
 
 /// Main ListenBot struct that manages transaction monitoring
 pub struct ListenBot {
-    /// The underlying listen-engine instance
-    engine: Arc<Engine>,
+    /// The underlying listen-core instance
+    core_engine: Arc<ListenEngine>,
     /// Configuration
-    config: ListenBotConfig,
+    core_config: ListenEngineConfig,
+    /// Transaction event receiver (from listen-core)
+    core_event_rx: Option<mpsc::Receiver<ListenTransaction>>,
     /// Transaction event sender (for internal use or forwarding) - Might be repurposed or removed
     event_tx: mpsc::Sender<TransactionEvent>,
-    /// Price Update receiver (from listen-engine)
-    price_update_rx: mpsc::Receiver<PriceUpdate>,
     /// Command receiver (for shutdown signal)
     cmd_rx: mpsc::Receiver<ListenBotCommand>,
     /// Opportunity evaluator for MEV detection
@@ -53,35 +66,30 @@ pub struct ListenBot {
 impl ListenBot {
     /// Creates a new ListenBot instance using settings from the environment.
     pub async fn from_settings(settings: &Settings) -> Result<(Self, mpsc::Sender<ListenBotCommand>)> {
-        info!("Initializing ListenBot from settings...");
-        // Create ListenBotConfig from global Settings
-        let bot_config = ListenBotConfig {
+        info!("Initializing ListenBot using listen-core...");
+
+        // Create ListenEngineConfig from global Settings
+        let core_config = ListenEngineConfig {
             rpc_url: settings.solana_rpc_url.clone(),
-            ws_url: settings.solana_ws_url.clone(),
-            filter: Default::default(),
-            max_concurrent_requests: settings.max_concurrent_trades,
-            request_timeout: settings.request_timeout_secs.unwrap_or(30),
-            max_retries: settings.max_retries.unwrap_or(3),
-            retry_backoff_ms: settings.retry_backoff_ms.unwrap_or(1000),
+            ws_url: Some(settings.solana_ws_url.clone()), // Use ws_url from settings
+            commitment: settings.commitment.clone().unwrap_or_else(|| "confirmed".to_string()), // Use commitment from settings or default
         };
 
+        // Create the listen-core engine
+        let core_engine = ListenEngine::new(core_config.clone())
+            .map_err(|e| SandoError::DependencyError(format!("Failed to create listen-core Engine: {}", e)))?;
+        let core_engine_arc = Arc::new(core_engine);
+
         let (cmd_tx, cmd_rx) = mpsc::channel::<ListenBotCommand>(1);
-        let (internal_event_tx, _internal_event_rx) = mpsc::channel::<TransactionEvent>(1000); // Keep for now, might remove later
-        // let (_engine_event_tx, engine_event_rx) = mpsc::channel::<EngineTransactionEvent>(1000); // REMOVE THIS - Engine uses PriceUpdate
+        let (internal_event_tx, _internal_event_rx) = mpsc::channel::<TransactionEvent>(1000);
 
-        // Get the engine and the correct PriceUpdate receiver
-        let (engine, price_rx) = Engine::from_env().await
-            .map_err(|e| SandoError::DependencyError(format!("Failed to create listen-engine Engine: {}", e)))?;
-
-        let engine_arc = Arc::new(engine);
-
-        info!("ListenBot initialized successfully.");
+        info!("ListenBot (listen-core based) initialized successfully.");
         Ok((
             Self {
-                engine: engine_arc,
-                config: bot_config,
-                event_tx: internal_event_tx, // Keep for now
-                price_update_rx: price_rx, // USE the receiver from the engine
+                core_engine: core_engine_arc,
+                core_config,
+                core_event_rx: None, // Stream receiver will be set in start()
+                event_tx: internal_event_tx,
                 cmd_rx,
                 evaluator: None,
             },
@@ -95,46 +103,49 @@ impl ListenBot {
         self.evaluator = Some(evaluator);
     }
 
-    /// Starts the ListenBot's main loop and the underlying engine.
-    pub async fn start(mut self) -> Result<()> {
-        info!("Starting ListenBot...");
+    /// Starts the ListenBot's main loop using listen-core
+    pub async fn start(self) -> Result<()> {
+        info!("Starting ListenBot (listen-core based)...");
 
-        // self.create_monitoring_pipeline().await?; // This seems engine-specific, remove from here?
-        // info!("Listen Engine pipeline configured."); // This seems engine-specific
-
-        let engine_to_start = self.engine.clone();
-        
-        // Create channels for engine command communication (if needed by engine.run)
-        // let (_price_tx, price_rx) = mpsc::channel(1000); // REMOVE THIS - we already have the receiver
-        let (cmd_tx, cmd_rx) = mpsc::channel(1000); // Engine run needs a command channel
-
-        // Create a dummy pipeline for testing? - This seems like internal engine logic, remove from here
-        // let test_pipeline = Pipeline { ... };
-        // Send test pipeline to engine? - Remove from here
-        // let (response_tx, _response_rx) = oneshot::channel();
-        // let _ = cmd_tx.send(EngineMessage::AddPipeline { ... }).await;
-
-        // Note: engine.run needs the PriceUpdate receiver, but it gets it from Engine::from_env internally via its subscriber.
-        // We just need to pass the command channel.
-        let engine_handle = tokio::spawn(async move {
-            info!("Starting listen-engine...");
-            // Pass the command receiver to engine run loop
-            // The PriceUpdate receiver is handled internally by the engine via its Redis subscriber
-            if let Err(e) = Engine::run(engine_to_start, mpsc::channel(1).1, cmd_rx).await { // Pass dummy price receiver, engine uses its own
-                error!(error = %e, "Listen Engine failed to start or encountered an error");
-            } else {
-                info!("Listen Engine stopped.");
-            }
-        });
+        // Define which DEXes to monitor (example)
+        let dexes_to_monitor = vec![DexName::Jupiter, DexName::Raydium, DexName::Orca];
 
         // Get the evaluator if it exists
         let evaluator = self.evaluator.clone();
+        let mut cmd_rx = self.cmd_rx;
+
+        // Move core_engine into the async block
+        let core_engine = Arc::clone(&self.core_engine);
 
         let event_processor_handle = tokio::spawn(async move {
-            info!("ListenBot event processor started.");
+            info!("ListenBot event processor started...");
+
+            // Get the slot stream from listen-core engine inside the async block
+            let slot_stream = match core_engine.stream_dex_swaps(dexes_to_monitor).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!(error = %e, "Failed to get stream from listen-core");
+                    return;
+                }
+            };
+
+            // Get the RPC client from the core engine
+            let rpc_client = core_engine.rpc_client();
+
+            let block_config = RpcBlockConfig {
+                encoding: Some(UiTransactionEncoding::Base64),
+                transaction_details: Some(solana_transaction_status::TransactionDetails::Full),
+                rewards: Some(false),
+                commitment: Some(CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            };
+
+            let mut slot_stream = slot_stream;
+
             loop {
                 tokio::select! {
-                    Some(command) = self.cmd_rx.recv() => {
+                    // Check for shutdown command
+                    Some(command) = cmd_rx.recv() => {
                         match command {
                             ListenBotCommand::Shutdown => {
                                 info!("Shutdown command received. Stopping ListenBot event processor...");
@@ -142,145 +153,185 @@ impl ListenBot {
                             }
                         }
                     }
-                    // Listen on the price_update_rx channel now
-                    Some(price_update) = self.price_update_rx.recv() => {
-                        debug!(asset = %price_update.pubkey, price = price_update.price, slot = price_update.slot, "ListenBot received PriceUpdate from channel");
-                        // Rename function to reflect it processes price updates
-                        match Self::process_price_update(price_update, evaluator.clone()).await {
-                            Ok(Some(processed_event)) => {
-                                // Still send TransactionEvent for now, but might change this
-                                if let Err(e) = self.event_tx.send(processed_event).await {
-                                    error!("Failed to send processed event internally: {}", e);
+                    // Process next slot from the listen-core stream
+                    maybe_slot = slot_stream.next() => {
+                        match maybe_slot {
+                            Some(slot) => {
+                                debug!(slot, "Received slot, fetching block...");
+                                
+                                // Clone client for blocking task
+                                let client = rpc_client.clone(); 
+                                let config = block_config.clone();
+                                
+                                // --- Fetch Block using spawn_blocking --- 
+                                match task::spawn_blocking(move || client.get_block_with_config(slot, config)).await {
+                                    Ok(Ok(block)) => {
+                                        if let Some(transactions) = block.transactions {
+                                            debug!(slot, num_txs = transactions.len(), "Successfully fetched block");
+                                            
+                                            // --- Iterate & Process Transactions --- 
+                                            for tx_with_meta in transactions {
+                                                // Filter out failed transactions
+                                                if let Some(ref meta) = tx_with_meta.meta {
+                                                    if meta.err.is_some() {
+                                                        continue;
+                                                    }
+                                                } else {
+                                                    continue;
+                                                }
+
+                                                // Get logs early to avoid move issues
+                                                let logs = tx_with_meta.meta
+                                                    .as_ref()
+                                                    .and_then(|m| match &m.log_messages {
+                                                        OptionSerializer::Some(logs) => Some(logs.clone()),
+                                                        _ => None,
+                                                    })
+                                                    .unwrap_or_default();
+
+                                                // Decode transaction first
+                                                let decoded_tx = match &tx_with_meta.transaction {
+                                                    EncodedTransaction::Json(_) => {
+                                                        warn!(slot, "JSON encoded transaction not supported");
+                                                        continue;
+                                                    },
+                                                    EncodedTransaction::Binary(data, encoding) => {
+                                                        match encoding {
+                                                            TransactionBinaryEncoding::Base58 => bs58::decode(data).into_vec().ok(),
+                                                            TransactionBinaryEncoding::Base64 => base64::prelude::BASE64_STANDARD.decode(data).ok(),
+                                                        }
+                                                    },
+                                                    EncodedTransaction::LegacyBinary(data) => {
+                                                        // Legacy binary is base-58 encoded
+                                                        bs58::decode(data).into_vec().ok()
+                                                    },
+                                                    EncodedTransaction::Accounts(_) => {
+                                                        warn!(slot, "Account-based transaction encoding not supported");
+                                                        continue;
+                                                    }
+                                                };
+
+                                                let decoded_tx = match decoded_tx {
+                                                    Some(bytes) => match bincode::deserialize::<solana_sdk::transaction::Transaction>(&bytes) {
+                                                        Ok(tx) => tx,
+                                                        Err(e) => {
+                                                            warn!(slot, error = %e, "Failed to deserialize transaction");
+                                                            continue;
+                                                        }
+                                                    },
+                                                    None => {
+                                                        warn!(slot, "Failed to decode transaction data");
+                                                        continue;
+                                                    }
+                                                };
+
+                                                // Get signature from decoded transaction
+                                                let signature = match &decoded_tx {
+                                                    solana_sdk::transaction::Transaction { signatures, .. } => {
+                                                        if let Some(sig) = signatures.first() {
+                                                            sig.to_string()
+                                                        } else {
+                                                            warn!(slot, "Transaction missing signature");
+                                                            continue;
+                                                        }
+                                                    }
+                                                };
+
+                                                // Process based on transaction version
+                                                match decoded_tx {
+                                                    solana_sdk::transaction::Transaction { message, .. } => {
+                                                        // Get the signer (fee payer)
+                                                        let signer = message.account_keys.get(0).map(|pk| pk.to_string()).unwrap_or_default();
+                                                        if signer.is_empty() {
+                                                            warn!(slot, %signature, "Transaction missing signer (account_keys[0])?");
+                                                            continue;
+                                                        }
+
+                                                        let block_time = block.block_time.unwrap_or_else(|| chrono::Utc::now().timestamp());
+                                                        
+                                                        debug!(%signature, %signer, slot, "Processing transaction");
+
+                                                        if let Some(evaluator) = evaluator.clone() {
+                                                            // Construct Eval Data
+                                                            let eval_data = serde_json::json!({
+                                                                "event_type": "solana_transaction",
+                                                                "signature": signature,
+                                                                "slot": slot,
+                                                                "block_time": block_time,
+                                                                "signer": signer,
+                                                                "logs": logs,
+                                                            });
+
+                                                            // Evaluate Opportunity
+                                                            debug!(data = ?eval_data, "Evaluating potential opportunity...");
+                                                            match evaluator.evaluate_opportunity(eval_data).await {
+                                                                Ok(opportunities) => {
+                                                                    if !opportunities.is_empty() {
+                                                                        info!(count = opportunities.len(), %signature, "Found potential MEV opportunities");
+                                                                        for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
+                                                                            match evaluator.process_mev_opportunity(&mut opportunity).await {
+                                                                                Ok(Some(exec_sig)) => {
+                                                                                    info!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
+                                                                                },
+                                                                                Ok(None) => {
+                                                                                    info!(idx = idx, strategy = ?opportunity.strategy, decision = ?opportunity.decision, "Decided not to execute MEV opportunity");
+                                                                                },
+                                                                                Err(e) => {
+                                                                                    error!(idx = idx, strategy = ?opportunity.strategy, error = %e, "Error executing MEV opportunity");
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    } 
+                                                                }
+                                                                Err(e) => {
+                                                                    error!(%signature, error = %e, "Error evaluating opportunity");
+                                                                }
+                                                            }
+                                                        } else {
+                                                            warn!("No evaluator set for ListenBot, cannot evaluate transaction.");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            debug!(slot, "Block has no transactions");
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        error!(slot, error = %e, "Failed to fetch block");
+                                    }
+                                    Err(e) => {
+                                        error!(slot, error = %e, "Block fetching task failed");
+                                    }
                                 }
                             }
-                            Ok(None) => { /* Filtered or no action needed */ }
-                            Err(e) => {
-                                error!("Error processing price update: {}", e);
+                            None => {
+                                info!("Listen-core slot stream ended. Exiting loop.");
+                                break;
                             }
                         }
-                    }
-                    else => {
-                        info!("ListenBot price update channel closed. Exiting loop.");
-                        break;
                     }
                 }
             }
             info!("ListenBot event processor stopped.");
         });
 
-        tokio::select! {
-            _ = engine_handle => {
-                warn!("Listen Engine task completed or failed.");
-            },
-            _ = event_processor_handle => {
-                 info!("ListenBot event processor task completed.");
-            }
+        // Wait for the event processor task to complete
+        if let Err(e) = event_processor_handle.await {
+            error!(error = ?e, "ListenBot event processor task failed or panicked");
+            return Err(SandoError::InternalError(format!("Event processor panicked: {:?}", e)));
         }
 
         info!("ListenBot shutting down.");
         Ok(())
     }
 
-    /// Processes a price update received from the listen-engine's channel.
-    async fn process_price_update(
-        price_update: PriceUpdate, 
-        evaluator: Option<Arc<OpportunityEvaluator>>
-    ) -> Result<Option<TransactionEvent>> {
-        info!(asset = %price_update.pubkey, price = price_update.price, slot = price_update.slot, "Processing price update");
-
-        // TODO: Decide if this price update warrants creating an "Opportunity"
-        // For now, let's always try to evaluate if an evaluator exists.
-
-        // If we have an evaluator, evaluate based on the price update
-        if let Some(evaluator) = evaluator {
-            debug!(asset = %price_update.pubkey, "Evaluating price update for MEV opportunities");
-            
-            // Construct data for the evaluator based on the PriceUpdate
-            // This structure needs to align with what OpportunityEvaluator expects
-            let eval_data = serde_json::json!({
-                "event_type": "price_update",
-                "asset_mint": price_update.pubkey,
-                "price": price_update.price,
-                "slot": price_update.slot,
-                "timestamp": chrono::Utc::now().timestamp(),
-                // Potentially add other market context here if available
-            });
-
-            // Evaluate for MEV opportunities based on price change
-            match evaluator.evaluate_opportunity(eval_data).await {
-                Ok(opportunities) => {
-                    if !opportunities.is_empty() {
-                        info!(
-                            count = opportunities.len(),
-                            asset = %price_update.pubkey,
-                            "Found potential MEV opportunities based on price update"
-                        );
-                        
-                        // Process each opportunity (same logic as before)
-                        for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
-                            info!(
-                                idx = idx,
-                                strategy = ?opportunity.strategy,
-                                profit = opportunity.estimated_profit,
-                                confidence = opportunity.confidence,
-                                risk = ?opportunity.risk_level,
-                                "Processing MEV opportunity triggered by price update"
-                            );
-                            
-                            match evaluator.process_mev_opportunity(&mut opportunity).await {
-                                Ok(Some(signature)) => {
-                                    info!(
-                                        idx = idx,
-                                        strategy = ?opportunity.strategy,
-                                        signature = %signature,
-                                        "Successfully executed MEV opportunity (from price update)"
-                                    );
-                                },
-                                Ok(None) => {
-                                    info!(
-                                        idx = idx,
-                                        strategy = ?opportunity.strategy,
-                                        decision = ?opportunity.decision,
-                                        "Decided not to execute MEV opportunity (from price update)"
-                                    );
-                                },
-                                Err(e) => {
-                                    error!(
-                                        idx = idx,
-                                        strategy = ?opportunity.strategy,
-                                        error = %e,
-                                        "Error executing MEV opportunity (from price update)"
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        debug!(asset = %price_update.pubkey, "No opportunities found for this price update");
-                    }
-                }
-                Err(e) => {
-                    error!(asset = %price_update.pubkey, error = %e, "Error evaluating opportunity for price update");
-                }
-            }
-        } else {
-            warn!("No evaluator set for ListenBot, cannot evaluate price update.");
-        }
-
-        // For now, return None as we are not converting PriceUpdate to TransactionEvent
-        // This might change based on how downstream components use the event_tx channel.
-        Ok(None) 
-    }
-
     /// Stops the ListenBot and its underlying engine.
     pub async fn stop(&mut self) -> Result<()> {
-        info!("Sending shutdown command to ListenBot event processor...");
-        // The actual cmd_tx was moved into the task, we need a way to access it or redesign shutdown
-        // For now, this won't work as intended.
-        // if let Err(e) = self.cmd_rx.send(ListenBotCommand::Shutdown).await { // This seems wrong, should send on cmd_tx
-        //     error!("Failed to send shutdown command: {}", e);
-        //     return Err(SandoError::InternalError(format!("Failed to send shutdown: {}", e)));
-        // }
-        warn!("ListenBot::stop currently cannot signal the running task correctly.");
+        // TODO: Need a way to signal the event_processor_handle task to stop.
+        // The self.cmd_rx is moved into the task.
+        // Maybe return the cmd_tx from from_settings and use it in main.rs?
+        warn!("ListenBot::stop needs refactoring to correctly signal the processing loop.");
         Ok(())
     }
 }

@@ -2,9 +2,14 @@ pub mod arbitrage;
 pub mod sandwich;
 pub mod token_snipe;
 
-use arbitrage::{ArbitrageConfig, ArbitrageEvaluator};
-use sandwich::{SandwichConfig, SandwichEvaluator};
-use token_snipe::{TokenSnipeConfig, TokenSnipeEvaluator};
+// use arbitrage::{ArbitrageConfig, ArbitrageEvaluator}; // Keep commented or remove
+// use sandwich::{SandwichConfig, SandwichEvaluator}; // Keep commented or remove
+// use token_snipe::{TokenSnipeConfig, TokenSnipeEvaluator}; // Keep commented or remove
+
+// use listen_engine::Engine; // REMOVE THIS LINE
+
+use crate::config::Settings;
+use crate::error::{Result as SandoResult, SandoError};
 
 // Removed unused: pub use arbitrage::{ArbitrageConfig, ArbitrageEvaluator, ArbitrageMetadata};
 
@@ -15,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-use listen_engine::Engine;
 use crate::config; // Import config module to access config::RiskLevel
 use std::time::{SystemTime, UNIX_EPOCH};
 use chrono;
@@ -682,8 +686,6 @@ impl CircuitBreaker for StrategyBreaker {
 
 /// Main opportunity evaluator that coordinates different strategy evaluators
 pub struct OpportunityEvaluator {
-    /// The underlying listen-engine instance
-    engine: Arc<Engine>,
     /// Strategy registry
     strategy_registry: StrategyRegistry,
     /// Minimum confidence threshold for opportunities
@@ -708,42 +710,45 @@ pub trait StrategyExecutionService: Send + Sync {
 }
 
 impl OpportunityEvaluator {
-    /// Creates a new OpportunityEvaluator with default settings
+    /// Creates a new OpportunityEvaluator with default thresholds.
     pub async fn new() -> Result<Self> {
+        let thresholds = ExecutionThresholds::default();
         Self::new_with_thresholds(
-            50.0, // $50 minimum profit
-            RiskLevel::Medium,
-            0.01, // 1% profit threshold
-            ExecutionThresholds::default(),
+            thresholds.min_profit_threshold, 
+            thresholds.max_risk_level, 
+            0.05, // Default min_profit_percentage, adjust if needed
+            thresholds
         ).await
     }
 
-    /// Creates a new OpportunityEvaluator with specific thresholds
+    /// Creates a new OpportunityEvaluator with specified thresholds.
     pub async fn new_with_thresholds(
         min_profit_threshold: f64,
         max_risk_level: RiskLevel,
-        min_profit_percentage: f64,
+        _min_profit_percentage: f64, // Parameter might be unused now or repurposed
         execution_thresholds: ExecutionThresholds,
     ) -> Result<Self> {
-        // Create a strategy registry
-        let strategy_registry = StrategyRegistry::new();
-        
-        // Get Engine from environment
-        let (engine, _price_rx) = Engine::from_env().await
-            .map_err(|e| anyhow::anyhow!("Failed to create engine: {}", e))?;
-        
-        // Initialize evaluator
+        info!("Initializing OpportunityEvaluator...");
+
+        let registry = StrategyRegistry::new();
+        // Add registration logic here if needed later
+
+        // Removed engine initialization
+        // let (engine, _price_rx) = Engine::from_env().await
+        //     .map_err(|e| SandoError::DependencyError(format!("Failed to create listen-engine: {}", e)))?;
+
         let evaluator = Self {
-            engine: Arc::new(engine),
-            strategy_registry,
-            min_confidence: 0.7, // 70% confidence minimum
+            // engine: Arc::new(engine), // Removed engine field assignment
+            strategy_registry: registry,
+            min_confidence: execution_thresholds.min_confidence,
             max_risk_level,
             min_profit_threshold,
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
             execution_thresholds,
-            strategy_executor: RwLock::new(None),
+            strategy_executor: RwLock::new(None), // Initialize executor as None
         };
 
+        info!("OpportunityEvaluator initialized successfully.");
         Ok(evaluator)
     }
 
@@ -1096,6 +1101,13 @@ impl OpportunityEvaluator {
 
     /// Get current market conditions (to be implemented based on your data sources)
     async fn get_market_conditions(&self) -> Option<MarketConditions> {
+        // TODO: Refactor market condition fetching.
+        // This method relied on the removed `engine` field.
+        // Market data should likely be fetched elsewhere (e.g., ListenBot or dedicated service)
+        // and passed to the evaluator when needed (e.g., during scoring or decision making).
+        warn!("get_market_conditions is currently disabled due to refactoring. Returning None.");
+        None
+        /*
         // Get market data from the engine
         if let Ok(prices) = self.engine.get_prices().await {
             let mut volatility_index: f64 = 0.0;
@@ -1150,6 +1162,7 @@ impl OpportunityEvaluator {
         } else {
             None
         }
+        */
     }
 }
 
@@ -1424,14 +1437,14 @@ mod tests {
         let (engine_instance, _) = Engine::from_env().await
             .expect("Engine creation failed in test - check environment variables");
         OpportunityEvaluator {
-            engine: Arc::new(engine_instance),
+            // engine: Arc::new(engine_instance), // Removed engine field assignment
             strategy_registry: StrategyRegistry::new(),
             min_confidence: 0.7, // Default test confidence
             max_risk_level: RiskLevel::High, // Default test risk level
             min_profit_threshold: 50.0, // Default test profit threshold
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
             execution_thresholds: ExecutionThresholds::default(),
-            strategy_executor: RwLock::new(None),
+            strategy_executor: RwLock::new(None), // Initialize executor as None
         }
     }
 

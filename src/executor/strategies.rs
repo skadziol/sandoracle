@@ -1,5 +1,6 @@
 use crate::error::{Result, SandoError, StrategyErrorKind};
 use crate::evaluator::{MevOpportunity, MevStrategy, StrategyExecutionService};
+use crate::jupiter_client::Jupiter;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::instruction::Instruction;
@@ -10,7 +11,6 @@ use serde::{Serialize, Deserialize};
 use crate::executor::TransactionExecutor;
 use async_trait::async_trait;
 use anyhow;
-use listen_engine::jup::Jupiter;
 
 /// Represents an arbitrage step between tokens on a specific DEX
 #[derive(Debug, Clone)]
@@ -205,14 +205,10 @@ impl StrategyExecutor {
 
     /// Builds a transaction for arbitrage execution
     async fn build_arbitrage_transaction(&self, opportunity: &MevOpportunity) -> Result<Transaction> {
-        info!("Building arbitrage transaction");
+        info!("Building arbitrage transaction using Jupiter");
         
-        // Parse opportunity metadata
         let metadata: ArbitrageMetadata = serde_json::from_value(opportunity.metadata.clone())?;
         
-        // --- Use Jupiter API for Arbitrage ---
-        // For simplicity, we'll execute the first step of the arbitrage path using Jupiter.
-        // A full implementation might chain multiple Jupiter swaps or use more complex routing.
         if metadata.token_path.len() < 2 {
             return Err(SandoError::Strategy {
                 kind: StrategyErrorKind::InvalidParameters,
@@ -222,9 +218,8 @@ impl StrategyExecutor {
 
         let input_token = &metadata.token_path[0];
         let output_token = &metadata.token_path[1];
-        // Estimate amount based on opportunity data - Needs refinement based on actual opportunity structure
-        // Placeholder: use estimated profit or a fixed amount
-        let amount_in = opportunity.estimated_profit.max(1_000_000.0) as u64; // Example: Use 1 token unit or estimated profit
+        // TODO: Refine amount calculation - needs token decimals
+        let amount_in = (metadata.prices[0].max(1.0) * 1_000_000.0) as u64; // Placeholder amount
 
         info!(input = %input_token, output = %output_token, amount = amount_in, "Fetching Jupiter quote for arbitrage step 1");
 
@@ -242,19 +237,14 @@ impl StrategyExecutor {
                 message: format!("Failed to get Jupiter swap transaction: {}", e),
             })?;
 
-        // Convert VersionedTransaction to legacy Transaction if needed, or handle appropriately
-        // For now, assume we can extract the message or instructions if TransactionExecutor expects legacy
-         match versioned_tx {
-            solana_sdk::transaction::VersionedTransaction { message, signatures } => {
-                 // Attempt to create a legacy transaction from the versioned message
+        match versioned_tx {
+            solana_sdk::transaction::VersionedTransaction { message, .. } => {
                  if let solana_sdk::message::VersionedMessage::Legacy(msg) = message {
                      Ok(Transaction::new_unsigned(msg))
                  } else {
-                     // Handle non-legacy transactions - maybe TransactionExecutor needs updating?
-                     // For now, return an error indicating incompatibility
                      Err(SandoError::Strategy {
                          kind: StrategyErrorKind::UnsupportedTransactionVersion,
-                         message: "Jupiter API returned a non-legacy transaction version, which is not currently supported by TransactionExecutor.".to_string(),
+                         message: "Jupiter API returned a non-legacy transaction version.".to_string(),
                      })
                  }
             }
@@ -263,15 +253,13 @@ impl StrategyExecutor {
 
     /// Builds transactions for sandwich attack execution
     async fn build_sandwich_transaction(&self, opportunity: &MevOpportunity) -> Result<Transaction> {
-        info!("Building sandwich transaction (front-run only)");
+        info!("Building sandwich transaction (front-run only) using Jupiter");
         
-        // Parse opportunity metadata
         let metadata: SandwichMetadata = serde_json::from_value(opportunity.metadata.clone())?;
 
-        // --- Use Jupiter API for Sandwich Front-Run ---
         let (input_token, output_token) = metadata.token_pair;
-        // Convert UI amount from metadata to raw amount (assuming 6 decimals for simplicity)
-        let amount_in = (metadata.front_run_amount * 1_000_000.0) as u64; // TODO: Use actual decimals
+        // TODO: Use actual token decimals
+        let amount_in = (metadata.front_run_amount * 1_000_000.0) as u64; // Placeholder amount
 
         info!(input = %input_token, output = %output_token, amount = amount_in, "Fetching Jupiter quote for sandwich front-run");
 
@@ -289,15 +277,14 @@ impl StrategyExecutor {
                 message: format!("Failed to get Jupiter swap transaction for front-run: {}", e),
             })?;
 
-        // Convert VersionedTransaction to legacy Transaction
          match versioned_tx {
-            solana_sdk::transaction::VersionedTransaction { message, signatures } => {
+            solana_sdk::transaction::VersionedTransaction { message, .. } => {
                  if let solana_sdk::message::VersionedMessage::Legacy(msg) = message {
                      Ok(Transaction::new_unsigned(msg))
                  } else {
                      Err(SandoError::Strategy {
                          kind: StrategyErrorKind::UnsupportedTransactionVersion,
-                         message: "Jupiter API returned a non-legacy transaction version for sandwich front-run.".to_string(),
+                         message: "Jupiter API returned a non-legacy transaction version for sandwich.".to_string(),
                      })
                  }
             }
@@ -306,18 +293,15 @@ impl StrategyExecutor {
 
     /// Builds a transaction for token snipe execution
     async fn build_token_snipe_transaction(&self, opportunity: &MevOpportunity) -> Result<Transaction> {
-        info!("Building token snipe transaction");
+        info!("Building token snipe transaction using Jupiter");
 
-        // Parse opportunity metadata
         let metadata: TokenSnipeMetadata = serde_json::from_value(opportunity.metadata.clone())?;
 
-        // --- Use Jupiter API for Token Snipe ---
-        // Assume input is usually SOL or USDC, output is the target token
         // TODO: Determine input token dynamically (e.g., from config or wallet balance)
         let input_token = "So11111111111111111111111111111111111111112"; // Example: SOL
         let output_token = &metadata.token_address;
-        // Convert UI amount from metadata to raw amount (assuming 9 decimals for SOL)
-        let amount_in = (metadata.volume.min(1.0) * 1_000_000_000.0) as u64; // Example: Spend 1 SOL or less
+        // TODO: Use actual token decimals (SOL=9)
+        let amount_in = (metadata.volume.min(1.0) * 1_000_000_000.0) as u64; // Example: Spend 1 SOL
 
         info!(input = %input_token, output = %output_token, amount = amount_in, "Fetching Jupiter quote for token snipe");
 
@@ -335,15 +319,14 @@ impl StrategyExecutor {
                 message: format!("Failed to get Jupiter swap transaction for snipe: {}", e),
             })?;
 
-        // Convert VersionedTransaction to legacy Transaction
-         match versioned_tx {
-            solana_sdk::transaction::VersionedTransaction { message, signatures } => {
+        match versioned_tx {
+            solana_sdk::transaction::VersionedTransaction { message, .. } => {
                  if let solana_sdk::message::VersionedMessage::Legacy(msg) = message {
                      Ok(Transaction::new_unsigned(msg))
                  } else {
                      Err(SandoError::Strategy {
                          kind: StrategyErrorKind::UnsupportedTransactionVersion,
-                         message: "Jupiter API returned a non-legacy transaction version for token snipe.".to_string(),
+                         message: "Jupiter API returned a non-legacy transaction version for snipe.".to_string(),
                      })
                  }
             }

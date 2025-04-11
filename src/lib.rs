@@ -6,6 +6,7 @@ pub mod executor;
 pub mod rig_agent;
 pub mod monitoring;
 pub mod market_data;
+pub mod jupiter_client;
 
 // Private modules
 mod listen_bot;
