@@ -221,27 +221,51 @@ impl ListenBot {
                             "Found potential MEV opportunities"
                         );
                         
-                        // Log details about each opportunity
-                        for (idx, opportunity) in opportunities.iter().enumerate() {
+                        // Process each opportunity
+                        for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
                             info!(
                                 idx = idx,
                                 strategy = ?opportunity.strategy,
                                 profit = opportunity.estimated_profit,
                                 confidence = opportunity.confidence,
                                 risk = ?opportunity.risk_level,
-                                decision = ?opportunity.decision,
-                                "MEV opportunity details"
+                                "Processing MEV opportunity"
                             );
                             
-                            // Monitor active opportunities
-                            if let Some(decision) = opportunity.decision {
-                                if decision == crate::evaluator::ExecutionDecision::Execute || 
-                                   decision == crate::evaluator::ExecutionDecision::Hold {
-                                    // Clone for monitoring
-                                    let opp_clone = opportunity.clone();
-                                    if let Err(e) = evaluator.monitor_opportunity(opp_clone).await {
-                                        error!(error = %e, "Failed to monitor opportunity");
+                            // Try to execute the opportunity
+                            match evaluator.process_mev_opportunity(&mut opportunity).await {
+                                Ok(Some(signature)) => {
+                                    info!(
+                                        idx = idx,
+                                        strategy = ?opportunity.strategy,
+                                        signature = %signature,
+                                        "Successfully executed MEV opportunity"
+                                    );
+                                },
+                                Ok(None) => {
+                                    info!(
+                                        idx = idx,
+                                        strategy = ?opportunity.strategy,
+                                        decision = ?opportunity.decision,
+                                        "Decided not to execute MEV opportunity"
+                                    );
+                                    
+                                    // Monitor the opportunity for later if it's on hold
+                                    if let Some(decision) = opportunity.decision {
+                                        if decision == crate::evaluator::ExecutionDecision::Hold {
+                                            if let Err(e) = evaluator.monitor_opportunity(opportunity).await {
+                                                error!(error = %e, "Failed to monitor opportunity");
+                                            }
+                                        }
                                     }
+                                },
+                                Err(e) => {
+                                    error!(
+                                        idx = idx,
+                                        error = %e,
+                                        strategy = ?opportunity.strategy,
+                                        "Failed to process MEV opportunity"
+                                    );
                                 }
                             }
                         }

@@ -21,6 +21,12 @@ use solana_sdk::account::Account;
 use spl_token::state::Account as TokenAccount;
 use spl_associated_token_account::solana_program::program_pack::Pack;
 
+// Export the strategies module
+pub mod strategies;
+
+// Re-export the strategy types used by this module
+pub use self::strategies::{ArbitragePath, ArbitrageStep};
+
 /// Represents the result of a transaction simulation
 #[derive(Debug, Clone)]
 pub struct SimulationResult {
@@ -99,25 +105,6 @@ impl std::fmt::Debug for TransactionExecutor {
     }
 }
 
-// --- Structs for Arbitrage Strategy ---
-
-/// Represents a single step in an arbitrage path
-#[derive(Debug, Clone)] // Add derives as needed
-pub struct ArbitrageStep {
-    pub dex_program_id: Pubkey,
-    pub input_token_mint: Pubkey,
-    pub output_token_mint: Pubkey,
-    pub input_amount: u64,
-    pub min_output_amount: u64, // For slippage control
-    // Add any other DEX-specific parameters (e.g., pool addresses)
-}
-
-/// Represents a full arbitrage path
-#[derive(Debug, Clone)]
-pub struct ArbitragePath {
-    pub steps: Vec<ArbitrageStep>,
-}
-
 impl TransactionExecutor {
     /// Creates a new TransactionExecutor
     pub fn new(
@@ -157,8 +144,8 @@ impl TransactionExecutor {
             .map_err(|e| SandoError::SolanaRpc(format!("Failed to get wallet balance: {}", e)))
     }
 
-    /// Gets the associated token account address - static method using token program's functions
-    fn get_associated_token_address(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    /// Gets the associated token account address
+    pub fn get_associated_token_address(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
         // Use a more compatible approach to get the associated token address
         let owner_key = owner.to_string();
         let mint_key = mint.to_string();
@@ -882,7 +869,7 @@ impl TransactionExecutor {
         }
     }
 
-    /// Builds an unsigned transaction for a given arbitrage path
+    /// Builds an arbitrage transaction
     pub fn build_arbitrage_transaction(
         &self,
         arbitrage_path: &ArbitragePath,

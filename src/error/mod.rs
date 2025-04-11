@@ -77,6 +77,9 @@ pub enum StrategyErrorKind {
     InsufficientLiquidity,
     PriceImpactTooHigh,
     OpportunityExpired,
+    SimulationFailed,
+    Unprofitable,
+    SafetyCheckFailed,
     Other,
 }
 
@@ -165,6 +168,9 @@ impl fmt::Display for StrategyErrorKind {
             Self::InsufficientLiquidity => write!(f, "Insufficient liquidity"),
             Self::PriceImpactTooHigh => write!(f, "Price impact too high"),
             Self::OpportunityExpired => write!(f, "Opportunity expired"),
+            Self::SimulationFailed => write!(f, "Simulation failed"),
+            Self::Unprofitable => write!(f, "Unprofitable"),
+            Self::SafetyCheckFailed => write!(f, "Safety check failed"),
             Self::Other => write!(f, "Other strategy error"),
         }
     }

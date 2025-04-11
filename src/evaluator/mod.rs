@@ -19,6 +19,7 @@ use listen_engine::Engine;
 use crate::config; // Import config module to access config::RiskLevel
 use std::time::{SystemTime, UNIX_EPOCH};
 use chrono;
+use anyhow;
 
 /// Represents different types of MEV strategies
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -695,62 +696,131 @@ pub struct OpportunityEvaluator {
     active_opportunities: Arc<RwLock<Vec<MevOpportunity>>>,
     /// Execution thresholds configuration
     execution_thresholds: ExecutionThresholds,
+    /// Strategy executor
+    strategy_executor: RwLock<Option<Arc<dyn StrategyExecutionService>>>,
+}
+
+/// This trait defines the interface for strategy execution services
+#[async_trait::async_trait]
+pub trait StrategyExecutionService: Send + Sync {
+    /// Executes an MEV opportunity
+    async fn execute_opportunity(&self, opportunity: &MevOpportunity) -> anyhow::Result<solana_sdk::signature::Signature>;
 }
 
 impl OpportunityEvaluator {
-    /// Creates a new OpportunityEvaluator
-    pub async fn new(
-        min_confidence: f64,
-        max_risk_level: RiskLevel,
-        min_profit_threshold: f64,
-    ) -> Result<Self> {
-        info!(
-            min_confidence = min_confidence,
-            risk_level = ?max_risk_level,
-            min_profit = min_profit_threshold,
-            "Creating new OpportunityEvaluator"
-        );
+    /// Creates a new OpportunityEvaluator with default settings
+    pub async fn new() -> Result<Self> {
+        Self::new_with_thresholds(
+            50.0, // $50 minimum profit
+            RiskLevel::Medium,
+            0.01, // 1% profit threshold
+            ExecutionThresholds::default(),
+        ).await
+    }
 
-        let (engine_instance, _) = Engine::from_env().await?;
-        let mut evaluator = Self {
-            engine: Arc::new(engine_instance),
-            strategy_registry: StrategyRegistry::new(),
-            min_confidence,
+    /// Creates a new OpportunityEvaluator with specific thresholds
+    pub async fn new_with_thresholds(
+        min_profit_threshold: f64,
+        max_risk_level: RiskLevel,
+        min_profit_percentage: f64,
+        execution_thresholds: ExecutionThresholds,
+    ) -> Result<Self> {
+        // Create a strategy registry
+        let strategy_registry = StrategyRegistry::new();
+        
+        // Get Engine from environment
+        let (engine, _price_rx) = Engine::from_env().await
+            .map_err(|e| anyhow::anyhow!("Failed to create engine: {}", e))?;
+        
+        // Initialize evaluator
+        let evaluator = Self {
+            engine: Arc::new(engine),
+            strategy_registry,
+            min_confidence: 0.7, // 70% confidence minimum
             max_risk_level,
             min_profit_threshold,
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
-            execution_thresholds: ExecutionThresholds::default(),
+            execution_thresholds,
+            strategy_executor: RwLock::new(None),
         };
 
-        // Register default evaluators
-        evaluator.register_evaluator(Box::new(ArbitrageEvaluator::new(ArbitrageConfig::default())));
-        evaluator.register_evaluator(Box::new(SandwichEvaluator::new(SandwichConfig::default())));
-        evaluator.register_evaluator(Box::new(TokenSnipeEvaluator::new(TokenSnipeConfig::default())));
-
         Ok(evaluator)
+    }
+
+    /// Sets the strategy executor
+    pub fn set_strategy_executor<T: StrategyExecutionService + 'static>(&mut self, executor: Arc<T>) {
+        let mut strategy_executor = self.strategy_executor.blocking_write();
+        *strategy_executor = Some(executor);
+    }
+
+    /// Executes an MEV opportunity
+    pub async fn execute_opportunity(&self, opportunity: &MevOpportunity) -> Result<solana_sdk::signature::Signature> {
+        // Check if we have a strategy executor
+        let strategy_executor = self.strategy_executor.read().await;
+        
+        if let Some(executor) = strategy_executor.as_ref() {
+            // Execute the opportunity
+            executor.execute_opportunity(opportunity).await
+                .map_err(|e| anyhow::anyhow!("{}", e).into()) // Convert anyhow::Error to SandoError
+        } else {
+            Err(anyhow::anyhow!("No strategy executor available").into())
+        }
+    }
+
+    /// Processes a detected MEV opportunity, evaluating and potentially executing it
+    pub async fn process_mev_opportunity(&self, opportunity: &mut MevOpportunity) -> Result<Option<solana_sdk::signature::Signature>> {
+        // First, calculate the opportunity score if not already done
+        if opportunity.score.is_none() {
+            let score = self.calculate_opportunity_score(opportunity).await;
+            opportunity.score = Some(score);
+        }
+        
+        // Then, make execution decision if not already done
+        if opportunity.decision.is_none() {
+            let decision = self.make_execution_decision(opportunity).await;
+            opportunity.decision = Some(decision);
+        }
+        
+        // Check if we should execute this opportunity
+        if self.should_execute(opportunity).await {
+            info!(
+                strategy = ?opportunity.strategy,
+                estimated_profit = opportunity.estimated_profit,
+                confidence = opportunity.confidence,
+                score = opportunity.score.unwrap_or(0.0),
+                "Executing MEV opportunity"
+            );
+            
+            // Execute the opportunity
+            match self.execute_opportunity(opportunity).await {
+                Ok(signature) => {
+                    info!(
+                        signature = %signature,
+                        "Successfully executed MEV opportunity"
+                    );
+                    Ok(Some(signature))
+                },
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "Failed to execute MEV opportunity"
+                    );
+                    Err(e)
+                }
+            }
+        } else {
+            info!(
+                strategy = ?opportunity.strategy,
+                decision = ?opportunity.decision,
+                "Decided not to execute MEV opportunity"
+            );
+            Ok(None)
+        }
     }
 
     /// Gets the minimum confidence threshold.
     pub fn min_confidence(&self) -> f64 {
         self.min_confidence
-    }
-
-    /// Creates a new OpportunityEvaluator with custom execution thresholds
-    pub async fn new_with_thresholds(
-        min_confidence: f64,
-        max_risk_level: RiskLevel,
-        min_profit_threshold: f64,
-        execution_thresholds: ExecutionThresholds,
-    ) -> Result<Self> {
-        // `new` now handles engine creation correctly
-        let mut evaluator = Self::new(
-            min_confidence,
-            max_risk_level,
-            min_profit_threshold,
-        ).await?;
-        
-        evaluator.execution_thresholds = execution_thresholds;
-        Ok(evaluator)
     }
 
     /// Updates the execution thresholds configuration
@@ -1361,6 +1431,7 @@ mod tests {
             min_profit_threshold: 50.0, // Default test profit threshold
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
             execution_thresholds: ExecutionThresholds::default(),
+            strategy_executor: RwLock::new(None),
         }
     }
 

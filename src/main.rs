@@ -5,12 +5,14 @@ mod listen_bot;
 mod rig_agent;
 mod monitoring;
 mod executor;
+mod market_data;
 
 use crate::config::Settings;
 use crate::error::{Result as SandoResult, SandoError};
 use crate::monitoring::init_logging;
 use crate::listen_bot::{ListenBot, ListenBotCommand};
 use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds, RiskLevel};
+use crate::executor::{TransactionExecutor, strategies::StrategyExecutor};
 use tracing::{info, error};
 use dotenv::dotenv;
 use tokio::signal;
@@ -44,9 +46,25 @@ async fn main() -> SandoResult<()> {
     // Initialize components
     info!("Initializing components...");
     
+    // Initialize Transaction Executor
+    info!("Initializing TransactionExecutor...");
+    let transaction_executor = TransactionExecutor::new(
+        &settings.solana_rpc_url,
+        &settings.wallet_private_key,
+        settings.simulation_mode,
+    )
+    .map_err(|e| SandoError::DependencyError(format!("Failed to create TransactionExecutor: {}", e)))?;
+    
+    // Initialize Strategy Executor
+    info!("Initializing StrategyExecutor...");
+    let strategy_executor = StrategyExecutor::new(transaction_executor.clone());
+    
+    // Wrap the strategy executor in an Arc for safe sharing between threads
+    let strategy_executor_arc = Arc::new(strategy_executor);
+    
     // Initialize the OpportunityEvaluator
     info!("Initializing OpportunityEvaluator...");
-    let evaluator = OpportunityEvaluator::new_with_thresholds(
+    let mut evaluator = OpportunityEvaluator::new_with_thresholds(
         settings.min_profit_threshold,  // Use settings for minimum profit threshold
         settings.risk_level,            // Use settings for risk level
         settings.min_profit_threshold,  // Duplicate setting as a fallback
@@ -54,6 +72,9 @@ async fn main() -> SandoResult<()> {
     )
     .await
     .map_err(|e| SandoError::DependencyError(format!("Failed to create OpportunityEvaluator: {}", e)))?;
+    
+    // Set the strategy executor on the evaluator
+    evaluator.set_strategy_executor(strategy_executor_arc.clone());
 
     // Wrap the evaluator in an Arc for safe sharing between threads
     let evaluator_arc = Arc::new(evaluator);
@@ -69,10 +90,10 @@ async fn main() -> SandoResult<()> {
         min_confidence = evaluator_arc.min_confidence(),
         risk_level = ?settings.risk_level,
         min_profit = settings.min_profit_threshold,
-        "OpportunityEvaluator initialized and connected to ListenBot"
+        wallet_pubkey = %transaction_executor.signer_pubkey(),
+        simulation_mode = settings.simulation_mode,
+        "All components initialized successfully"
     );
-
-    info!("Components initialized successfully");
 
     // Start the ListenBot in its own task
     let listen_bot_handle = tokio::spawn(async move {
@@ -97,9 +118,6 @@ async fn main() -> SandoResult<()> {
     if let Err(e) = listen_bot_handle.await {
         error!(error = ?e, "ListenBot task failed or panicked");
     }
-
-    // }.instrument(main_span).await;
-    // Span guard _main_span_guard drops here
 
     info!("SandoSeer shutting down...");
     // The logging _guard will be dropped here, flushing file logs
