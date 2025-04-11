@@ -10,6 +10,7 @@ use serde::{Serialize, Deserialize};
 use crate::executor::TransactionExecutor;
 use async_trait::async_trait;
 use anyhow;
+use listen_engine::jup::Jupiter;
 
 /// Represents an arbitrage step between tokens on a specific DEX
 #[derive(Debug, Clone)]
@@ -209,199 +210,150 @@ impl StrategyExecutor {
         // Parse opportunity metadata
         let metadata: ArbitrageMetadata = serde_json::from_value(opportunity.metadata.clone())?;
         
-        // Ensure we have enough tokens in metadata
+        // --- Use Jupiter API for Arbitrage ---
+        // For simplicity, we'll execute the first step of the arbitrage path using Jupiter.
+        // A full implementation might chain multiple Jupiter swaps or use more complex routing.
         if metadata.token_path.len() < 2 {
             return Err(SandoError::Strategy {
                 kind: StrategyErrorKind::InvalidParameters,
                 message: "Arbitrage path must contain at least 2 tokens".to_string(),
             });
         }
+
+        let input_token = &metadata.token_path[0];
+        let output_token = &metadata.token_path[1];
+        // Estimate amount based on opportunity data - Needs refinement based on actual opportunity structure
+        // Placeholder: use estimated profit or a fixed amount
+        let amount_in = opportunity.estimated_profit.max(1_000_000.0) as u64; // Example: Use 1 token unit or estimated profit
+
+        info!(input = %input_token, output = %output_token, amount = amount_in, "Fetching Jupiter quote for arbitrage step 1");
+
+        let quote_response = Jupiter::fetch_quote(input_token, output_token, amount_in).await
+            .map_err(|e| SandoError::Strategy {
+                kind: StrategyErrorKind::ApiError,
+                message: format!("Failed to fetch Jupiter quote: {}", e),
+            })?;
         
-        // Build arbitrage path with steps
-        let mut steps = Vec::new();
-        for i in 0..(metadata.token_path.len() - 1) {
-            let input_token = &metadata.token_path[i];
-            let output_token = &metadata.token_path[i + 1];
-            let dex = &metadata.dexes[i];
-            
-            // Convert amount to raw token amount (assuming 6 decimals for simplicity)
-            // In a real implementation, we'd use the token's actual decimal places
-            let input_amount = (metadata.prices[i] * 1_000_000.0) as u64;
-            let min_output_amount = ((metadata.prices[i+1] * 0.98) * 1_000_000.0) as u64; // 2% slippage
-            
-            let step = ArbitrageStep {
-                dex_program_id: Pubkey::from_str(dex)
-                    .map_err(|_| SandoError::Strategy {
-                        kind: StrategyErrorKind::InvalidParameters,
-                        message: format!("Invalid DEX program ID: {}", dex),
-                    })?,
-                input_token_mint: Pubkey::from_str(input_token)
-                    .map_err(|_| SandoError::Strategy {
-                        kind: StrategyErrorKind::InvalidParameters,
-                        message: format!("Invalid input token mint: {}", input_token),
-                    })?,
-                output_token_mint: Pubkey::from_str(output_token)
-                    .map_err(|_| SandoError::Strategy {
-                        kind: StrategyErrorKind::InvalidParameters,
-                        message: format!("Invalid output token mint: {}", output_token),
-                    })?,
-                input_amount,
-                min_output_amount,
-                pool_address: None, // Would be determined based on DEX
-                additional_accounts: Vec::new(), // Would be determined based on DEX
-            };
-            
-            steps.push(step);
+        info!(quote = ?quote_response, "Received Jupiter quote");
+
+        let versioned_tx = Jupiter::swap(quote_response, &self.executor.signer_pubkey()).await
+             .map_err(|e| SandoError::Strategy {
+                kind: StrategyErrorKind::ApiError,
+                message: format!("Failed to get Jupiter swap transaction: {}", e),
+            })?;
+
+        // Convert VersionedTransaction to legacy Transaction if needed, or handle appropriately
+        // For now, assume we can extract the message or instructions if TransactionExecutor expects legacy
+         match versioned_tx {
+            solana_sdk::transaction::VersionedTransaction { message, signatures } => {
+                 // Attempt to create a legacy transaction from the versioned message
+                 if let solana_sdk::message::VersionedMessage::Legacy(msg) = message {
+                     Ok(Transaction::new_unsigned(msg))
+                 } else {
+                     // Handle non-legacy transactions - maybe TransactionExecutor needs updating?
+                     // For now, return an error indicating incompatibility
+                     Err(SandoError::Strategy {
+                         kind: StrategyErrorKind::UnsupportedTransactionVersion,
+                         message: "Jupiter API returned a non-legacy transaction version, which is not currently supported by TransactionExecutor.".to_string(),
+                     })
+                 }
+            }
         }
-        
-        let arbitrage_path = ArbitragePath { steps };
-        
-        // Use the executor's build_arbitrage_transaction method
-        // Make sure the transaction is properly built with the correct inputs
-        let mut instructions = Vec::new();
-        let user_pubkey = self.executor.signer_pubkey();
-        
-        // For each step in the arbitrage path, add swap instructions
-        for step in &arbitrage_path.steps {
-            // Get user's token accounts for input and output tokens
-            let _input_token_account = self.executor.get_associated_token_address(&user_pubkey, &step.input_token_mint);
-            let _output_token_account = self.executor.get_associated_token_address(&user_pubkey, &step.output_token_mint);
-            
-            // Here would be DEX-specific instruction building logic
-            // This is just a placeholder
-            let dummy_ix = solana_sdk::system_instruction::transfer(
-                &user_pubkey,
-                &Pubkey::new_unique(),
-                1, // 1 lamport
-            );
-            
-            instructions.push(dummy_ix);
-        }
-        
-        // Assemble transaction
-        let message = Message::new(&instructions, Some(&user_pubkey));
-        let transaction = Transaction::new_unsigned(message);
-        
-        Ok(transaction)
     }
 
     /// Builds transactions for sandwich attack execution
     async fn build_sandwich_transaction(&self, opportunity: &MevOpportunity) -> Result<Transaction> {
-        info!("Building sandwich transaction");
+        info!("Building sandwich transaction (front-run only)");
         
         // Parse opportunity metadata
         let metadata: SandwichMetadata = serde_json::from_value(opportunity.metadata.clone())?;
-        
-        // Create sandwich attack details
-        let sandwich = SandwichAttack {
-            dex_program_id: Pubkey::from_str(&metadata.dex)
-                .map_err(|_| SandoError::Strategy {
-                    kind: StrategyErrorKind::InvalidParameters,
-                    message: format!("Invalid DEX program ID: {}", metadata.dex),
-                })?,
-            pool_address: Pubkey::new_unique(), // Would be determined based on token pair and DEX
-            input_token_mint: Pubkey::from_str(&metadata.token_pair.0)
-                .map_err(|_| SandoError::Strategy {
-                    kind: StrategyErrorKind::InvalidParameters,
-                    message: format!("Invalid input token mint: {}", metadata.token_pair.0),
-                })?,
-            output_token_mint: Pubkey::from_str(&metadata.token_pair.1)
-                .map_err(|_| SandoError::Strategy {
-                    kind: StrategyErrorKind::InvalidParameters,
-                    message: format!("Invalid output token mint: {}", metadata.token_pair.1),
-                })?,
-            front_run_amount: (metadata.front_run_amount * 1_000_000.0) as u64, // Convert to raw amount
-            back_run_amount: (metadata.back_run_amount * 1_000_000.0) as u64, // Convert to raw amount
-            target_tx_hash: metadata.target_tx_hash,
-            min_front_run_out: ((metadata.front_run_amount * 0.95) * 1_000_000.0) as u64, // 5% slippage
-            min_back_run_out: ((metadata.back_run_amount * 0.95) * 1_000_000.0) as u64, // 5% slippage
-        };
-        
-        // For now, implement a basic sandwich as a single transaction
-        // In a real implementation, this would be split into front-run and back-run transactions
-        // with timing logic to execute around the target transaction
-        
-        let mut instructions = Vec::new();
-        
-        // Get user's token account for input token
-        let user_pubkey = self.executor.signer_pubkey();
-        let _input_token_account = self.executor.get_associated_token_address(&user_pubkey, &sandwich.input_token_mint);
-        let _output_token_account = self.executor.get_associated_token_address(&user_pubkey, &sandwich.output_token_mint);
-        
-        // Implement DEX-specific swap instructions
-        // For Orca/Raydium/etc. would need specific instruction builders
-        // This is a placeholder
-        
-        warn!("Using placeholder instruction for sandwich attack");
-        
-        // Create a dummy swap instruction (in real code, would use the actual DEX swap instruction)
-        let dummy_ix = solana_sdk::system_instruction::transfer(
-            &user_pubkey,
-            &Pubkey::new_unique(),
-            1, // 1 lamport
-        );
-        
-        instructions.push(dummy_ix);
-        
-        // Assemble transaction
-        let message = Message::new(&instructions, Some(&user_pubkey));
-        let transaction = Transaction::new_unsigned(message);
-        
-        Ok(transaction)
+
+        // --- Use Jupiter API for Sandwich Front-Run ---
+        let (input_token, output_token) = metadata.token_pair;
+        // Convert UI amount from metadata to raw amount (assuming 6 decimals for simplicity)
+        let amount_in = (metadata.front_run_amount * 1_000_000.0) as u64; // TODO: Use actual decimals
+
+        info!(input = %input_token, output = %output_token, amount = amount_in, "Fetching Jupiter quote for sandwich front-run");
+
+        let quote_response = Jupiter::fetch_quote(&input_token, &output_token, amount_in).await
+            .map_err(|e| SandoError::Strategy {
+                kind: StrategyErrorKind::ApiError,
+                message: format!("Failed to fetch Jupiter quote for front-run: {}", e),
+            })?;
+
+        info!(quote = ?quote_response, "Received Jupiter quote for front-run");
+
+        let versioned_tx = Jupiter::swap(quote_response, &self.executor.signer_pubkey()).await
+            .map_err(|e| SandoError::Strategy {
+                kind: StrategyErrorKind::ApiError,
+                message: format!("Failed to get Jupiter swap transaction for front-run: {}", e),
+            })?;
+
+        // Convert VersionedTransaction to legacy Transaction
+         match versioned_tx {
+            solana_sdk::transaction::VersionedTransaction { message, signatures } => {
+                 if let solana_sdk::message::VersionedMessage::Legacy(msg) = message {
+                     Ok(Transaction::new_unsigned(msg))
+                 } else {
+                     Err(SandoError::Strategy {
+                         kind: StrategyErrorKind::UnsupportedTransactionVersion,
+                         message: "Jupiter API returned a non-legacy transaction version for sandwich front-run.".to_string(),
+                     })
+                 }
+            }
+        }
     }
 
     /// Builds a transaction for token snipe execution
     async fn build_token_snipe_transaction(&self, opportunity: &MevOpportunity) -> Result<Transaction> {
         info!("Building token snipe transaction");
-        
+
         // Parse opportunity metadata
         let metadata: TokenSnipeMetadata = serde_json::from_value(opportunity.metadata.clone())?;
-        
-        // Create token snipe details
-        let snipe = TokenSnipe {
-            dex_program_id: Pubkey::from_str(&metadata.dex)
-                .map_err(|_| SandoError::Strategy {
-                    kind: StrategyErrorKind::InvalidParameters,
-                    message: format!("Invalid DEX program ID: {}", metadata.dex),
-                })?,
-            pool_address: Pubkey::new_unique(), // Would be determined based on token and DEX
-            input_token_mint: Pubkey::new_unique(), // Usually a stablecoin, would come from metadata
-            output_token_mint: Pubkey::from_str(&metadata.token_address)
-                .map_err(|_| SandoError::Strategy {
-                    kind: StrategyErrorKind::InvalidParameters,
-                    message: format!("Invalid token address: {}", metadata.token_address),
-                })?,
-            input_amount: (metadata.liquidity * 0.01) as u64, // 1% of liquidity as example
-            min_output_amount: 1, // Minimum amount, should be calculated based on expected price
-        };
-        
-        let mut instructions = Vec::new();
-        
-        // Get user's token account for input token
-        let user_pubkey = self.executor.signer_pubkey();
-        let _input_token_account = self.executor.get_associated_token_address(&user_pubkey, &snipe.input_token_mint);
-        let _output_token_account = self.executor.get_associated_token_address(&user_pubkey, &snipe.output_token_mint);
-        
-        // Implement DEX-specific swap instructions
-        // For Orca/Raydium/etc. would need specific instruction builders
-        // This is a placeholder
-        
-        warn!("Using placeholder instruction for token snipe");
-        
-        // Create a dummy swap instruction (in real code, would use the actual DEX swap instruction)
-        let dummy_ix = solana_sdk::system_instruction::transfer(
-            &user_pubkey,
-            &Pubkey::new_unique(),
-            1, // 1 lamport
-        );
-        
-        instructions.push(dummy_ix);
-        
-        // Assemble transaction
-        let message = Message::new(&instructions, Some(&user_pubkey));
-        let transaction = Transaction::new_unsigned(message);
-        
-        Ok(transaction)
+
+        // --- Use Jupiter API for Token Snipe ---
+        // Assume input is usually SOL or USDC, output is the target token
+        // TODO: Determine input token dynamically (e.g., from config or wallet balance)
+        let input_token = "So11111111111111111111111111111111111111112"; // Example: SOL
+        let output_token = &metadata.token_address;
+        // Convert UI amount from metadata to raw amount (assuming 9 decimals for SOL)
+        let amount_in = (metadata.volume.min(1.0) * 1_000_000_000.0) as u64; // Example: Spend 1 SOL or less
+
+        info!(input = %input_token, output = %output_token, amount = amount_in, "Fetching Jupiter quote for token snipe");
+
+        let quote_response = Jupiter::fetch_quote(input_token, output_token, amount_in).await
+            .map_err(|e| SandoError::Strategy {
+                kind: StrategyErrorKind::ApiError,
+                message: format!("Failed to fetch Jupiter quote for snipe: {}", e),
+            })?;
+
+        info!(quote = ?quote_response, "Received Jupiter quote for snipe");
+
+        let versioned_tx = Jupiter::swap(quote_response, &self.executor.signer_pubkey()).await
+            .map_err(|e| SandoError::Strategy {
+                kind: StrategyErrorKind::ApiError,
+                message: format!("Failed to get Jupiter swap transaction for snipe: {}", e),
+            })?;
+
+        // Convert VersionedTransaction to legacy Transaction
+         match versioned_tx {
+            solana_sdk::transaction::VersionedTransaction { message, signatures } => {
+                 if let solana_sdk::message::VersionedMessage::Legacy(msg) = message {
+                     Ok(Transaction::new_unsigned(msg))
+                 } else {
+                     Err(SandoError::Strategy {
+                         kind: StrategyErrorKind::UnsupportedTransactionVersion,
+                         message: "Jupiter API returned a non-legacy transaction version for token snipe.".to_string(),
+                     })
+                 }
+            }
+        }
+    }
+
+    /// Returns the underlying transaction executor for testing
+    #[cfg(test)]
+    pub fn get_executor(&self) -> &TransactionExecutor {
+        &self.executor
     }
 }
 

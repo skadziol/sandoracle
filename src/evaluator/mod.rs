@@ -748,8 +748,8 @@ impl OpportunityEvaluator {
     }
 
     /// Sets the strategy executor
-    pub fn set_strategy_executor<T: StrategyExecutionService + 'static>(&mut self, executor: Arc<T>) {
-        let mut strategy_executor = self.strategy_executor.blocking_write();
+    pub async fn set_strategy_executor<T: StrategyExecutionService + 'static>(&mut self, executor: Arc<T>) {
+        let mut strategy_executor = self.strategy_executor.write().await;
         *strategy_executor = Some(executor);
     }
 

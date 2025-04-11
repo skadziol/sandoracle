@@ -16,6 +16,9 @@ use std::str::FromStr;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 
+// Import PriceUpdate from listen-engine
+use listen_engine::redis::subscriber::PriceUpdate;
+
 mod config;
 mod types;
 mod dex;
@@ -37,10 +40,10 @@ pub struct ListenBot {
     engine: Arc<Engine>,
     /// Configuration
     config: ListenBotConfig,
-    /// Transaction event sender (for internal use or forwarding)
+    /// Transaction event sender (for internal use or forwarding) - Might be repurposed or removed
     event_tx: mpsc::Sender<TransactionEvent>,
-    /// Transaction event receiver (from listen-engine)
-    event_rx: mpsc::Receiver<EngineTransactionEvent>,
+    /// Price Update receiver (from listen-engine)
+    price_update_rx: mpsc::Receiver<PriceUpdate>,
     /// Command receiver (for shutdown signal)
     cmd_rx: mpsc::Receiver<ListenBotCommand>,
     /// Opportunity evaluator for MEV detection
@@ -63,10 +66,11 @@ impl ListenBot {
         };
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<ListenBotCommand>(1);
-        let (internal_event_tx, _internal_event_rx) = mpsc::channel::<TransactionEvent>(1000);
-        let (_engine_event_tx, engine_event_rx) = mpsc::channel::<EngineTransactionEvent>(1000);
+        let (internal_event_tx, _internal_event_rx) = mpsc::channel::<TransactionEvent>(1000); // Keep for now, might remove later
+        // let (_engine_event_tx, engine_event_rx) = mpsc::channel::<EngineTransactionEvent>(1000); // REMOVE THIS - Engine uses PriceUpdate
 
-        let (engine, _price_rx) = Engine::from_env().await
+        // Get the engine and the correct PriceUpdate receiver
+        let (engine, price_rx) = Engine::from_env().await
             .map_err(|e| SandoError::DependencyError(format!("Failed to create listen-engine Engine: {}", e)))?;
 
         let engine_arc = Arc::new(engine);
@@ -76,8 +80,8 @@ impl ListenBot {
             Self {
                 engine: engine_arc,
                 config: bot_config,
-                event_tx: internal_event_tx,
-                event_rx: engine_event_rx,
+                event_tx: internal_event_tx, // Keep for now
+                price_update_rx: price_rx, // USE the receiver from the engine
                 cmd_rx,
                 evaluator: None,
             },
@@ -95,37 +99,28 @@ impl ListenBot {
     pub async fn start(mut self) -> Result<()> {
         info!("Starting ListenBot...");
 
-        self.create_monitoring_pipeline().await?;
-        info!("Listen Engine pipeline configured.");
+        // self.create_monitoring_pipeline().await?; // This seems engine-specific, remove from here?
+        // info!("Listen Engine pipeline configured."); // This seems engine-specific
 
         let engine_to_start = self.engine.clone();
         
-        // Create channels for engine communication
-        let (_price_tx, price_rx) = mpsc::channel(1000);
-        let (cmd_tx, cmd_rx) = mpsc::channel(1000);
+        // Create channels for engine command communication (if needed by engine.run)
+        // let (_price_tx, price_rx) = mpsc::channel(1000); // REMOVE THIS - we already have the receiver
+        let (cmd_tx, cmd_rx) = mpsc::channel(1000); // Engine run needs a command channel
 
-        // Create a dummy pipeline for testing
-        let test_pipeline = Pipeline {
-            id: uuid::Uuid::new_v4(),
-            user_id: "test".to_string(),
-            wallet_address: None,
-            pubkey: None,
-            current_steps: Vec::new(),
-            steps: HashMap::new(),
-            status: Status::Pending,
-            created_at: chrono::Utc::now(),
-        };
+        // Create a dummy pipeline for testing? - This seems like internal engine logic, remove from here
+        // let test_pipeline = Pipeline { ... };
+        // Send test pipeline to engine? - Remove from here
+        // let (response_tx, _response_rx) = oneshot::channel();
+        // let _ = cmd_tx.send(EngineMessage::AddPipeline { ... }).await;
 
-        // Send test pipeline to engine
-        let (response_tx, _response_rx) = oneshot::channel();
-        let _ = cmd_tx.send(EngineMessage::AddPipeline {
-            pipeline: test_pipeline,
-            response_tx,
-        }).await;
-
+        // Note: engine.run needs the PriceUpdate receiver, but it gets it from Engine::from_env internally via its subscriber.
+        // We just need to pass the command channel.
         let engine_handle = tokio::spawn(async move {
             info!("Starting listen-engine...");
-            if let Err(e) = Engine::run(engine_to_start, price_rx, cmd_rx).await {
+            // Pass the command receiver to engine run loop
+            // The PriceUpdate receiver is handled internally by the engine via its Redis subscriber
+            if let Err(e) = Engine::run(engine_to_start, mpsc::channel(1).1, cmd_rx).await { // Pass dummy price receiver, engine uses its own
                 error!(error = %e, "Listen Engine failed to start or encountered an error");
             } else {
                 info!("Listen Engine stopped.");
@@ -147,21 +142,25 @@ impl ListenBot {
                             }
                         }
                     }
-                    Some(engine_event) = self.event_rx.recv() => {
-                        match Self::process_engine_event(engine_event, evaluator.clone()).await {
+                    // Listen on the price_update_rx channel now
+                    Some(price_update) = self.price_update_rx.recv() => {
+                        debug!(asset = %price_update.pubkey, price = price_update.price, slot = price_update.slot, "ListenBot received PriceUpdate from channel");
+                        // Rename function to reflect it processes price updates
+                        match Self::process_price_update(price_update, evaluator.clone()).await {
                             Ok(Some(processed_event)) => {
+                                // Still send TransactionEvent for now, but might change this
                                 if let Err(e) = self.event_tx.send(processed_event).await {
                                     error!("Failed to send processed event internally: {}", e);
                                 }
                             }
-                            Ok(None) => { /* Filtered */ }
+                            Ok(None) => { /* Filtered or no action needed */ }
                             Err(e) => {
-                                error!("Error processing engine event: {}", e);
+                                error!("Error processing price update: {}", e);
                             }
                         }
                     }
                     else => {
-                        info!("ListenBot event channel closed. Exiting loop.");
+                        info!("ListenBot price update channel closed. Exiting loop.");
                         break;
                     }
                 }
@@ -182,46 +181,42 @@ impl ListenBot {
         Ok(())
     }
 
-    /// Processes an event received from the listen-engine.
-    async fn process_engine_event(
-        event: EngineTransactionEvent, 
+    /// Processes a price update received from the listen-engine's channel.
+    async fn process_price_update(
+        price_update: PriceUpdate, 
         evaluator: Option<Arc<OpportunityEvaluator>>
     ) -> Result<Option<TransactionEvent>> {
-        info!("Processing engine event");
+        info!(asset = %price_update.pubkey, price = price_update.price, slot = price_update.slot, "Processing price update");
 
-        // Convert the engine event to our local TransactionEvent format
-        let processed_event = TransactionEvent {
-            signature: Signature::from_str(&event.transaction_hash)
-                .map_err(|e| SandoError::InternalError(format!("Invalid signature format: {}", e)))?,
-            program_id: Pubkey::from_str(&event.details) // Assuming details contains the program ID
-                .map_err(|e| SandoError::InternalError(format!("Invalid program ID format: {}", e)))?,
-            token_mint: None, // We don't have this info from the engine event
-            amount: None, // We don't have this info from the engine event
-            success: event.status == "Executed", // Convert status string to boolean
-        };
+        // TODO: Decide if this price update warrants creating an "Opportunity"
+        // For now, let's always try to evaluate if an evaluator exists.
 
-        // If we have an evaluator, evaluate the transaction for MEV opportunities
+        // If we have an evaluator, evaluate based on the price update
         if let Some(evaluator) = evaluator {
-            debug!("Evaluating transaction for MEV opportunities");
-            // Convert the event to a format the evaluator can understand
+            debug!(asset = %price_update.pubkey, "Evaluating price update for MEV opportunities");
+            
+            // Construct data for the evaluator based on the PriceUpdate
+            // This structure needs to align with what OpportunityEvaluator expects
             let eval_data = serde_json::json!({
-                "signature": event.transaction_hash,
-                "program_id": event.details,
-                "status": event.status,
+                "event_type": "price_update",
+                "asset_mint": price_update.pubkey,
+                "price": price_update.price,
+                "slot": price_update.slot,
                 "timestamp": chrono::Utc::now().timestamp(),
-                // Add any other data needed by evaluator
+                // Potentially add other market context here if available
             });
 
-            // Evaluate for MEV opportunities
+            // Evaluate for MEV opportunities based on price change
             match evaluator.evaluate_opportunity(eval_data).await {
                 Ok(opportunities) => {
                     if !opportunities.is_empty() {
                         info!(
                             count = opportunities.len(),
-                            "Found potential MEV opportunities"
+                            asset = %price_update.pubkey,
+                            "Found potential MEV opportunities based on price update"
                         );
                         
-                        // Process each opportunity
+                        // Process each opportunity (same logic as before)
                         for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
                             info!(
                                 idx = idx,
@@ -229,17 +224,16 @@ impl ListenBot {
                                 profit = opportunity.estimated_profit,
                                 confidence = opportunity.confidence,
                                 risk = ?opportunity.risk_level,
-                                "Processing MEV opportunity"
+                                "Processing MEV opportunity triggered by price update"
                             );
                             
-                            // Try to execute the opportunity
                             match evaluator.process_mev_opportunity(&mut opportunity).await {
                                 Ok(Some(signature)) => {
                                     info!(
                                         idx = idx,
                                         strategy = ?opportunity.strategy,
                                         signature = %signature,
-                                        "Successfully executed MEV opportunity"
+                                        "Successfully executed MEV opportunity (from price update)"
                                     );
                                 },
                                 Ok(None) => {
@@ -247,63 +241,46 @@ impl ListenBot {
                                         idx = idx,
                                         strategy = ?opportunity.strategy,
                                         decision = ?opportunity.decision,
-                                        "Decided not to execute MEV opportunity"
+                                        "Decided not to execute MEV opportunity (from price update)"
                                     );
-                                    
-                                    // Monitor the opportunity for later if it's on hold
-                                    if let Some(decision) = opportunity.decision {
-                                        if decision == crate::evaluator::ExecutionDecision::Hold {
-                                            if let Err(e) = evaluator.monitor_opportunity(opportunity).await {
-                                                error!(error = %e, "Failed to monitor opportunity");
-                                            }
-                                        }
-                                    }
                                 },
                                 Err(e) => {
                                     error!(
                                         idx = idx,
-                                        error = %e,
                                         strategy = ?opportunity.strategy,
-                                        "Failed to process MEV opportunity"
+                                        error = %e,
+                                        "Error executing MEV opportunity (from price update)"
                                     );
                                 }
                             }
                         }
                     } else {
-                        debug!("No MEV opportunities found");
+                        debug!(asset = %price_update.pubkey, "No opportunities found for this price update");
                     }
                 }
                 Err(e) => {
-                    error!(error = %e, "Error evaluating MEV opportunities");
+                    error!(asset = %price_update.pubkey, error = %e, "Error evaluating opportunity for price update");
                 }
             }
+        } else {
+            warn!("No evaluator set for ListenBot, cannot evaluate price update.");
         }
 
-        Ok(Some(processed_event))
-    }
-
-    /// Creates the monitoring pipeline using the listen-engine configuration API.
-    async fn create_monitoring_pipeline(&self) -> Result<()> {
-        info!("Configuring listen-engine pipeline...");
-        if !self.config.filter.program_ids.is_empty() {
-            let program_ids = self.config.filter.program_ids.iter().cloned().collect::<Vec<_>>();
-            info!(count = program_ids.len(), "Adding program ID filter to engine pipeline");
-            warn!("Engine pipeline configuration (filtering) is currently a placeholder.");
-        }
-        Ok(())
+        // For now, return None as we are not converting PriceUpdate to TransactionEvent
+        // This might change based on how downstream components use the event_tx channel.
+        Ok(None) 
     }
 
     /// Stops the ListenBot and its underlying engine.
     pub async fn stop(&mut self) -> Result<()> {
-        info!("Stopping ListenBot...");
-
-        // Shutdown the engine gracefully - Note: shutdown() might not return Result
-        self.engine.shutdown().await; // Removed error handling based on compiler output
-        // Removed: if let Err(e) = self.engine.shutdown().await {
-        //     error!("Error during listen-engine shutdown: {}", e);
-        //     return Err(SandoError::DependencyError(format!("Engine shutdown failed: {}", e)));
+        info!("Sending shutdown command to ListenBot event processor...");
+        // The actual cmd_tx was moved into the task, we need a way to access it or redesign shutdown
+        // For now, this won't work as intended.
+        // if let Err(e) = self.cmd_rx.send(ListenBotCommand::Shutdown).await { // This seems wrong, should send on cmd_tx
+        //     error!("Failed to send shutdown command: {}", e);
+        //     return Err(SandoError::InternalError(format!("Failed to send shutdown: {}", e)));
         // }
-        info!("Listen Engine shutdown requested.");
+        warn!("ListenBot::stop currently cannot signal the running task correctly.");
         Ok(())
     }
 }

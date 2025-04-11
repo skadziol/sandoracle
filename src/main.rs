@@ -74,7 +74,7 @@ async fn main() -> SandoResult<()> {
     .map_err(|e| SandoError::DependencyError(format!("Failed to create OpportunityEvaluator: {}", e)))?;
     
     // Set the strategy executor on the evaluator
-    evaluator.set_strategy_executor(strategy_executor_arc.clone());
+    evaluator.set_strategy_executor(strategy_executor_arc.clone()).await;
 
     // Wrap the evaluator in an Arc for safe sharing between threads
     let evaluator_arc = Arc::new(evaluator);

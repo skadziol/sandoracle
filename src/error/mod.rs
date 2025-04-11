@@ -80,6 +80,8 @@ pub enum StrategyErrorKind {
     SimulationFailed,
     Unprofitable,
     SafetyCheckFailed,
+    ApiError,
+    UnsupportedTransactionVersion,
     Other,
 }
 
@@ -171,6 +173,8 @@ impl fmt::Display for StrategyErrorKind {
             Self::SimulationFailed => write!(f, "Simulation failed"),
             Self::Unprofitable => write!(f, "Unprofitable"),
             Self::SafetyCheckFailed => write!(f, "Safety check failed"),
+            Self::ApiError => write!(f, "External API error (e.g., Jupiter)"),
+            Self::UnsupportedTransactionVersion => write!(f, "Unsupported transaction version received"),
             Self::Other => write!(f, "Other strategy error"),
         }
     }
