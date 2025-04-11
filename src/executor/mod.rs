@@ -31,6 +31,15 @@ pub struct TransactionExecutor {
     simulation_mode: bool, // Added simulation mode flag
 }
 
+impl std::fmt::Debug for TransactionExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionExecutor")
+            .field("rpc_client", &"<RpcClient>")
+            // Add other fields here
+            .finish()
+    }
+}
+
 // --- Structs for Arbitrage Strategy ---
 
 /// Represents a single step in an arbitrage path

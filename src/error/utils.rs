@@ -1,6 +1,8 @@
 use super::SandoError;
 use tokio::time::{sleep, Duration};
 use tracing::{error, warn};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Retries a fallible async operation with exponential backoff.
 ///

@@ -274,8 +274,8 @@ mod tests {
         let log_content = fs::read_to_string(&log_file_path).expect("Failed to read log file");
         assert!(log_content.contains("Info level message"));
         assert!(log_content.contains("Debug level message"));
-        assert!(log_content.contains("level":"INFO")); // Check JSON format
-        assert!(log_content.contains("level":"DEBUG"));
+        assert!(log_content.contains(r#""level":"INFO""#)); // Check JSON format
+        assert!(log_content.contains(r#""level":"DEBUG""#));
 
         cleanup_logs();
     }
@@ -289,19 +289,32 @@ mod tests {
     async fn test_health_check_placeholders() {
         // Create dummy settings and executor for testing the structure
         let settings = Settings {
-            solana_rpc_url: "https://api.devnet.solana.com".to_string(), // Use a real one for basic check
-            // Fill other dummy fields as needed by Settings struct
-            wallet_private_key: get_test_keypair_b58(), 
-            rig_api_key: "dummy".to_string(),
-            max_concurrent_trades: 1,
+            solana_rpc_url: "http://localhost:8899".to_string(),
+            solana_ws_url: "ws://localhost:8900".to_string(),
+            wallet_private_key: get_test_keypair_b58(),
+            rig_api_key: Some("dummy".to_string()),
+            rig_model_provider: Some("anthropic".to_string()),
+            rig_model_name: Some("claude-3-opus-20240229".to_string()),
+            telegram_bot_token: Some("dummy".to_string()),
+            telegram_chat_id: Some("dummy".to_string()),
+            log_level: Some("info".to_string()),
+            max_concurrent_trades: 5,
             min_profit_threshold: 0.1,
             max_slippage: 0.1,
-            log_level: "info".to_string(),
-            orca_api_url: "dummy".to_string(),
-            raydium_api_url: "dummy".to_string(),
-            jupiter_api_url: "dummy".to_string(),
             max_position_size: 100.0,
-            risk_level: crate::evaluator::RiskLevel::Low, // Assuming RiskLevel is accessible
+            risk_level: crate::evaluator::RiskLevel::Low,
+            simulation_mode: true,
+            allowed_tokens: Some(vec!["SOL".to_string()]),
+            blocked_tokens: Some(vec![]),
+            request_timeout_secs: Some(30),
+            max_retries: Some(3),
+            retry_backoff_ms: Some(1000),
+            orca_api_url: Some("dummy".to_string()),
+            raydium_api_url: Some("dummy".to_string()),
+            jupiter_api_url: Some("dummy".to_string()),
+            arbitrage_min_profit: Some(0.1),
+            sandwich_min_profit: Some(0.1),
+            snipe_min_profit: Some(0.1),
         };
         let executor = TransactionExecutor::new(&settings.solana_rpc_url, &settings.wallet_private_key, false).unwrap();
         
