@@ -233,4 +233,99 @@ impl Jupiter {
             data,
         })
     }
+
+    // Add a new method to get individual swap instructions
+    pub async fn get_swap_instructions(
+        quote_response: QuoteResponse,
+        owner: &Pubkey,
+        min_out_amount: u64, // Allow explicit slippage control
+    ) -> Result<Vec<solana_sdk::instruction::Instruction>> {
+        // Create a modified quote response with the specified min_out_amount
+        let mut quote = quote_response.clone();
+        quote.other_amount_threshold = min_out_amount.to_string();
+
+        // Prepare the request for instructions
+        let swap_request = SwapRequest {
+            user_public_key: owner.to_string(),
+            quote_response: quote,
+            wrap_and_unwrap_sol: true,
+            use_shared_accounts: true,
+            fee_account: None,
+            tracking_account: None,
+            compute_unit_price_micro_lamports: None,
+            prioritization_fee_lamports: None,
+            as_legacy_transaction: true, // Using legacy transaction format
+            use_token_ledger: false,
+            destination_token_account: None,
+            dynamic_compute_unit_limit: true,
+            skip_user_accounts_rpc_calls: true,
+            dynamic_slippage: None,
+        };
+
+        // Use the Jupiter instructions endpoint
+        let client = reqwest::Client::new();
+        let raw_res = client
+            .post("https://quote-api.jup.ag/v6/swap-instructions")
+            .json(&swap_request)
+            .send()
+            .await?;
+
+        if !raw_res.status().is_success() {
+            let error_body = raw_res.text().await.unwrap_or_else(|_| "Unknown error body".to_string());
+            return Err(anyhow!("Jupiter swap instructions API failed: {}", error_body));
+        }
+
+        // Instructions response from Jupiter
+        #[derive(Deserialize, Debug)]
+        struct InstructionsResponse {
+            #[serde(rename = "tokenLedgerInstruction")]
+            token_ledger_instruction: Option<InstructionData>,
+            #[serde(rename = "computeBudgetInstructions")]
+            compute_budget_instructions: Vec<InstructionData>,
+            #[serde(rename = "setupInstructions")]
+            setup_instructions: Vec<InstructionData>,
+            #[serde(rename = "swapInstruction")]
+            swap_instruction: InstructionData,
+            #[serde(rename = "cleanupInstruction")]
+            cleanup_instruction: Option<InstructionData>,
+            #[serde(rename = "addressLookupTableAddresses")]
+            address_lookup_table_addresses: Vec<String>,
+        }
+
+        // Parse the response
+        let instructions_response: InstructionsResponse = raw_res.json().await?;
+
+        // Convert all instruction data to Solana SDK instructions
+        let mut instructions = Vec::new();
+
+        // Process compute budget instructions (typically sets compute unit limit and price)
+        for ix_data in instructions_response.compute_budget_instructions {
+            let instruction = Self::_convert_instruction_data(ix_data)?;
+            instructions.push(instruction);
+        }
+
+        // Process setup instructions (token account creation, wrapping SOL, etc.)
+        for ix_data in instructions_response.setup_instructions {
+            let instruction = Self::_convert_instruction_data(ix_data)?;
+            instructions.push(instruction);
+        }
+
+        // Add token ledger instruction if present
+        if let Some(token_ledger) = instructions_response.token_ledger_instruction {
+            let instruction = Self::_convert_instruction_data(token_ledger)?;
+            instructions.push(instruction);
+        }
+
+        // Add the main swap instruction
+        let swap_ix = Self::_convert_instruction_data(instructions_response.swap_instruction)?;
+        instructions.push(swap_ix);
+
+        // Add cleanup instruction if present (typically for unwrapping SOL)
+        if let Some(cleanup) = instructions_response.cleanup_instruction {
+            let instruction = Self::_convert_instruction_data(cleanup)?;
+            instructions.push(instruction);
+        }
+
+        Ok(instructions)
+    }
 }

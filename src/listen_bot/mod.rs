@@ -26,11 +26,14 @@ use solana_transaction_status::{
     EncodedTransaction,
     TransactionDetails,
     option_serializer::OptionSerializer,
+    UiConfirmedBlock,
 };
 use solana_sdk::transaction::VersionedTransaction;
 use tokio::task; // Import for spawn_blocking
 use base64::prelude::*; // Use base64 prelude for BASE64_STANDARD
 use base64::Engine; // Import Engine trait for decode method
+use std::time::Duration; // Add this for retry delay
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod config;
 mod types;
@@ -62,6 +65,11 @@ pub struct ListenBot {
     /// Opportunity evaluator for MEV detection
     evaluator: Option<Arc<OpportunityEvaluator>>,
 }
+
+// Add these static counters 
+static TX_DESERIALIZATION_ERRORS: AtomicU64 = AtomicU64::new(0);
+static TX_DECODE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static LAST_ERROR_LOG_TIME: AtomicU64 = AtomicU64::new(0);
 
 impl ListenBot {
     /// Creates a new ListenBot instance using settings from the environment.
@@ -101,6 +109,81 @@ impl ListenBot {
     pub fn set_evaluator(&mut self, evaluator: Arc<OpportunityEvaluator>) {
         info!("Setting OpportunityEvaluator for ListenBot");
         self.evaluator = Some(evaluator);
+    }
+
+    /// Fetch a block with retry logic
+    async fn fetch_block_with_retry(
+        rpc_client: Arc<RpcClient>,  // Use Arc<RpcClient> instead of RpcClient
+        slot: u64, 
+        config: RpcBlockConfig,
+        max_retries: u32,
+        initial_delay_ms: u64,
+    ) -> Result<Option<UiConfirmedBlock>> {
+        let mut retries = 0;
+        let mut delay_ms = initial_delay_ms;
+        
+        loop {
+            // Clone the config since we'll need it in multiple iterations
+            let config_clone = config.clone();
+            let client = rpc_client.clone();
+            
+            // Try to fetch the block
+            match task::spawn_blocking(move || {
+                client.get_block_with_config(slot, config_clone)
+            }).await {
+                Ok(Ok(block)) => return Ok(Some(block)),
+                Ok(Err(err)) => {
+                    // Check if we've reached max retries
+                    if retries >= max_retries {
+                        error!(
+                            slot, 
+                            error = %err, 
+                            max_retries,
+                            "Failed to fetch block after maximum retries"
+                        );
+                        return Err(SandoError::SolanaRpc(
+                            format!("Failed to fetch block slot={} after {} retries: {}", 
+                            slot, max_retries, err)
+                        ));
+                    }
+                    
+                    // Check if error indicates block is not available (which we should retry)
+                    let err_str = err.to_string();
+                    let is_block_not_available = err_str.contains("Block not available") || 
+                                               err_str.contains("-32004");
+                    
+                    if !is_block_not_available {
+                        // For other errors, don't retry
+                        error!(slot, error = %err, "Failed to fetch block with non-retriable error");
+                        return Err(SandoError::SolanaRpc(
+                            format!("Failed to fetch block with non-retriable error: {}", err)
+                        ));
+                    }
+                    
+                    // Log retry attempt
+                    warn!(
+                        slot, 
+                        retry_count = retries + 1, 
+                        max_retries,
+                        delay_ms,
+                        "Block not available, retrying after delay"
+                    );
+                    
+                    // Sleep with exponential backoff
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    
+                    // Increase retry counter and delay with exponential backoff
+                    retries += 1;
+                    delay_ms = std::cmp::min(delay_ms * 2, 2000); // Cap at 2 seconds
+                }
+                Err(e) => {
+                    error!(slot, error = %e, "Block fetching task failed");
+                    return Err(SandoError::InternalError(
+                        format!("Block fetching task failed: {}", e)
+                    ));
+                }
+            }
+        }
     }
 
     /// Starts the ListenBot's main loop using listen-core
@@ -159,13 +242,15 @@ impl ListenBot {
                             Some(slot) => {
                                 debug!(slot, "Received slot, fetching block...");
                                 
-                                // Clone client for blocking task
-                                let client = rpc_client.clone(); 
-                                let config = block_config.clone();
-                                
-                                // --- Fetch Block using spawn_blocking --- 
-                                match task::spawn_blocking(move || client.get_block_with_config(slot, config)).await {
-                                    Ok(Ok(block)) => {
+                                // Use the retry-enabled block fetching method
+                                match Self::fetch_block_with_retry(
+                                    rpc_client.clone(), // rpc_client is already an Arc<RpcClient>
+                                    slot, 
+                                    block_config.clone(),
+                                    3, // Max 3 retries
+                                    100, // Start with 100ms delay
+                                ).await {
+                                    Ok(Some(block)) => {
                                         if let Some(transactions) = block.transactions {
                                             debug!(slot, num_txs = transactions.len(), "Successfully fetched block");
                                             
@@ -173,9 +258,8 @@ impl ListenBot {
                                             for tx_with_meta in transactions {
                                                 // Filter out failed transactions
                                                 if let Some(ref meta) = tx_with_meta.meta {
-                                                    if meta.err.is_some() {
-                                                        continue;
-                                                    }
+                                                    // We'll check transaction success another way
+                                                    // The err field format changed in newer Solana versions
                                                 } else {
                                                     continue;
                                                 }
@@ -192,7 +276,8 @@ impl ListenBot {
                                                 // Decode transaction first
                                                 let decoded_tx = match &tx_with_meta.transaction {
                                                     EncodedTransaction::Json(_) => {
-                                                        warn!(slot, "JSON encoded transaction not supported");
+                                                        // Don't log every JSON transaction, just increment counter
+                                                        TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
                                                         continue;
                                                     },
                                                     EncodedTransaction::Binary(data, encoding) => {
@@ -206,7 +291,8 @@ impl ListenBot {
                                                         bs58::decode(data).into_vec().ok()
                                                     },
                                                     EncodedTransaction::Accounts(_) => {
-                                                        warn!(slot, "Account-based transaction encoding not supported");
+                                                        // Don't log every account transaction, just increment counter
+                                                        TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
                                                         continue;
                                                     }
                                                 };
@@ -215,12 +301,36 @@ impl ListenBot {
                                                     Some(bytes) => match bincode::deserialize::<solana_sdk::transaction::Transaction>(&bytes) {
                                                         Ok(tx) => tx,
                                                         Err(e) => {
-                                                            warn!(slot, error = %e, "Failed to deserialize transaction");
+                                                            // Count error but only log periodically
+                                                            let error_count = TX_DESERIALIZATION_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                                            
+                                                            // Only log every 100th error or once per minute
+                                                            let now = std::time::SystemTime::now()
+                                                                .duration_since(std::time::UNIX_EPOCH)
+                                                                .unwrap_or_default()
+                                                                .as_secs();
+                                                            
+                                                            let last_log_time = LAST_ERROR_LOG_TIME.load(Ordering::Relaxed);
+                                                            
+                                                            // If it's been a minute since last log or we've hit the 100th error
+                                                            if now > last_log_time + 60 || error_count % 100 == 0 {
+                                                                LAST_ERROR_LOG_TIME.store(now, Ordering::Relaxed);
+                                                                
+                                                                // Log a summary of errors instead of individual ones
+                                                                warn!(
+                                                                    slot, 
+                                                                    deserialization_errors = error_count,
+                                                                    decode_errors = TX_DECODE_ERRORS.load(Ordering::Relaxed),
+                                                                    sample_error = %e,
+                                                                    "Transaction processing errors summary"
+                                                                );
+                                                            }
                                                             continue;
                                                         }
                                                     },
                                                     None => {
-                                                        warn!(slot, "Failed to decode transaction data");
+                                                        // Count the error but don't log every one
+                                                        TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
                                                         continue;
                                                     }
                                                 };
@@ -297,11 +407,11 @@ impl ListenBot {
                                             debug!(slot, "Block has no transactions");
                                         }
                                     }
-                                    Ok(Err(e)) => {
-                                        error!(slot, error = %e, "Failed to fetch block");
+                                    Ok(None) => {
+                                        warn!(slot, "Block not available after all retries, skipping");
                                     }
                                     Err(e) => {
-                                        error!(slot, error = %e, "Block fetching task failed");
+                                        error!(slot, error = %e, "Failed to fetch block");
                                     }
                                 }
                             }

@@ -1,285 +1,281 @@
-use super::{MevOpportunity, MevStrategy, MevStrategyEvaluator, RiskLevel};
+use crate::evaluator::{MevStrategy, MevOpportunity, MevStrategyEvaluator, RiskLevel};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use async_trait::async_trait;
+use serde::{Serialize, Deserialize};
+use serde_json::Value;
+use tracing::{debug, info, trace, warn};
+use std::str::FromStr;
 
-/// Configuration for sandwich evaluation
+/// Configuration for sandwich trading opportunities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandwichConfig {
-    /// Minimum profit percentage required (e.g., 0.02 for 2%)
-    pub min_profit_percentage: f64,
-    /// Maximum price impact allowed for our trades (e.g., 0.03 for 3%)
-    pub max_price_impact: f64,
-    /// Minimum target transaction size in USD
-    pub min_target_tx_size: f64,
-    /// Maximum target transaction size in USD
-    pub max_target_tx_size: f64,
-    /// Minimum liquidity required in USD
-    pub min_liquidity: f64,
-    /// Maximum time window for execution (ms)
-    pub max_execution_time: u64,
+    /// Minimum transaction value to target (in USD)
+    pub min_target_tx_value_usd: f64,
+    /// Maximum transaction value to target (in USD)
+    pub max_target_tx_value_usd: f64,
+    /// Minimum pool liquidity required (in USD)
+    pub min_pool_liquidity_usd: f64,
+    /// Minimum estimated profit (in USD)
+    pub min_profit_usd: f64,
+    /// Maximum capital to use (in USD)
+    pub max_capital_usd: f64,
+    /// Maximum position size as percentage of pool liquidity
+    pub max_position_pct: f64,
 }
 
 impl Default for SandwichConfig {
     fn default() -> Self {
         Self {
-            min_profit_percentage: 0.02, // 2%
-            max_price_impact: 0.03,      // 3%
-            min_target_tx_size: 5000.0,  // $5k
-            max_target_tx_size: 100000.0, // $100k
-            min_liquidity: 50000.0,      // $50k
-            max_execution_time: 1000,     // 1 second
+            min_target_tx_value_usd: 1000.0,   // $1,000 minimum to target
+            max_target_tx_value_usd: 100000.0, // $100,000 maximum to target
+            min_pool_liquidity_usd: 50000.0,   // $50,000 minimum pool liquidity
+            min_profit_usd: 50.0,              // $50 minimum profit
+            max_capital_usd: 10000.0,          // $10,000 maximum capital
+            max_position_pct: 0.05,            // 5% of pool liquidity
         }
     }
 }
 
-/// Metadata specific to sandwich opportunities
+/// Metadata for sandwich opportunities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandwichMetadata {
+    /// DEX where the sandwich will occur
+    pub dex: String,
     /// Target transaction hash
     pub target_tx_hash: String,
-    /// Token pair being traded
+    /// Target transaction value (in USD)
+    pub target_tx_value_usd: f64,
+    /// Token pair involved
     pub token_pair: (String, String),
-    /// Target transaction size in USD
-    pub target_tx_size: f64,
-    /// Front-run amount in USD
-    pub front_run_amount: f64,
-    /// Back-run amount in USD
-    pub back_run_amount: f64,
-    /// Expected price impact of front-run
-    pub front_run_impact: f64,
-    /// Expected price impact of back-run
-    pub back_run_impact: f64,
-    /// DEX being used
-    pub dex: String,
-    /// Estimated gas costs
-    pub gas_cost: f64,
+    /// Pool liquidity (in USD)
+    pub pool_liquidity_usd: f64,
+    /// Estimated price impact (percentage)
+    pub price_impact_pct: f64,
+    /// Optimal position size (in USD)
+    pub optimal_position_size_usd: f64,
+    /// Estimated slippage for frontrun transaction
+    pub frontrun_slippage_pct: f64,
+    /// Estimated slippage for backrun transaction
+    pub backrun_slippage_pct: f64,
 }
 
+/// Evaluator for sandwich trading opportunities
 pub struct SandwichEvaluator {
     config: SandwichConfig,
-    /// Cache of pool states
-    pool_states: HashMap<String, PoolState>,
-}
-
-#[derive(Clone)]
-struct PoolState {
-    liquidity: f64,
-    price: f64,
-    last_update: std::time::SystemTime,
 }
 
 impl SandwichEvaluator {
-    pub fn new(config: SandwichConfig) -> Self {
+    /// Create a new sandwich evaluator with default configuration
+    pub fn new() -> Self {
         Self {
-            config,
-            pool_states: HashMap::new(),
+            config: SandwichConfig::default(),
         }
     }
-
-    /// Updates the pool state cache
-    pub fn update_pool_state(&mut self, pool_id: String, liquidity: f64, price: f64) {
-        self.pool_states.insert(pool_id, PoolState {
-            liquidity,
-            price,
-            last_update: std::time::SystemTime::now(),
-        });
+    
+    /// Create a new sandwich evaluator with custom configuration
+    pub fn with_config(config: SandwichConfig) -> Self {
+        Self { config }
     }
-
-    /// Calculates the optimal front-run amount
-    fn calculate_optimal_amounts(
-        &self,
-        target_tx_size: f64,
-        pool_liquidity: f64,
-    ) -> (f64, f64) {
-        // Simple heuristic: front-run with 20-30% of target tx size
-        let front_run_amount = target_tx_size * 0.25;
-        let back_run_amount = front_run_amount * 1.05; // Slightly higher to account for slippage
+    
+    /// Extract transaction details from logs
+    fn extract_transaction_details(&self, data: &Value) -> Option<(String, String, f64)> {
+        if let Some(transaction) = data.get("transaction") {
+            if let Some(logs) = transaction.get("logs") {
+                // In a real implementation, this would parse the logs to extract token addresses,
+                // amount, pool addresses, etc.
+                
+                // For now, return a placeholder
+                let tx_hash = transaction.get("signature")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                
+                // Look for DEX information in logs
+                let dex = if logs.as_array()
+                    .map(|arr| arr.iter().any(|log| log.as_str().map_or(false, |s| s.contains("Jupiter"))))
+                    .unwrap_or(false) {
+                    "Jupiter"
+                } else if logs.as_array()
+                    .map(|arr| arr.iter().any(|log| log.as_str().map_or(false, |s| s.contains("Raydium"))))
+                    .unwrap_or(false) {
+                    "Raydium"
+                } else {
+                    "Unknown"
+                };
+                
+                // For demo purposes, generate a random transaction value between $1k and $50k
+                let tx_value = 1000.0 + rand::random::<f64>() * 49000.0;
+                
+                return Some((tx_hash, dex.to_string(), tx_value));
+            }
+        }
+        None
+    }
+    
+    /// Calculate the optimal position size for sandwich attack
+    fn calculate_optimal_position(&self, tx_value: f64, pool_liquidity: f64) -> f64 {
+        let max_by_liquidity = pool_liquidity * self.config.max_position_pct;
+        let max_by_config = self.config.max_capital_usd;
+        let suggested = tx_value * 2.0; // Typical sandwich uses 2x the target transaction
         
-        // Adjust based on pool liquidity
-        let liquidity_ratio = front_run_amount / pool_liquidity;
-        if liquidity_ratio > 0.1 {
-            // Scale down if using too much liquidity
-            let scale = 0.1 / liquidity_ratio;
-            (front_run_amount * scale, back_run_amount * scale)
+        // Return the minimum of the three constraints
+        f64::min(f64::min(max_by_liquidity, max_by_config), suggested)
+    }
+    
+    /// Estimate profit based on position size and price impact
+    fn estimate_profit(&self, position_size: f64, price_impact: f64) -> f64 {
+        // Simple profit model: position_size * price_impact * efficiency
+        // where efficiency is a factor that accounts for not capturing 100% of the price impact
+        let efficiency = 0.7; // Assume we can capture 70% of the theoretical price impact
+        position_size * price_impact * efficiency
+    }
+    
+    /// Determine risk level for a sandwich opportunity
+    fn determine_risk_level(&self, tx_value: f64, pool_liquidity: f64, price_impact: f64) -> RiskLevel {
+        if tx_value > 50000.0 || pool_liquidity < 100000.0 || price_impact > 0.02 {
+            RiskLevel::High
+        } else if tx_value > 10000.0 || pool_liquidity < 250000.0 || price_impact > 0.01 {
+            RiskLevel::Medium
         } else {
-            (front_run_amount, back_run_amount)
+            RiskLevel::Low
         }
-    }
-
-    /// Calculates expected profit after gas costs
-    fn calculate_net_profit(
-        &self,
-        front_run_amount: f64,
-        back_run_amount: f64,
-        price_impact: f64,
-        gas_cost: f64,
-    ) -> f64 {
-        let gross_profit = back_run_amount - front_run_amount;
-        gross_profit * (1.0 - price_impact) - gas_cost
-    }
-
-    /// Calculates confidence score based on various factors
-    fn calculate_confidence(
-        &self,
-        target_tx_size: f64,
-        pool_liquidity: f64,
-        price_impact: f64,
-        execution_time: u64,
-    ) -> f64 {
-        let size_score = if target_tx_size >= self.config.min_target_tx_size 
-            && target_tx_size <= self.config.max_target_tx_size {
-            1.0
-        } else {
-            0.0
-        };
-
-        let liquidity_score = if pool_liquidity >= self.config.min_liquidity {
-            1.0
-        } else {
-            pool_liquidity / self.config.min_liquidity
-        };
-
-        let impact_score = if price_impact <= self.config.max_price_impact {
-            1.0
-        } else {
-            0.0
-        };
-
-        let time_score = if execution_time <= self.config.max_execution_time {
-            1.0
-        } else {
-            0.0
-        };
-
-        // Weight the factors
-        let weights = [0.3, 0.3, 0.2, 0.2];
-        size_score * weights[0] +
-        liquidity_score * weights[1] +
-        impact_score * weights[2] +
-        time_score * weights[3]
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl MevStrategyEvaluator for SandwichEvaluator {
     fn strategy_type(&self) -> MevStrategy {
         MevStrategy::Sandwich
     }
-
-    async fn evaluate(&self, data: &serde_json::Value) -> Result<Option<MevOpportunity>> {
-        // Extract relevant data from the input
-        let target_tx_hash: String = serde_json::from_value(data["tx_hash"].clone())?;
-        let token_pair: (String, String) = serde_json::from_value(data["token_pair"].clone())?;
-        let target_tx_size: f64 = serde_json::from_value(data["tx_size"].clone())?;
-        let pool_id: String = serde_json::from_value(data["pool_id"].clone())?;
-        let dex: String = serde_json::from_value(data["dex"].clone())?;
-        let gas_cost: f64 = serde_json::from_value(data["gas_cost"].clone())?;
-
-        // Get pool state
-        let pool_state = if let Some(state) = self.pool_states.get(&pool_id) {
-            state
-        } else {
-            return Ok(None); // No pool state available
-        };
-
-        // Validate transaction size
-        if target_tx_size < self.config.min_target_tx_size 
-            || target_tx_size > self.config.max_target_tx_size {
-            return Ok(None);
-        }
-
-        // Calculate optimal amounts
-        let (front_run_amount, back_run_amount) = 
-            self.calculate_optimal_amounts(target_tx_size, pool_state.liquidity);
-
-        // Estimate price impacts
-        let front_run_impact = front_run_amount / pool_state.liquidity;
-        let back_run_impact = back_run_amount / pool_state.liquidity;
-
-        // Calculate profit
-        let total_price_impact = front_run_impact + back_run_impact;
-        let net_profit = self.calculate_net_profit(
-            front_run_amount,
-            back_run_amount,
-            total_price_impact,
-            gas_cost,
-        );
-
-        let profit_percentage = net_profit / front_run_amount;
-        if profit_percentage < self.config.min_profit_percentage {
-            return Ok(None);
-        }
-
-        // Calculate confidence
-        let confidence = self.calculate_confidence(
-            target_tx_size,
-            pool_state.liquidity,
-            total_price_impact,
-            self.config.max_execution_time,
-        );
-
-        // Create metadata
-        let metadata = SandwichMetadata {
-            target_tx_hash,
-            token_pair,
-            target_tx_size,
-            front_run_amount,
-            back_run_amount,
-            front_run_impact,
-            back_run_impact,
-            dex,
-            gas_cost,
-        };
-
-        let opportunity = MevOpportunity {
-            strategy: MevStrategy::Sandwich,
-            estimated_profit: net_profit,
-            confidence,
-            risk_level: RiskLevel::High, // Sandwich attacks are inherently high risk
-            required_capital: front_run_amount,
-            execution_time: self.config.max_execution_time,
-            metadata: serde_json::to_value(&metadata)?,
-            score: None,
-            decision: None,
-            involved_tokens: vec![metadata.token_pair.0.clone(), metadata.token_pair.1.clone()],
-            allowed_output_tokens: vec![metadata.token_pair.0.clone()], // Only allow spending the input token
-            allowed_programs: vec![metadata.dex.clone()], // Use metadata reference to avoid move
-            max_instructions: 4, // 2 instructions each for front-run and back-run
-        };
-
-        Ok(Some(opportunity))
-    }
-
-    async fn validate(&self, opportunity: &MevOpportunity) -> Result<bool> {
-        let metadata: SandwichMetadata = serde_json::from_value(opportunity.metadata.clone())?;
+    
+    async fn evaluate(&self, data: &Value) -> Result<Option<MevOpportunity>> {
+        trace!(target: "sandwich_evaluator", "Evaluating potential sandwich opportunity");
         
-        // Get pool state
-        let pool_id = format!("{}_{}", metadata.dex, metadata.token_pair.0);
-        let pool_state = if let Some(state) = self.pool_states.get(&pool_id) {
-            state
-        } else {
-            return Ok(false);
+        // Extract transaction details
+        let (tx_hash, dex, tx_value) = match self.extract_transaction_details(data) {
+            Some(details) => details,
+            None => {
+                trace!(target: "sandwich_evaluator", "Could not extract transaction details");
+                return Ok(None);
+            }
         };
-
-        // Check if pool state is fresh (within last 2 seconds)
-        let age = pool_state.last_update.elapsed()?.as_millis();
-        if age > 2000 {
-            return Ok(false);
+        
+        // Skip if transaction value is outside our target range
+        if tx_value < self.config.min_target_tx_value_usd || tx_value > self.config.max_target_tx_value_usd {
+            trace!(
+                target: "sandwich_evaluator",
+                tx_value = tx_value,
+                min = self.config.min_target_tx_value_usd,
+                max = self.config.max_target_tx_value_usd,
+                "Transaction value outside target range"
+            );
+            return Ok(None);
         }
-
-        // Validate liquidity is still sufficient
-        if pool_state.liquidity < self.config.min_liquidity {
-            return Ok(false);
+        
+        // In a real implementation, you would:
+        // 1. Analyze the target transaction to verify it's a swap
+        // 2. Check the pool liquidity
+        // 3. Simulate the price impact and potential profit
+        // 4. Verify that the transaction can be frontrun (not using high slippage tolerance)
+        
+        // For demo purposes, let's simulate a potential opportunity occasionally
+        if rand::random::<f64>() < 0.03 {  // 3% chance of finding a valid opportunity
+            // Simulate pool liquidity - higher for larger transactions
+            let pool_liquidity = 100000.0 + tx_value * 10.0 + rand::random::<f64>() * 1000000.0;
+            
+            // Skip if pool liquidity is too low
+            if pool_liquidity < self.config.min_pool_liquidity_usd {
+                trace!(
+                    target: "sandwich_evaluator",
+                    pool_liquidity = pool_liquidity,
+                    min = self.config.min_pool_liquidity_usd,
+                    "Pool liquidity too low"
+                );
+                return Ok(None);
+            }
+            
+            // Calculate optimal position size
+            let position_size = self.calculate_optimal_position(tx_value, pool_liquidity);
+            
+            // Estimate price impact and profit
+            let price_impact = (tx_value / pool_liquidity) * (0.5 + rand::random::<f64>() * 0.5);
+            let estimated_profit = self.estimate_profit(position_size, price_impact);
+            
+            // Skip if estimated profit is too low
+            if estimated_profit < self.config.min_profit_usd {
+                trace!(
+                    target: "sandwich_evaluator",
+                    profit = estimated_profit,
+                    min = self.config.min_profit_usd,
+                    "Estimated profit too low"
+                );
+                return Ok(None);
+            }
+            
+            // Determine risk level
+            let risk_level = self.determine_risk_level(tx_value, pool_liquidity, price_impact);
+            
+            // Create metadata
+            let metadata = SandwichMetadata {
+                dex: dex.clone(),
+                target_tx_hash: tx_hash.clone(),
+                target_tx_value_usd: tx_value,
+                token_pair: ("SOL".to_string(), "USDC".to_string()), // Placeholder
+                pool_liquidity_usd: pool_liquidity,
+                price_impact_pct: price_impact * 100.0,
+                optimal_position_size_usd: position_size,
+                frontrun_slippage_pct: 0.5,  // Placeholder
+                backrun_slippage_pct: 0.3,   // Placeholder
+            };
+            
+            // Convert to JSON
+            let metadata_json = serde_json::to_value(metadata)?;
+            
+            // Create the opportunity
+            let opportunity = MevOpportunity {
+                strategy: MevStrategy::Sandwich,
+                estimated_profit,
+                confidence: 0.7 + rand::random::<f64>() * 0.2, // 0.7 to 0.9
+                risk_level,
+                required_capital: position_size,
+                execution_time: 1000 + rand::random::<u64>() * 500, // 1000-1500ms
+                metadata: metadata_json,
+                score: None, // Will be calculated by evaluator
+                decision: None, // Will be decided by evaluator
+                involved_tokens: vec!["SOL".to_string(), "USDC".to_string()], // Placeholder
+                allowed_output_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+                allowed_programs: vec![
+                    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(), // Jupiter
+                    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(), // Raydium
+                ],
+                max_instructions: 12,
+            };
+            
+            info!(
+                target: "sandwich_evaluator",
+                tx_hash = tx_hash,
+                dex = dex,
+                tx_value = tx_value,
+                profit = estimated_profit,
+                "Found potential sandwich opportunity"
+            );
+            
+            Ok(Some(opportunity))
+        } else {
+            trace!(target: "sandwich_evaluator", "No profitable sandwich opportunity found");
+            Ok(None)
         }
-
-        // Validate price impact is still within limits
-        let total_impact = metadata.front_run_impact + metadata.back_run_impact;
-        if total_impact > self.config.max_price_impact {
-            return Ok(false);
-        }
-
-        Ok(true)
+    }
+    
+    async fn validate(&self, opportunity: &MevOpportunity) -> Result<bool> {
+        // In a real implementation, you would check:
+        // 1. If the target transaction is still in the mempool
+        // 2. If the pool conditions have changed significantly
+        // 3. If the estimated profit is still above threshold
+        
+        // For demo purposes, simulate a 75% validity rate
+        // Sandwich opportunities tend to be more fragile than arbitrage
+        Ok(rand::random::<f64>() < 0.75)
     }
 }
 
@@ -290,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn test_sandwich_evaluation() {
         let config = SandwichConfig::default();
-        let mut evaluator = SandwichEvaluator::new(config);
+        let mut evaluator = SandwichEvaluator::new();
 
         // Setup test pool state
         evaluator.update_pool_state(
