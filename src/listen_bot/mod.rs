@@ -71,6 +71,12 @@ static TX_DESERIALIZATION_ERRORS: AtomicU64 = AtomicU64::new(0);
 static TX_DECODE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LAST_ERROR_LOG_TIME: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug)]
+enum DecodedTransaction {
+    Legacy(solana_sdk::transaction::Transaction),
+    Versioned(solana_sdk::transaction::VersionedTransaction)
+}
+
 impl ListenBot {
     /// Creates a new ListenBot instance using settings from the environment.
     pub async fn from_settings(settings: &Settings) -> Result<(Self, mpsc::Sender<ListenBotCommand>)> {
@@ -298,9 +304,15 @@ impl ListenBot {
                                                 };
 
                                                 let decoded_tx = match decoded_tx {
-                                                    Some(bytes) => match bincode::deserialize::<solana_sdk::transaction::Transaction>(&bytes) {
-                                                        Ok(tx) => tx,
-                                                        Err(e) => {
+                                                    Some(bytes) => {
+                                                        // Try versioned transaction first (more common in newer blocks)
+                                                        if let Ok(versioned_tx) = bincode::deserialize::<solana_sdk::transaction::VersionedTransaction>(&bytes) {
+                                                            DecodedTransaction::Versioned(versioned_tx)
+                                                        } 
+                                                        // Fall back to legacy format
+                                                        else if let Ok(legacy_tx) = bincode::deserialize::<solana_sdk::transaction::Transaction>(&bytes) {
+                                                            DecodedTransaction::Legacy(legacy_tx)
+                                                        } else {
                                                             // Count error but only log periodically
                                                             let error_count = TX_DESERIALIZATION_ERRORS.fetch_add(1, Ordering::Relaxed);
                                                             
@@ -321,7 +333,6 @@ impl ListenBot {
                                                                     slot, 
                                                                     deserialization_errors = error_count,
                                                                     decode_errors = TX_DECODE_ERRORS.load(Ordering::Relaxed),
-                                                                    sample_error = %e,
                                                                     "Transaction processing errors summary"
                                                                 );
                                                             }
@@ -335,72 +346,94 @@ impl ListenBot {
                                                     }
                                                 };
 
-                                                // Get signature from decoded transaction
-                                                let signature = match &decoded_tx {
-                                                    solana_sdk::transaction::Transaction { signatures, .. } => {
-                                                        if let Some(sig) = signatures.first() {
-                                                            sig.to_string()
-                                                        } else {
-                                                            warn!(slot, "Transaction missing signature");
-                                                            continue;
-                                                        }
+                                                // Process based on transaction version
+                                                let (signature, signer) = match decoded_tx {
+                                                    DecodedTransaction::Legacy(tx) => {
+                                                        // Get signature from decoded transaction
+                                                        let signature = match tx.signatures.first() {
+                                                            Some(sig) => sig.to_string(),
+                                                            None => {
+                                                                TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                                                continue;
+                                                            }
+                                                        };
+
+                                                        // Get the signer (fee payer)
+                                                        let signer = match tx.message.account_keys.get(0) {
+                                                            Some(pubkey) => pubkey.to_string(),
+                                                            None => {
+                                                                TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                                                continue;
+                                                            }
+                                                        };
+
+                                                        (signature, signer)
+                                                    },
+                                                    DecodedTransaction::Versioned(tx) => {
+                                                        // Get signature from versioned transaction
+                                                        let signature = match tx.signatures.first() {
+                                                            Some(sig) => sig.to_string(),
+                                                            None => {
+                                                                TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                                                continue;
+                                                            }
+                                                        };
+
+                                                        // Get the signer (fee payer) - the first account in the static account keys
+                                                        let signer = match tx.message.static_account_keys().first() {
+                                                            Some(pubkey) => pubkey.to_string(),
+                                                            None => {
+                                                                TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                                                continue;
+                                                            }
+                                                        };
+                                                        
+                                                        (signature, signer)
                                                     }
                                                 };
 
-                                                // Process based on transaction version
-                                                match decoded_tx {
-                                                    solana_sdk::transaction::Transaction { message, .. } => {
-                                                        // Get the signer (fee payer)
-                                                        let signer = message.account_keys.get(0).map(|pk| pk.to_string()).unwrap_or_default();
-                                                        if signer.is_empty() {
-                                                            warn!(slot, %signature, "Transaction missing signer (account_keys[0])?");
-                                                            continue;
-                                                        }
+                                                let block_time = block.block_time.unwrap_or_else(|| chrono::Utc::now().timestamp());
+                                                
+                                                debug!(%signature, %signer, slot, "Processing transaction");
 
-                                                        let block_time = block.block_time.unwrap_or_else(|| chrono::Utc::now().timestamp());
-                                                        
-                                                        debug!(%signature, %signer, slot, "Processing transaction");
+                                                if let Some(evaluator) = evaluator.clone() {
+                                                    // Construct Eval Data
+                                                    let eval_data = serde_json::json!({
+                                                        "event_type": "solana_transaction",
+                                                        "signature": signature,
+                                                        "slot": slot,
+                                                        "block_time": block_time,
+                                                        "signer": signer,
+                                                        "logs": logs,
+                                                    });
 
-                                                        if let Some(evaluator) = evaluator.clone() {
-                                                            // Construct Eval Data
-                                                            let eval_data = serde_json::json!({
-                                                                "event_type": "solana_transaction",
-                                                                "signature": signature,
-                                                                "slot": slot,
-                                                                "block_time": block_time,
-                                                                "signer": signer,
-                                                                "logs": logs,
-                                                            });
-
-                                                            // Evaluate Opportunity
-                                                            debug!(data = ?eval_data, "Evaluating potential opportunity...");
-                                                            match evaluator.evaluate_opportunity(eval_data).await {
-                                                                Ok(opportunities) => {
-                                                                    if !opportunities.is_empty() {
-                                                                        info!(count = opportunities.len(), %signature, "Found potential MEV opportunities");
-                                                                        for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
-                                                                            match evaluator.process_mev_opportunity(&mut opportunity).await {
-                                                                                Ok(Some(exec_sig)) => {
-                                                                                    info!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
-                                                                                },
-                                                                                Ok(None) => {
-                                                                                    info!(idx = idx, strategy = ?opportunity.strategy, decision = ?opportunity.decision, "Decided not to execute MEV opportunity");
-                                                                                },
-                                                                                Err(e) => {
-                                                                                    error!(idx = idx, strategy = ?opportunity.strategy, error = %e, "Error executing MEV opportunity");
-                                                                                }
-                                                                            }
+                                                    // Evaluate Opportunity
+                                                    debug!(data = ?eval_data, "Evaluating potential opportunity...");
+                                                    match evaluator.evaluate_opportunity(eval_data).await {
+                                                        Ok(opportunities) => {
+                                                            if !opportunities.is_empty() {
+                                                                info!(count = opportunities.len(), %signature, "Found potential MEV opportunities");
+                                                                for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
+                                                                    match evaluator.process_mev_opportunity(&mut opportunity).await {
+                                                                        Ok(Some(exec_sig)) => {
+                                                                            info!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
+                                                                        },
+                                                                        Ok(None) => {
+                                                                            info!(idx = idx, strategy = ?opportunity.strategy, decision = ?opportunity.decision, "Decided not to execute MEV opportunity");
+                                                                        },
+                                                                        Err(e) => {
+                                                                            error!(idx = idx, strategy = ?opportunity.strategy, error = %e, "Error executing MEV opportunity");
                                                                         }
-                                                                    } 
+                                                                    }
                                                                 }
-                                                                Err(e) => {
-                                                                    error!(%signature, error = %e, "Error evaluating opportunity");
-                                                                }
-                                                            }
-                                                        } else {
-                                                            warn!("No evaluator set for ListenBot, cannot evaluate transaction.");
+                                                            } 
+                                                        }
+                                                        Err(e) => {
+                                                            error!(%signature, error = %e, "Error evaluating opportunity");
                                                         }
                                                     }
+                                                } else {
+                                                    warn!("No evaluator set for ListenBot, cannot evaluate transaction.");
                                                 }
                                             }
                                         } else {
