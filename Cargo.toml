@@ -78,6 +78,10 @@ sandoracle-types = { path = "./sandoracle-types" }
 
 uuid = { version = "1.12.1", features = ["serde", "v4"] }
 
+# Added from the code block
+async-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 pretty_assertions = "1.4"

@@ -34,6 +34,9 @@ use base64::prelude::*; // Use base64 prelude for BASE64_STANDARD
 use base64::Engine; // Import Engine trait for decode method
 use std::time::Duration; // Add this for retry delay
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::listen_bot::stream::{TransactionStream, StreamConfig};
+use crate::listen_bot::transaction::{TransactionMonitor, DexTransactionParser};
+use crate::listen_bot::dex::JupiterParser;
 
 mod config;
 mod types;
@@ -195,6 +198,20 @@ impl ListenBot {
     /// Starts the ListenBot's main loop using listen-core
     pub async fn start(self) -> Result<()> {
         info!("Starting ListenBot (listen-core based)...");
+
+        // --- Start new TransactionStream for DEX log streaming ---
+        let stream_config = StreamConfig::default(); // You may want to build from settings
+        let monitor = TransactionMonitor::default(); // Or build from config
+        let parsers: Vec<Arc<dyn DexTransactionParser>> = vec![
+            Arc::new(JupiterParser),
+        ];
+        let (transaction_stream, _rx) = TransactionStream::new(stream_config, monitor, parsers);
+        tokio::spawn(async move {
+            if let Err(e) = transaction_stream.start().await {
+                error!("TransactionStream failed: {:?}", e);
+            }
+        });
+        // --- End TransactionStream integration ---
 
         // Define which DEXes to monitor (example)
         let dexes_to_monitor = vec![DexName::Jupiter, DexName::Raydium, DexName::Orca];

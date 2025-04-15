@@ -6,9 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use async_trait::async_trait;
-use solana_sdk::{
-    transaction::Transaction,
-};
+use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status::UiTransactionStatusMeta;
 use std::fmt::Debug;
 use tracing::{debug};
@@ -174,7 +172,7 @@ pub trait DexTransactionParser: Send + Sync + std::fmt::Debug {
 
 #[derive(Debug, Clone)]
 pub struct TransactionInfo {
-    pub transaction: Transaction,
+    pub transaction: VersionedTransaction,
     pub meta: Option<UiTransactionStatusMeta>,
     pub signature: String,
     pub program_id: String,

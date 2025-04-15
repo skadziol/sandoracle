@@ -35,7 +35,7 @@ impl RateLimitedLogger {
             .as_millis() as u64;
         
         let last = self.last_logged.load(Ordering::Relaxed);
-        if now - last > self.interval_ms {
+        if now.saturating_sub(last) > self.interval_ms {
             self.last_logged.store(now, Ordering::Relaxed);
             true
         } else {
