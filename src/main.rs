@@ -17,7 +17,7 @@ use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds, MevOpportunity
 use crate::executor::{TransactionExecutor, ExecutionService};
 use crate::rig_agent::RigAgent;
 use crate::market_data::{MarketDataCollector, MarketData};
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use dotenv::dotenv;
 use tokio::signal;
 use std::sync::Arc;
@@ -171,6 +171,58 @@ async fn main() -> SandoResult<()> {
     
     // Set the evaluator on the ListenBot - this establishes the data flow from listen-bot to evaluator
     listen_bot.set_evaluator(evaluator_arc.clone());
+
+    // Define token mints for monitoring
+    let token_mints = std::collections::HashMap::from([
+        ("SOL", "So11111111111111111111111111111111111111112"),  // SOL
+        ("USDC", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), // USDC
+        ("ETH", "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"),  // ETH (Wormhole)
+        ("BTC", "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"),  // BTC (Wormhole)
+        ("BONK", "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"), // BONK
+        ("JUP", "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"),   // JUP
+    ]);
+
+    // Configure ListenBot filtering based on token mints from market data
+    let token_mint_list: Vec<String> = token_mints.iter()
+        .map(|(_, mint)| mint.to_string())
+        .collect();
+    
+    // Prepare program IDs to monitor
+    let program_ids_to_monitor = vec![
+        // Jupiter v4 and v6
+        "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
+        "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB".to_string(),
+        // Orca
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string(), // Whirlpools
+        "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP".to_string(), // v2
+        // Raydium
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(), // SwapV2
+        "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(), // CLMM
+    ];
+    
+    // Set minimum transaction value based on risk level
+    let min_tx_value = match settings.risk_level {
+        crate::config::RiskLevel::Low => 5_000_000,    // 5 SOL in lamports for low risk
+        crate::config::RiskLevel::Medium => 1_000_000, // 1 SOL in lamports for medium risk
+        crate::config::RiskLevel::High => 500_000,     // 0.5 SOL in lamports for high risk
+    };
+    
+    // Configure the block filter
+    listen_bot.configure_block_filter(
+        Some(program_ids_to_monitor),
+        Some(token_mint_list),
+        Some(min_tx_value),
+        Some(1), // At least 1 transaction per block
+    );
+    
+    // If in debug mode, run block filter calibration
+    if std::env::var("RUST_LOG").map(|v| v.to_lowercase().contains("debug")).unwrap_or(false) {
+        info!("Running block filter calibration for optimized filtering...");
+        match listen_bot.calibrate_block_filter().await {
+            Ok(_) => info!("Block filter calibration complete"),
+            Err(e) => warn!(error = %e, "Block filter calibration failed, using default settings"),
+        }
+    }
 
     // Log detailed information about the initialized components
     info!(

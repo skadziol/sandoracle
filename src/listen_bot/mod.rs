@@ -25,12 +25,19 @@ use solana_transaction_status::{
     EncodedTransaction,  // Needed for matching on transaction type
     TransactionDetails,
     UiConfirmedBlock,
+    UiMessage,  // Add this import for pattern matching on message types
+    UiParsedMessage,  // Add this for accessing the parsed message fields
+    UiInstruction,    // Add this for working with instruction types
+    UiParsedInstruction, // Add UiParsedInstruction for proper pattern matching
 };
+use solana_transaction_status::parse_accounts::ParsedAccount;  // Import from correct module
 use solana_sdk::transaction::VersionedTransaction;
 use tokio::task; // Import for spawn_blocking
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _}; // Add Engine trait
 use std::time::Duration; // Add this for retry delay
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashSet;
+use serde_json::Value; // Add Value for JSON handling
 
 mod config;
 mod types;
@@ -40,6 +47,128 @@ mod stream;
 
 pub use config::ListenBotConfig;
 pub use transaction::TransactionEvent;
+
+/// Block filtering to reduce unnecessary processing
+#[derive(Debug, Clone)]
+pub struct BlockFilter {
+    /// Minimum number of transactions to consider processing a block
+    pub min_transactions: usize,
+    /// Program IDs to monitor
+    pub monitored_program_ids: HashSet<String>,
+    /// Token mints to monitor
+    pub monitored_token_mints: HashSet<String>,
+    /// DEXes to monitor
+    pub monitored_dexes: HashSet<String>,
+    /// Minimum transaction value in lamports
+    pub min_transaction_value: u64,
+}
+
+impl Default for BlockFilter {
+    fn default() -> Self {
+        // Default Jupiter program ID
+        let jupiter_v4 = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string();
+        let jupiter_v6 = "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB".to_string();
+        
+        // Default Orca Whirlpools program ID
+        let orca_whirlpools = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string();
+        
+        // Default Raydium program IDs
+        let raydium_swap = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string();
+        let raydium_clmm = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string();
+        
+        // Common tokens
+        let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
+        let sol = "So11111111111111111111111111111111111111112".to_string();
+        let msol = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So".to_string();
+        let bonk = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".to_string();
+        
+        let mut program_ids = HashSet::new();
+        program_ids.insert(jupiter_v4);
+        program_ids.insert(jupiter_v6);
+        program_ids.insert(orca_whirlpools);
+        program_ids.insert(raydium_swap);
+        program_ids.insert(raydium_clmm);
+        
+        let mut token_mints = HashSet::new();
+        token_mints.insert(usdc);
+        token_mints.insert(sol);
+        token_mints.insert(msol);
+        token_mints.insert(bonk);
+        
+        let mut dexes = HashSet::new();
+        dexes.insert("Jupiter".to_string());
+        dexes.insert("Orca".to_string());
+        dexes.insert("Raydium".to_string());
+        
+        Self {
+            min_transactions: 1,
+            monitored_program_ids: program_ids,
+            monitored_token_mints: token_mints,
+            monitored_dexes: dexes,
+            min_transaction_value: 1_000_000, // 1 SOL in lamports
+        }
+    }
+}
+
+impl BlockFilter {
+    /// Creates a new BlockFilter with custom configuration
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Add a program ID to monitor
+    pub fn add_program_id(&mut self, program_id: impl Into<String>) {
+        self.monitored_program_ids.insert(program_id.into());
+    }
+    
+    /// Add a token mint to monitor
+    pub fn add_token_mint(&mut self, token_mint: impl Into<String>) {
+        self.monitored_token_mints.insert(token_mint.into());
+    }
+    
+    /// Add a DEX to monitor
+    pub fn add_dex(&mut self, dex: impl Into<String>) {
+        self.monitored_dexes.insert(dex.into());
+    }
+    
+    /// Set minimum number of transactions to consider processing a block
+    pub fn with_min_transactions(mut self, min_transactions: usize) -> Self {
+        self.min_transactions = min_transactions;
+        self
+    }
+    
+    /// Set minimum transaction value in lamports
+    pub fn with_min_transaction_value(mut self, min_value: u64) -> Self {
+        self.min_transaction_value = min_value;
+        self
+    }
+    
+    /// Check if a block should be processed based on preliminary transaction count
+    pub fn should_process_block(&self, transaction_count: usize) -> bool {
+        transaction_count >= self.min_transactions
+    }
+    
+    /// Check if a transaction should be processed based on its program IDs and accounts
+    pub fn should_process_transaction(&self, program_ids: &[String], account_keys: &[String]) -> bool {
+        // Skip if no program IDs match our monitored list
+        let has_monitored_program = program_ids.iter()
+            .any(|id| self.monitored_program_ids.contains(id));
+            
+        if !has_monitored_program {
+            return false;
+        }
+        
+        // Skip if no account keys match our monitored token mints
+        let has_monitored_token = account_keys.iter()
+            .any(|key| self.monitored_token_mints.contains(key));
+            
+        if !has_monitored_token {
+            return false;
+        }
+        
+        true
+    }
+}
 
 /// Commands for controlling the ListenBot
 #[derive(Debug)]
@@ -61,6 +190,8 @@ pub struct ListenBot {
     cmd_rx: mpsc::Receiver<ListenBotCommand>,
     /// Opportunity evaluator for MEV detection
     evaluator: Option<Arc<OpportunityEvaluator>>,
+    /// Block filtering settings
+    block_filter: BlockFilter,
 }
 
 impl ListenBot {
@@ -82,8 +213,32 @@ impl ListenBot {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<ListenBotCommand>(1);
         let (internal_event_tx, _internal_event_rx) = mpsc::channel::<TransactionEvent>(1000);
+        
+        // Create a customized block filter based on settings
+        let block_filter = {
+            let mut filter = BlockFilter::default();
+            
+            // If risk level is set to low, increase the minimum transaction value
+            if let crate::config::RiskLevel::Low = settings.risk_level {
+                filter.min_transaction_value = 5_000_000; // 5 SOL in lamports for low risk
+            }
+            
+            // Medium risk level uses the default
+            
+            // If risk level is high, lower minimum transaction value
+            if let crate::config::RiskLevel::High = settings.risk_level {
+                filter.min_transaction_value = 500_000; // 0.5 SOL in lamports for high risk
+            }
+            
+            // Configure based on other settings if needed
+            if settings.min_profit_threshold > 100.0 {
+                filter.min_transactions = 3; // Only process blocks with 3+ transactions
+            }
+            
+            filter
+        };
 
-        info!("ListenBot (listen-core based) initialized successfully.");
+        info!("ListenBot (listen-core based) initialized successfully with block filtering.");
         Ok((
             Self {
                 core_engine: core_engine_arc,
@@ -92,6 +247,7 @@ impl ListenBot {
                 event_tx: internal_event_tx,
                 cmd_rx,
                 evaluator: None,
+                block_filter,
             },
             cmd_tx,
         ))
@@ -194,6 +350,9 @@ impl ListenBot {
         
         // Capture the RPC URL from config for logging in the async block
         let rpc_url = self.core_config.rpc_url.clone();
+        
+        // Clone the block filter for use in the async block
+        let block_filter = self.block_filter.clone();
 
         let event_processor_handle = tokio::spawn(async move {
             info!("ListenBot event processor started...");
@@ -229,6 +388,13 @@ impl ListenBot {
             };
 
             let mut slot_stream = slot_stream;
+            
+            // Track statistics for block filtering
+            let mut total_blocks_seen: u64 = 0;
+            let mut blocks_processed: u64 = 0;
+            let mut transactions_seen: u64 = 0;
+            let mut transactions_processed: u64 = 0;
+            let mut last_stats_time = std::time::Instant::now();
 
             loop {
                 tokio::select! {
@@ -246,6 +412,7 @@ impl ListenBot {
                         match maybe_slot {
                             Some(slot) => {
                                 debug!(slot, "Received slot, fetching block...");
+                                total_blocks_seen += 1;
                                 
                                 // Use the retry-enabled block fetching method
                                 match Self::fetch_block_with_retry(
@@ -257,7 +424,17 @@ impl ListenBot {
                                 ).await {
                                     Ok(Some(block)) => {
                                         if let Some(transactions) = block.transactions {
-                                            debug!(slot, num_txs = transactions.len(), "Successfully fetched block with {} transaction signatures", transactions.len());
+                                            let tx_count = transactions.len();
+                                            transactions_seen += tx_count as u64;
+                                            
+                                            // Apply early block filtering
+                                            if !block_filter.should_process_block(tx_count) {
+                                                debug!(slot, "Block has insufficient transactions ({}) to process", tx_count);
+                                                continue;
+                                            }
+                                            
+                                            debug!(slot, num_txs = tx_count, "Successfully fetched block with {} transaction signatures", tx_count);
+                                            blocks_processed += 1;
                                             
                                             // --- Process only transactions with signatures --- 
                                             for (tx_idx, tx_with_meta) in transactions.into_iter().enumerate() {
@@ -265,6 +442,76 @@ impl ListenBot {
                                                 if tx_with_meta.meta.is_none() {
                                                     continue;
                                                 }
+                                                
+                                                // Get transaction account keys for filtering
+                                                let account_keys: Vec<String> = match &tx_with_meta.transaction {
+                                                    EncodedTransaction::Json(json_tx) => {
+                                                        // Access account_keys through the message field by pattern matching
+                                                        match &json_tx.message {
+                                                            UiMessage::Parsed(parsed_msg) => {
+                                                                // Convert ParsedAccount to String using pubkey field
+                                                                parsed_msg.account_keys.iter()
+                                                                    .map(|account| account.pubkey.clone())
+                                                                    .collect()
+                                                            },
+                                                            UiMessage::Raw(_) => Vec::new(),
+                                                        }
+                                                    },
+                                                    _ => Vec::new(),
+                                                };
+                                                
+                                                // Get program IDs for filtering (from instructions)
+                                                let program_ids: Vec<String> = match &tx_with_meta.transaction {
+                                                    EncodedTransaction::Json(json_tx) => {
+                                                        // Extract program IDs from instructions by pattern matching on message first
+                                                        match &json_tx.message {
+                                                            UiMessage::Parsed(parsed_msg) => {
+                                                                parsed_msg.instructions.iter()
+                                                                    .filter_map(|ix| {
+                                                                        match ix {
+                                                                            UiInstruction::Compiled(compiled_ix) => {
+                                                                                // program_id_index is a u8, not an Option
+                                                                                let program_idx = compiled_ix.program_id_index;
+                                                                                if let UiMessage::Parsed(ref parsed_msg) = json_tx.message {
+                                                                                    if program_idx < parsed_msg.account_keys.len() as u8 {
+                                                                                        let program_id = parsed_msg.account_keys[program_idx as usize].pubkey.clone();
+                                                                                        Some(program_id)
+                                                                                    } else {
+                                                                                        None
+                                                                                    }
+                                                                                } else {
+                                                                                    None
+                                                                                }
+                                                                            },
+                                                                            UiInstruction::Parsed(parsed_ix) => {
+                                                                                // Extract program_id based on the variant
+                                                                                match parsed_ix {
+                                                                                    UiParsedInstruction::Parsed(parsed) => {
+                                                                                        // For fully parsed instructions, program_id is in the program field
+                                                                                        Some(parsed.program_id.clone())
+                                                                                    },
+                                                                                    UiParsedInstruction::PartiallyDecoded(partial) => {
+                                                                                        // For partially decoded instructions, program_id is available directly
+                                                                                        Some(partial.program_id.to_string())
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    })
+                                                                    .collect()
+                                                            },
+                                                            UiMessage::Raw(_) => Vec::new(),
+                                                        }
+                                                    },
+                                                    _ => Vec::new(),
+                                                };
+                                                
+                                                // Apply transaction filtering
+                                                if !block_filter.should_process_transaction(&program_ids, &account_keys) {
+                                                    continue;
+                                                }
+                                                
+                                                transactions_processed += 1;
                                                 
                                                 // We're only supporting JSON transactions for now
                                                 // This is safe because we're using TransactionDetails::Signatures
@@ -288,6 +535,22 @@ impl ListenBot {
                                                         Err(_) => continue,
                                                     };
                                                     
+                                                    // Calculate transaction value if possible
+                                                    let transaction_value = tx_with_meta.meta.as_ref()
+                                                        .and_then(|meta_data| meta_data.pre_balances.get(0))
+                                                        .and_then(|pre| {
+                                                            tx_with_meta.meta.as_ref()
+                                                                .and_then(|meta_data| meta_data.post_balances.get(0))
+                                                                .map(|post| pre.saturating_sub(*post))
+                                                        })
+                                                        .unwrap_or(0);
+                                                    
+                                                    // Filter by transaction value
+                                                    if transaction_value < block_filter.min_transaction_value {
+                                                        debug!(tx_idx = tx_idx, %signature, value = transaction_value, "Skipping low-value transaction");
+                                                        continue;
+                                                    }
+                                                    
                                                     debug!(tx_idx = tx_idx, %signature, slot, "Processing transaction signature");
                                                     
                                                     // --- Pass to Evaluator --- 
@@ -300,6 +563,9 @@ impl ListenBot {
                                                             "signature": signature.to_string(),
                                                             "slot": slot,
                                                             "tx_idx": tx_idx,
+                                                            "value": transaction_value,
+                                                            "program_ids": program_ids,
+                                                            "account_keys": account_keys,
                                                         });
 
                                                         debug!(data = ?eval_data, "Evaluating transaction signature");
@@ -330,13 +596,26 @@ impl ListenBot {
                                                         warn!("No evaluator set for ListenBot, cannot evaluate transaction.");
                                                     }
                                                 }
-                                                
-                                                // Note: The original code for parsing full transaction bytes is now bypassed
-                                                // as we're using the signature-based approach. If you need full transaction
-                                                // details, you would fetch them via get_transaction after initial filtering.
                                             }
                                         } else {
                                             debug!(slot, "Block has no transactions");
+                                        }
+                                        
+                                        // Log filter stats periodically
+                                        let now = std::time::Instant::now();
+                                        if now.duration_since(last_stats_time).as_secs() >= 60 {
+                                            info!(
+                                                blocks_seen = total_blocks_seen,
+                                                blocks_processed = blocks_processed,
+                                                blocks_filtered = (total_blocks_seen - blocks_processed),
+                                                blocks_efficiency = format!("{:.2}%", (blocks_processed as f64 / total_blocks_seen as f64) * 100.0),
+                                                transactions_seen = transactions_seen,
+                                                transactions_processed = transactions_processed,
+                                                transactions_filtered = (transactions_seen - transactions_processed),
+                                                tx_efficiency = format!("{:.2}%", (transactions_processed as f64 / transactions_seen.max(1) as f64) * 100.0),
+                                                "Block filter efficiency statistics"
+                                            );
+                                            last_stats_time = now;
                                         }
                                     }
                                     Ok(None) => {
@@ -438,6 +717,224 @@ impl ListenBot {
                 "No evaluator set on ListenBot".to_string()
             ));
         }
+        
+        Ok(())
+    }
+
+    /// Configure block filtering with custom settings
+    pub fn configure_block_filter(&mut self, 
+        program_ids: Option<Vec<String>>,
+        token_mints: Option<Vec<String>>,
+        min_value: Option<u64>,
+        min_transactions: Option<usize>
+    ) {
+        let mut updated = false;
+        
+        if let Some(program_ids) = program_ids {
+            info!("Updating monitored program IDs, new count: {}", program_ids.len());
+            self.block_filter.monitored_program_ids = program_ids.into_iter().collect();
+            updated = true;
+        }
+        
+        if let Some(token_mints) = token_mints {
+            info!("Updating monitored token mints, new count: {}", token_mints.len());
+            self.block_filter.monitored_token_mints = token_mints.into_iter().collect();
+            updated = true;
+        }
+        
+        if let Some(min_value) = min_value {
+            info!("Updating minimum transaction value: {}", min_value);
+            self.block_filter.min_transaction_value = min_value;
+            updated = true;
+        }
+        
+        if let Some(min_transactions) = min_transactions {
+            info!("Updating minimum transactions per block: {}", min_transactions);
+            self.block_filter.min_transactions = min_transactions;
+            updated = true;
+        }
+        
+        if updated {
+            info!("Block filter configuration updated");
+        }
+    }
+    
+    /// Add specific program IDs to monitor
+    pub fn add_monitored_program_ids(&mut self, program_ids: Vec<String>) {
+        let count_before = self.block_filter.monitored_program_ids.len();
+        for id in program_ids {
+            self.block_filter.monitored_program_ids.insert(id);
+        }
+        let count_after = self.block_filter.monitored_program_ids.len();
+        info!("Added {} new program IDs to monitoring list", count_after - count_before);
+    }
+    
+    /// Add specific token mints to monitor
+    pub fn add_monitored_token_mints(&mut self, token_mints: Vec<String>) {
+        let count_before = self.block_filter.monitored_token_mints.len();
+        for mint in token_mints {
+            self.block_filter.monitored_token_mints.insert(mint);
+        }
+        let count_after = self.block_filter.monitored_token_mints.len();
+        info!("Added {} new token mints to monitoring list", count_after - count_before);
+    }
+    
+    /// Run a test to determine optimal filtering settings based on current blockchain activity
+    pub async fn calibrate_block_filter(&mut self) -> Result<()> {
+        info!("Calibrating block filter based on recent blockchain activity...");
+        
+        // Get RPC client
+        let rpc_client = self.core_engine.rpc_client();
+        
+        // Get recent blocks to analyze
+        let recent_blocks_config = RpcBlockConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            transaction_details: Some(solana_transaction_status::TransactionDetails::Signatures),
+            rewards: Some(false),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+        
+        // Get latest slot and analyze recent blocks
+        let latest_blockhash = match rpc_client.get_latest_blockhash() {
+            Ok(blockhash) => blockhash,
+            Err(e) => {
+                return Err(SandoError::SolanaRpc(format!("Failed to get latest blockhash: {}", e)));
+            }
+        };
+        
+        // Get slot for the latest blockhash
+        let slot = match rpc_client.get_slot() {
+            Ok(slot) => slot,
+            Err(e) => {
+                return Err(SandoError::SolanaRpc(format!("Failed to get current slot: {}", e)));
+            }
+        };
+        
+        // Create a sample of slots to analyze (current and a few earlier ones)
+        let mut recent_slots = vec![slot];
+        for i in 1..10 {
+            if slot > i {
+                recent_slots.push(slot - i);
+            }
+        }
+        
+        let mut transaction_sizes = Vec::new();
+        let mut program_id_counts = HashMap::new();
+        let mut token_mint_counts = HashMap::new();
+        
+        // Analyze blocks
+        info!("Analyzing {} recent blocks for filter calibration", recent_slots.len());
+        
+        for slot in recent_slots.iter().take(10) { // Limit to 10 blocks for calibration
+            if let Ok(Some(block)) = Self::fetch_block_with_retry(
+                rpc_client.clone(),
+                *slot,
+                recent_blocks_config.clone(),
+                3,
+                500,
+            ).await {
+                if let Some(transactions) = block.transactions {
+                    for tx in transactions {
+                        if let EncodedTransaction::Json(json_tx) = &tx.transaction {
+                            // Collect program IDs
+                            if let UiMessage::Parsed(parsed_msg) = &json_tx.message {
+                                for ix in &parsed_msg.instructions {
+                                    match ix {
+                                        UiInstruction::Compiled(compiled_ix) => {
+                                            // program_id_index is a u8, not an Option
+                                            let program_idx = compiled_ix.program_id_index;
+                                            if program_idx < parsed_msg.account_keys.len() as u8 {
+                                                let program_id = parsed_msg.account_keys[program_idx as usize].pubkey.clone();
+                                                *program_id_counts.entry(program_id).or_insert(0) += 1;
+                                            }
+                                        },
+                                        UiInstruction::Parsed(parsed_ix) => {
+                                            // Extract program_id based on the variant
+                                            match parsed_ix {
+                                                UiParsedInstruction::Parsed(parsed) => {
+                                                    // For fully parsed instructions, program_id is in the program field
+                                                    *program_id_counts.entry(parsed.program_id.clone()).or_insert(0) += 1;
+                                                },
+                                                UiParsedInstruction::PartiallyDecoded(partial) => {
+                                                    // For partially decoded instructions, program_id is available directly
+                                                    *program_id_counts.entry(partial.program_id.to_string()).or_insert(0) += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Collect top account keys (might be tokens)
+                            if let UiMessage::Parsed(parsed_msg) = &json_tx.message {
+                                for account in &parsed_msg.account_keys {
+                                    let key = account.pubkey.clone();
+                                    *token_mint_counts.entry(key).or_insert(0) += 1;
+                                }
+                            }
+                            
+                            // Collect transaction sizes
+                            if let Some(meta) = &tx.meta {
+                                if let (Some(pre), Some(post)) = (meta.pre_balances.get(0), meta.post_balances.get(0)) {
+                                    let value = pre.saturating_sub(*post);
+                                    if value > 0 {
+                                        transaction_sizes.push(value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Determine optimal filter values
+        if !transaction_sizes.is_empty() {
+            transaction_sizes.sort();
+            let median_size = transaction_sizes[transaction_sizes.len() / 2];
+            let p25_size = transaction_sizes[transaction_sizes.len() / 4];
+            
+            info!("Transaction size analysis: median={}, p25={}", median_size, p25_size);
+            
+            // Set min transaction value to 25th percentile to capture most relevant transactions
+            self.block_filter.min_transaction_value = p25_size;
+        }
+        
+        // Find top program IDs
+        let mut program_ids: Vec<_> = program_id_counts.into_iter().collect();
+        program_ids.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        // Find top token mints
+        let mut token_mints: Vec<_> = token_mint_counts.into_iter().collect();
+        token_mints.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        // Add top program IDs
+        let top_programs: Vec<_> = program_ids.iter()
+            .take(10) // Top 10 program IDs
+            .map(|(id, count)| format!("{} (count: {})", id, count))
+            .collect();
+            
+        // Add top token mints
+        let top_tokens: Vec<_> = token_mints.iter()
+            .take(10) // Top 10 token mints
+            .map(|(id, count)| format!("{} (count: {})", id, count))
+            .collect();
+        
+        info!("Calibration complete. Top programs: {:?}", top_programs);
+        info!("Calibration complete. Top tokens: {:?}", top_tokens);
+        
+        // Optionally add the top program IDs and token mints to the filter
+        // This is commented out to let the user decide whether to use these results
+        /*
+        if !program_ids.is_empty() {
+            self.add_monitored_program_ids(program_ids.iter().take(10).map(|(id, _)| id.clone()).collect());
+        }
+        
+        if !token_mints.is_empty() {
+            self.add_monitored_token_mints(token_mints.iter().take(10).map(|(id, _)| id.clone()).collect());
+        }
+        */
         
         Ok(())
     }
