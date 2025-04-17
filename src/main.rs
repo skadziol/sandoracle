@@ -25,6 +25,9 @@ use std::collections::HashMap;
 use crate::config::RiskLevel as ConfigRiskLevel;
 use crate::evaluator::RiskLevel as EvalRiskLevel;
 use crate::monitoring::OPPORTUNITY_LOGGER;
+use crate::evaluator::arbitrage::ArbitrageEvaluator;
+use crate::evaluator::sandwich::SandwichEvaluator;
+use crate::evaluator::token_snipe::TokenSnipeEvaluator;
 
 // Add this struct definition for HealthCheckService
 pub struct HealthCheckService {
@@ -156,6 +159,21 @@ async fn main() -> SandoResult<()> {
     )
     .await
     .map_err(|e| SandoError::DependencyError(format!("Failed to create OpportunityEvaluator: {}", e)))?;
+    
+    // Register strategy evaluators
+    info!("Registering strategy evaluators...");
+    
+    // Register ArbitrageEvaluator
+    let arbitrage_evaluator = ArbitrageEvaluator::new();
+    evaluator.register_evaluator(Box::new(arbitrage_evaluator));
+    
+    // Register SandwichEvaluator
+    let sandwich_evaluator = SandwichEvaluator::new();
+    evaluator.register_evaluator(Box::new(sandwich_evaluator));
+    
+    // Register TokenSnipeEvaluator
+    let token_snipe_evaluator = TokenSnipeEvaluator::new();
+    evaluator.register_evaluator(Box::new(token_snipe_evaluator));
     
     // Set the execution service on the evaluator
     evaluator.set_strategy_executor(execution_service_arc.clone()).await;
