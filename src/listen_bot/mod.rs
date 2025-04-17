@@ -39,6 +39,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashSet;
 use serde_json::Value; // Add Value for JSON handling
 
+// Set to true to relax filtering criteria for debugging (more transactions will pass)
+const DEBUG_RELAX_FILTERS: bool = false;
+
 mod config;
 mod types;
 mod dex;
@@ -150,11 +153,22 @@ impl BlockFilter {
     
     /// Check if a transaction should be processed based on its program IDs and accounts
     pub fn should_process_transaction(&self, program_ids: &[String], account_keys: &[String]) -> bool {
+        // If DEBUG_RELAX_FILTERS is true, we'll skip the filtering for debugging
+        if DEBUG_RELAX_FILTERS {
+            debug!("DEBUG_RELAX_FILTERS enabled: bypassing normal filter criteria");
+            return true;
+        }
+        
         // Skip if no program IDs match our monitored list
         let has_monitored_program = program_ids.iter()
             .any(|id| self.monitored_program_ids.contains(id));
             
         if !has_monitored_program {
+            debug!(
+                program_ids_count = program_ids.len(),
+                monitored_programs_count = self.monitored_program_ids.len(),
+                "Transaction filtered: no monitored program IDs found"
+            );
             return false;
         }
         
@@ -163,9 +177,15 @@ impl BlockFilter {
             .any(|key| self.monitored_token_mints.contains(key));
             
         if !has_monitored_token {
+            debug!(
+                account_keys_count = account_keys.len(),
+                monitored_tokens_count = self.monitored_token_mints.len(),
+                "Transaction filtered: no monitored token mints found"
+            );
             return false;
         }
         
+        debug!("Transaction passed filter: has monitored program and token mint");
         true
     }
 }
@@ -338,8 +358,30 @@ impl ListenBot {
     pub async fn start(self) -> Result<()> {
         info!("Starting ListenBot (listen-core based)...");
 
+        // Print diagnostic information about the filter settings
+        info!(
+            min_transactions = self.block_filter.min_transactions,
+            min_transaction_value = self.block_filter.min_transaction_value,
+            monitored_programs = self.block_filter.monitored_program_ids.len(),
+            monitored_tokens = self.block_filter.monitored_token_mints.len(),
+            "ListenBot filter settings"
+        );
+        
+        // Log whether DEBUG_RELAX_FILTERS is enabled
+        if DEBUG_RELAX_FILTERS {
+            warn!("DEBUG_RELAX_FILTERS is enabled - normal filtering criteria are bypassed!");
+        }
+
+        // Check if evaluator is set
+        if self.evaluator.is_some() {
+            info!("Opportunity evaluator is properly connected");
+        } else {
+            warn!("No opportunity evaluator set - transactions will be filtered but not evaluated");
+        }
+
         // Define which DEXes to monitor (example)
         let dexes_to_monitor = vec![DexName::Jupiter, DexName::Raydium, DexName::Orca];
+        info!("Monitoring DEXes: {:?}", dexes_to_monitor);
 
         // Get the evaluator if it exists
         let evaluator = self.evaluator.clone();
@@ -380,8 +422,8 @@ impl ListenBot {
             let rpc_client = core_engine.rpc_client();
 
             let block_config = RpcBlockConfig {
-                encoding: Some(UiTransactionEncoding::Base64),
-                transaction_details: Some(solana_transaction_status::TransactionDetails::Signatures),
+                encoding: Some(UiTransactionEncoding::Json),
+                transaction_details: Some(solana_transaction_status::TransactionDetails::Full),
                 rewards: Some(false),
                 commitment: Some(CommitmentConfig::confirmed()),
                 max_supported_transaction_version: Some(0),
@@ -423,9 +465,63 @@ impl ListenBot {
                                     500, // Increase initial delay from 100 to 500ms
                                 ).await {
                                     Ok(Some(block)) => {
+                                        // Add diagnostic logging for block structure
+                                        debug!(
+                                            slot,
+                                            block_has_transactions = block.transactions.is_some(),
+                                            transactions_len = block.transactions.as_ref().map(|txs| txs.len()).unwrap_or(0),
+                                            block_hash = %block.blockhash,
+                                            parent_slot = block.parent_slot,
+                                            "Block structure overview"
+                                        );
+                                        
                                         if let Some(transactions) = block.transactions {
                                             let tx_count = transactions.len();
                                             transactions_seen += tx_count as u64;
+                                            
+                                            // Add diagnostic logging for the first transaction if available
+                                            if tx_count > 0 {
+                                                if let Some(first_tx) = transactions.get(0) {
+                                                    // Log raw transaction structure to investigate the format
+                                                    debug!(
+                                                        ?first_tx, // Log the entire transaction structure 
+                                                        "Raw transaction structure for debugging"
+                                                    );
+                                                    
+                                                    debug!(
+                                                        slot,
+                                                        tx_idx = 0,
+                                                        tx_has_meta = first_tx.meta.is_some(),
+                                                        tx_type = match &first_tx.transaction {
+                                                            EncodedTransaction::Json(json_tx) => {
+                                                                // Log raw JSON transaction structure
+                                                                debug!(?json_tx, "JSON transaction structure");
+                                                                "Json"
+                                                            },
+                                                            EncodedTransaction::Binary(_, _) => "Binary",
+                                                            EncodedTransaction::LegacyBinary(_) => "LegacyBinary",
+                                                            EncodedTransaction::Accounts(_) => "Accounts",
+                                                        },
+                                                        "First transaction structure"
+                                                    );
+                                                    
+                                                    // Log more details if it's a JSON transaction
+                                                    if let EncodedTransaction::Json(json_tx) = &first_tx.transaction {
+                                                        let message_type = match &json_tx.message {
+                                                            UiMessage::Parsed(_) => "Parsed",
+                                                            UiMessage::Raw(_) => "Raw",
+                                                        };
+                                                        
+                                                        debug!(
+                                                            slot,
+                                                            tx_idx = 0,
+                                                            message_type,
+                                                            signature_count = json_tx.signatures.len(),
+                                                            "First transaction JSON details"
+                                                        );
+                                                    }
+                                                }
+                                            }
                                             
                                             // Apply early block filtering
                                             if !block_filter.should_process_block(tx_count) {
@@ -446,16 +542,42 @@ impl ListenBot {
                                                 // Get transaction account keys for filtering
                                                 let account_keys: Vec<String> = match &tx_with_meta.transaction {
                                                     EncodedTransaction::Json(json_tx) => {
+                                                        // Log the JSON message to investigate
+                                                        if tx_idx < 2 { // Only log first two transactions to avoid spam
+                                                            debug!(?json_tx.message, "JSON message structure");
+                                                        }
+                                                        
                                                         // Access account_keys through the message field by pattern matching
                                                         match &json_tx.message {
                                                             UiMessage::Parsed(parsed_msg) => {
+                                                                // Log parsed message structure for debugging
+                                                                if tx_idx < 2 {
+                                                                    debug!(?parsed_msg.account_keys, "Parsed message account_keys");
+                                                                }
+                                                                
                                                                 // Convert ParsedAccount to String using pubkey field
                                                                 parsed_msg.account_keys.iter()
                                                                     .map(|account| account.pubkey.clone())
                                                                     .collect()
                                                             },
-                                                            UiMessage::Raw(_) => Vec::new(),
+                                                            UiMessage::Raw(raw_msg) => {
+                                                                // Log raw message structure for debugging
+                                                                if tx_idx < 2 {
+                                                                    debug!(?raw_msg, "Raw message structure");
+                                                                    debug!(keys_len = raw_msg.account_keys.len(), "Raw message account_keys");
+                                                                }
+                                                                
+                                                                // Raw message account_keys is already a Vec<String>, just clone it
+                                                                raw_msg.account_keys.clone()
+                                                            },
                                                         }
+                                                    },
+                                                    EncodedTransaction::Binary(_, _) => {
+                                                        // Log that we got a binary transaction despite requesting JSON
+                                                        if tx_idx < 2 {
+                                                            debug!("Received Binary transaction despite requesting JSON encoding");
+                                                        }
+                                                        Vec::new()
                                                     },
                                                     _ => Vec::new(),
                                                 };
@@ -466,6 +588,11 @@ impl ListenBot {
                                                         // Extract program IDs from instructions by pattern matching on message first
                                                         match &json_tx.message {
                                                             UiMessage::Parsed(parsed_msg) => {
+                                                                // Log instructions for first two transactions for debugging
+                                                                if tx_idx < 2 {
+                                                                    debug!(?parsed_msg.instructions, "Parsed message instructions");
+                                                                }
+                                                                
                                                                 parsed_msg.instructions.iter()
                                                                     .filter_map(|ix| {
                                                                         match ix {
@@ -500,14 +627,56 @@ impl ListenBot {
                                                                     })
                                                                     .collect()
                                                             },
-                                                            UiMessage::Raw(_) => Vec::new(),
+                                                            UiMessage::Raw(raw_msg) => {
+                                                                // Log raw message instructions for first two transactions
+                                                                if tx_idx < 2 {
+                                                                    debug!(?raw_msg.instructions, "Raw message instructions");
+                                                                }
+                                                                
+                                                                // Extract program IDs from raw instructions
+                                                                raw_msg.instructions.iter()
+                                                                    .filter_map(|ix| {
+                                                                        let program_idx = ix.program_id_index;
+                                                                        if program_idx < raw_msg.account_keys.len() as u8 {
+                                                                            Some(raw_msg.account_keys[program_idx as usize].clone())
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    })
+                                                                    .collect()
+                                                            },
                                                         }
                                                     },
                                                     _ => Vec::new(),
                                                 };
                                                 
                                                 // Apply transaction filtering
+                                                debug!(
+                                                    tx_idx = tx_idx,
+                                                    slot = slot,
+                                                    program_ids_count = program_ids.len(),
+                                                    account_keys_count = account_keys.len(),
+                                                    "Transaction filter check starting"
+                                                );
+                                                
+                                                let has_monitored_program = program_ids.iter()
+                                                    .any(|id| block_filter.monitored_program_ids.contains(id));
+                                                
+                                                let has_monitored_token = account_keys.iter()
+                                                    .any(|key| block_filter.monitored_token_mints.contains(key));
+                                                
+                                                debug!(
+                                                    tx_idx = tx_idx,
+                                                    has_monitored_program = has_monitored_program,
+                                                    has_monitored_token = has_monitored_token,
+                                                    "Transaction filter check results"
+                                                );
+                                                
                                                 if !block_filter.should_process_transaction(&program_ids, &account_keys) {
+                                                    debug!(
+                                                        tx_idx = tx_idx,
+                                                        "Transaction filtered: did not pass should_process_transaction check"
+                                                    );
                                                     continue;
                                                 }
                                                 
@@ -546,12 +715,20 @@ impl ListenBot {
                                                         .unwrap_or(0);
                                                     
                                                     // Filter by transaction value
+                                                    debug!(
+                                                        tx_idx = tx_idx,
+                                                        %signature,
+                                                        value = transaction_value,
+                                                        min_value = block_filter.min_transaction_value,
+                                                        "Transaction value check"
+                                                    );
+                                                    
                                                     if transaction_value < block_filter.min_transaction_value {
                                                         debug!(tx_idx = tx_idx, %signature, value = transaction_value, "Skipping low-value transaction");
                                                         continue;
                                                     }
                                                     
-                                                    debug!(tx_idx = tx_idx, %signature, slot, "Processing transaction signature");
+                                                    info!(tx_idx = tx_idx, %signature, slot, "Processing transaction signature");
                                                     
                                                     // --- Pass to Evaluator --- 
                                                     if let Some(evaluator) = evaluator.clone() {
@@ -568,12 +745,25 @@ impl ListenBot {
                                                             "account_keys": account_keys,
                                                         });
 
-                                                        debug!(data = ?eval_data, "Evaluating transaction signature");
+                                                        info!(data = ?eval_data, "Sending transaction to evaluator");
                                                         match evaluator.evaluate_opportunity(eval_data).await {
                                                             Ok(opportunities) => {
+                                                                info!(
+                                                                    count = opportunities.len(),
+                                                                    %signature, 
+                                                                    "Evaluator response: found {} potential opportunities",
+                                                                    opportunities.len()
+                                                                );
+                                                                
                                                                 if !opportunities.is_empty() {
                                                                     info!(count = opportunities.len(), %signature, "Found potential MEV opportunities");
                                                                     for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
+                                                                        info!(
+                                                                            idx = idx,
+                                                                            strategy = ?opportunity.strategy,
+                                                                            estimated_profit = opportunity.estimated_profit,
+                                                                            "Processing opportunity"
+                                                                        );
                                                                         match evaluator.process_mev_opportunity(&mut opportunity).await {
                                                                             Ok(Some(exec_sig)) => {
                                                                                 info!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
@@ -586,6 +776,8 @@ impl ListenBot {
                                                                             }
                                                                         }
                                                                     }
+                                                                } else {
+                                                                    debug!(%signature, "Evaluator found no opportunities in transaction");
                                                                 }
                                                             }
                                                             Err(e) => {
@@ -732,12 +924,36 @@ impl ListenBot {
         
         if let Some(program_ids) = program_ids {
             info!("Updating monitored program IDs, new count: {}", program_ids.len());
+            
+            // Log the specific program IDs we're monitoring (truncated for readability)
+            if !program_ids.is_empty() {
+                let program_display = program_ids.iter()
+                    .take(5)
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let extra = if program_ids.len() > 5 { format!(" and {} more", program_ids.len() - 5) } else { "".to_string() };
+                info!("Monitoring programs: {}{}", program_display, extra);
+            }
+            
             self.block_filter.monitored_program_ids = program_ids.into_iter().collect();
             updated = true;
         }
         
         if let Some(token_mints) = token_mints {
             info!("Updating monitored token mints, new count: {}", token_mints.len());
+            
+            // Log the specific token mints we're monitoring (truncated for readability)
+            if !token_mints.is_empty() {
+                let token_display = token_mints.iter()
+                    .take(5)
+                    .map(|mint| mint.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let extra = if token_mints.len() > 5 { format!(" and {} more", token_mints.len() - 5) } else { "".to_string() };
+                info!("Monitoring tokens: {}{}", token_display, extra);
+            }
+            
             self.block_filter.monitored_token_mints = token_mints.into_iter().collect();
             updated = true;
         }
@@ -788,7 +1004,7 @@ impl ListenBot {
         
         // Get recent blocks to analyze
         let recent_blocks_config = RpcBlockConfig {
-            encoding: Some(UiTransactionEncoding::Base64),
+            encoding: Some(UiTransactionEncoding::Json),
             transaction_details: Some(solana_transaction_status::TransactionDetails::Signatures),
             rewards: Some(false),
             commitment: Some(CommitmentConfig::confirmed()),
