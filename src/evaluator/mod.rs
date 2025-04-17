@@ -10,10 +10,12 @@ pub mod token_snipe;
 
 use crate::config::Settings;
 use crate::error::{Result as SandoResult, SandoError};
+use crate::config::RiskLevel as ConfigRiskLevel;
+use crate::rig_agent::{RigAgent, RawOpportunityData, MarketContext};
+use anyhow::{Result, Error, Context, anyhow};
 
 // Removed unused: pub use arbitrage::{ArbitrageConfig, ArbitrageEvaluator, ArbitrageMetadata};
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,8 +25,7 @@ use tracing::{debug, error, info, warn, trace};
 use crate::config; // Import config module to access config::RiskLevel
 use std::time::{SystemTime, UNIX_EPOCH};
 use chrono;
-use anyhow;
-use crate::monitoring::OPPORTUNITY_LOGGER;
+use crate::monitoring::{OPPORTUNITY_LOGGER, OPPORTUNITY_RATE_LOGGER};
 
 /// Represents different types of MEV strategies
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -701,6 +702,8 @@ pub struct OpportunityEvaluator {
     execution_thresholds: ExecutionThresholds,
     /// Strategy executor
     strategy_executor: RwLock<Option<Arc<dyn StrategyExecutionService>>>,
+    /// RIG Agent for AI-powered decision enhancement
+    rig_agent: Option<Arc<RigAgent>>,
 }
 
 /// This trait defines the interface for strategy execution services
@@ -747,6 +750,7 @@ impl OpportunityEvaluator {
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
             execution_thresholds,
             strategy_executor: RwLock::new(None), // Initialize executor as None
+            rig_agent: None,
         };
 
         info!("OpportunityEvaluator initialized successfully.");
@@ -848,7 +852,7 @@ impl OpportunityEvaluator {
 
     /// Evaluates incoming data for MEV opportunities across all registered strategies
     pub async fn evaluate_opportunity(&self, data: serde_json::Value) -> Result<Vec<MevOpportunity>> {
-        let should_log_detailed = OPPORTUNITY_LOGGER.should_log() || 
+        let should_log_detailed = OPPORTUNITY_RATE_LOGGER.should_log() || 
             std::env::var("DETAILED_LOGGING").map(|v| v == "true").unwrap_or(false);
             
         if should_log_detailed {
@@ -933,7 +937,7 @@ impl OpportunityEvaluator {
         let mut weighted_score = 0.0;
         
         // Only log detailed scoring calculation if detailed logging enabled
-        let should_log_detailed = OPPORTUNITY_LOGGER.should_log() || 
+        let should_log_detailed = OPPORTUNITY_RATE_LOGGER.should_log() || 
             std::env::var("DETAILED_LOGGING").map(|v| v == "true").unwrap_or(false);
             
         for factor in &scoring_factors {
@@ -1198,6 +1202,109 @@ impl OpportunityEvaluator {
             None
         }
         */
+    }
+
+    /// Add RIG Agent for AI-powered decision enhancement
+    pub fn with_rig_agent(mut self, rig_agent: Arc<RigAgent>) -> Self {
+        self.rig_agent = Some(rig_agent);
+        self
+    }
+    
+    /// Sets the RIG agent for AI-enhanced decision making
+    pub async fn set_rig_agent(&mut self, agent: Arc<RigAgent>) {
+        self.rig_agent = Some(agent);
+    }
+    
+    /// Enhances opportunity evaluation with AI insights from RIG Agent
+    pub async fn enhance_with_ai(&self, opportunity: &mut MevOpportunity) -> Result<()> {
+        // Skip if no RIG agent is set
+        let Some(rig_agent) = &self.rig_agent else {
+            debug!("No RIG Agent available for opportunity enhancement");
+            return Ok(());
+        };
+        
+        debug!(strategy = ?opportunity.strategy, "Enhancing opportunity evaluation with RIG Agent");
+        
+        // Create raw opportunity data from MevOpportunity
+        let raw_opportunity = RawOpportunityData {
+            source_dex: "Unknown".to_string(), // Could be improved by adding DEX info to MevOpportunity
+            transaction_hash: opportunity.metadata.get("signature")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tx_hash")
+                .to_string(),
+            input_token: opportunity.involved_tokens.first()
+                .cloned()
+                .unwrap_or_else(|| "UNKNOWN".to_string()),
+            output_token: opportunity.involved_tokens.get(1)
+                .cloned()
+                .unwrap_or_else(|| "UNKNOWN".to_string()),
+            input_amount: opportunity.required_capital,
+            output_amount: opportunity.required_capital + opportunity.estimated_profit,
+        };
+        
+        // Get market context data - could be further enhanced by using real market data
+        let market_context = MarketContext {
+            input_token_price_usd: 1.0, // Placeholder - should use real price data
+            output_token_price_usd: 1.0, // Placeholder
+            pool_liquidity_usd: 1_000_000.0, // Placeholder
+            recent_volatility_percent: 5.0, // Placeholder
+        };
+        
+        // Get AI evaluation using RIG Agent
+        let ai_evaluation = match rig_agent.evaluate_opportunity(&raw_opportunity, &market_context).await {
+            Ok(eval) => eval,
+            Err(e) => {
+                warn!(error = ?e, "Failed to get AI evaluation from RIG Agent, using rule-based fallback");
+                // Fallback to rule-based evaluation if AI fails
+                rig_agent.evaluate_opportunity_rule_based(&raw_opportunity, &market_context)?
+            }
+        };
+        
+        // Enhance opportunity with AI insights
+        let ai_confidence = ai_evaluation.confidence_score;
+        
+        // Average existing confidence with AI confidence, giving AI higher weight
+        let combined_confidence = (opportunity.confidence * 0.3) + (ai_confidence * 0.7);
+        opportunity.confidence = combined_confidence;
+        
+        // Update estimated profit if AI has a different view
+        if (ai_evaluation.estimated_profit_usd - opportunity.estimated_profit).abs() > 1.0 {
+            // If significant difference, choose more conservative estimate
+            opportunity.estimated_profit = opportunity.estimated_profit.min(ai_evaluation.estimated_profit_usd);
+            debug!(
+                ai_profit = ai_evaluation.estimated_profit_usd,
+                original_profit = opportunity.estimated_profit,
+                final_profit = opportunity.estimated_profit,
+                "Adjusted profit estimate based on AI insights"
+            );
+        }
+        
+        // Add AI reasoning to metadata
+        let mut metadata = opportunity.metadata.clone();
+        
+        // Clone the string values before moving them
+        let ai_reasoning = ai_evaluation.reasoning.clone();
+        let ai_suggestion = ai_evaluation.suggested_action.clone();
+        
+        metadata.as_object_mut().map(|m| {
+            m.insert("ai_reasoning".into(), serde_json::Value::String(ai_reasoning));
+            m.insert("ai_suggestion".into(), serde_json::Value::String(ai_suggestion));
+            let ai_conf_value = match serde_json::Number::from_f64(ai_confidence) {
+                Some(num) => serde_json::Value::Number(num),
+                None => serde_json::Value::Null,
+            };
+            m.insert("ai_confidence".into(), ai_conf_value);
+        });
+        opportunity.metadata = metadata;
+        
+        debug!(
+            ai_confidence = ai_confidence,
+            combined_confidence = combined_confidence,
+            ai_suggested_action = %ai_evaluation.suggested_action,
+            "Enhanced opportunity with AI insights"
+        );
+        
+        Ok(())
     }
 }
 
@@ -1499,6 +1606,7 @@ mod tests {
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
             execution_thresholds: ExecutionThresholds::default(),
             strategy_executor: RwLock::new(None), // Initialize executor as None
+            rig_agent: None,
         }
     }
 

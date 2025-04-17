@@ -10,6 +10,7 @@ use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status::UiTransactionStatusMeta;
 use std::fmt::Debug;
 use tracing::{debug};
+use serde::Serialize;
 
 /// Represents a DEX transaction with relevant MEV information
 #[derive(Debug, Clone)]
@@ -56,7 +57,7 @@ impl TokenAmount {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TransactionEvent {
     pub signature: Signature,
     pub program_id: Pubkey,

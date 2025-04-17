@@ -22,10 +22,8 @@ use solana_client::rpc_config::{RpcBlockConfig, RpcTransactionConfig};
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_transaction_status::{
     UiTransactionEncoding,
-    TransactionBinaryEncoding,
-    EncodedTransaction,
+    EncodedTransaction,  // Needed for matching on transaction type
     TransactionDetails,
-    option_serializer::OptionSerializer,
     UiConfirmedBlock,
 };
 use solana_sdk::transaction::VersionedTransaction;
@@ -33,9 +31,6 @@ use tokio::task; // Import for spawn_blocking
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _}; // Add Engine trait
 use std::time::Duration; // Add this for retry delay
 use std::sync::atomic::{AtomicU64, Ordering};
-use crate::listen_bot::stream::{TransactionStream, StreamConfig};
-use crate::listen_bot::transaction::{TransactionMonitor, DexTransactionParser};
-use crate::listen_bot::dex::JupiterParser;
 
 mod config;
 mod types;
@@ -66,17 +61,6 @@ pub struct ListenBot {
     cmd_rx: mpsc::Receiver<ListenBotCommand>,
     /// Opportunity evaluator for MEV detection
     evaluator: Option<Arc<OpportunityEvaluator>>,
-}
-
-// Add these static counters 
-static TX_DESERIALIZATION_ERRORS: AtomicU64 = AtomicU64::new(0);
-static TX_DECODE_ERRORS: AtomicU64 = AtomicU64::new(0);
-static LAST_ERROR_LOG_TIME: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug)]
-enum DecodedTransaction {
-    Legacy(solana_sdk::transaction::Transaction),
-    Versioned(solana_sdk::transaction::VersionedTransaction)
 }
 
 impl ListenBot {
@@ -198,20 +182,6 @@ impl ListenBot {
     pub async fn start(self) -> Result<()> {
         info!("Starting ListenBot (listen-core based)...");
 
-        // --- Start new TransactionStream for DEX log streaming ---
-        let stream_config = StreamConfig::default(); // You may want to build from settings
-        let monitor = TransactionMonitor::default(); // Or build from config
-        let parsers: Vec<Arc<dyn DexTransactionParser>> = vec![
-            Arc::new(JupiterParser),
-        ];
-        let (transaction_stream, _rx) = TransactionStream::new(stream_config, monitor, parsers);
-        tokio::spawn(async move {
-            if let Err(e) = transaction_stream.start().await {
-                error!("TransactionStream failed: {:?}", e);
-            }
-        });
-        // --- End TransactionStream integration ---
-
         // Define which DEXes to monitor (example)
         let dexes_to_monitor = vec![DexName::Jupiter, DexName::Raydium, DexName::Orca];
 
@@ -221,6 +191,9 @@ impl ListenBot {
 
         // Move core_engine into the async block
         let core_engine = Arc::clone(&self.core_engine);
+        
+        // Capture the RPC URL from config for logging in the async block
+        let rpc_url = self.core_config.rpc_url.clone();
 
         let event_processor_handle = tokio::spawn(async move {
             info!("ListenBot event processor started...");
@@ -234,12 +207,22 @@ impl ListenBot {
                 }
             };
 
+            // Log the RPC URL being used (safely without showing full URL)
+            let safe_rpc_url = rpc_url.replace("https://", "").replace("http://", "");
+            let safe_rpc_parts: Vec<&str> = safe_rpc_url.split('.').collect();
+            let masked_url = if safe_rpc_parts.len() > 1 {
+                format!("{}.***.{}", safe_rpc_parts[0], safe_rpc_parts.last().unwrap_or(&""))
+            } else {
+                "RPC URL".to_string()
+            };
+            info!("Using Solana RPC: {}", masked_url);
+
             // Get the RPC client from the core engine
             let rpc_client = core_engine.rpc_client();
 
             let block_config = RpcBlockConfig {
                 encoding: Some(UiTransactionEncoding::Base64),
-                transaction_details: Some(solana_transaction_status::TransactionDetails::Full),
+                transaction_details: Some(solana_transaction_status::TransactionDetails::Signatures),
                 rewards: Some(false),
                 commitment: Some(CommitmentConfig::confirmed()),
                 max_supported_transaction_version: Some(0),
@@ -269,156 +252,57 @@ impl ListenBot {
                                     rpc_client.clone(), // rpc_client is already an Arc<RpcClient>
                                     slot, 
                                     block_config.clone(),
-                                    3, // Max 3 retries
-                                    100, // Start with 100ms delay
+                                    5, // Increase from 3 to 5 retries
+                                    500, // Increase initial delay from 100 to 500ms
                                 ).await {
                                     Ok(Some(block)) => {
                                         if let Some(transactions) = block.transactions {
-                                            debug!(slot, num_txs = transactions.len(), "Successfully fetched block");
+                                            debug!(slot, num_txs = transactions.len(), "Successfully fetched block with {} transaction signatures", transactions.len());
                                             
-                                            // --- Iterate & Process Transactions --- 
-                                            for tx_with_meta in transactions {
-                                                // Filter out failed transactions
-                                                if let Some(ref _meta) = tx_with_meta.meta {
-                                                    // We'll check transaction success another way
-                                                    // The err field format changed in newer Solana versions
-                                                } else {
+                                            // --- Process only transactions with signatures --- 
+                                            for (tx_idx, tx_with_meta) in transactions.into_iter().enumerate() {
+                                                // Skip transactions without meta
+                                                if tx_with_meta.meta.is_none() {
                                                     continue;
                                                 }
-
-                                                // Get logs early to avoid move issues
-                                                let logs = tx_with_meta.meta
-                                                    .as_ref()
-                                                    .and_then(|m| match &m.log_messages {
-                                                        OptionSerializer::Some(logs) => Some(logs.clone()),
-                                                        _ => None,
-                                                    })
-                                                    .unwrap_or_default();
-
-                                                // --- Decode Transaction --- 
-                                                let maybe_decoded_bytes: Option<Vec<u8>> = match &tx_with_meta.transaction {
-                                                    EncodedTransaction::Json(_) => {
-                                                        TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                                        None // Skip JSON encoded, difficult to get raw bytes
-                                                    },
-                                                    EncodedTransaction::Binary(data, encoding) => {
-                                                        match encoding {
-                                                            TransactionBinaryEncoding::Base58 => bs58::decode(data).into_vec().ok(),
-                                                            TransactionBinaryEncoding::Base64 => BASE64_STANDARD.decode(data).ok(),
-                                                        }
-                                                    },
-                                                    EncodedTransaction::LegacyBinary(data) => {
-                                                        // Legacy binary is base-58 encoded
-                                                        bs58::decode(data).into_vec().ok()
-                                                    },
-                                                    EncodedTransaction::Accounts(_) => {
-                                                        TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                                        None // Skip Accounts encoded
-                                                    }
-                                                };
                                                 
-                                                // --- Deserialize Transaction --- 
-                                                let decoded_tx_result: Option<DecodedTransaction> = if let Some(bytes_vec) = maybe_decoded_bytes {
-                                                    // Try versioned transaction first (more common in newer blocks)
-                                                    if let Ok(versioned_tx) = bincode::deserialize::<solana_sdk::transaction::VersionedTransaction>(&bytes_vec) {
-                                                        Some(DecodedTransaction::Versioned(versioned_tx))
-                                                    } 
-                                                    // Fall back to legacy format
-                                                    else if let Ok(legacy_tx) = bincode::deserialize::<solana_sdk::transaction::Transaction>(&bytes_vec) {
-                                                        Some(DecodedTransaction::Legacy(legacy_tx))
-                                                    } else {
-                                                        // --- Handle Deserialization Error --- 
-                                                        let error_count = TX_DESERIALIZATION_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                                        let now = std::time::SystemTime::now()
-                                                            .duration_since(std::time::UNIX_EPOCH)
-                                                            .unwrap_or_default()
-                                                            .as_secs();
-                                                        let last_log_time = LAST_ERROR_LOG_TIME.load(Ordering::Relaxed);
-                                                        if now > last_log_time + 60 || error_count % 100 == 0 {
-                                                            LAST_ERROR_LOG_TIME.store(now, Ordering::Relaxed);
-                                                            warn!(
-                                                                slot, 
-                                                                deserialization_errors = error_count,
-                                                                decode_errors = TX_DECODE_ERRORS.load(Ordering::Relaxed),
-                                                                "Transaction processing errors summary"
-                                                            );
-                                                        }
-                                                        None // Indicate deserialization failure
-                                                    }
+                                                // We're only supporting JSON transactions for now
+                                                // This is safe because we're using TransactionDetails::Signatures
+                                                // which should encode transactions in JSON format
+                                                let signature_str = if let EncodedTransaction::Json(json_tx) = &tx_with_meta.transaction {
+                                                    json_tx.signatures.get(0).cloned()
                                                 } else {
-                                                     // --- Handle Decode Error --- 
-                                                     TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed); // Already counted, but good place to indicate None reason
-                                                     None // Indicate decoding failure
+                                                    // Log other encoding types that we encounter
+                                                    debug!(
+                                                        tx_idx = tx_idx, 
+                                                        slot,
+                                                        encoding = ?tx_with_meta.transaction, 
+                                                        "Unsupported transaction encoding"
+                                                    );
+                                                    None
                                                 };
                                                 
-                                                // --- Process Successfully Decoded Transaction --- 
-                                                if let Some(decoded_tx) = decoded_tx_result {
-                                                    // Process based on transaction version
-                                                    let (signature, signer) = match &decoded_tx { // Borrow decoded_tx here
-                                                        DecodedTransaction::Legacy(tx) => {
-                                                            // Get signature from decoded transaction
-                                                            let signature = match tx.signatures.first() {
-                                                                Some(sig) => sig.to_string(),
-                                                                None => {
-                                                                    TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                                                    continue; // Skip to next tx_with_meta
-                                                                }
-                                                            };
-
-                                                            // Get the signer (fee payer)
-                                                            let signer = match tx.message.account_keys.get(0) {
-                                                                Some(pubkey) => pubkey.to_string(),
-                                                                None => {
-                                                                    TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                                                    continue; // Skip to next tx_with_meta
-                                                                }
-                                                            };
-
-                                                            (signature, signer)
-                                                        },
-                                                        DecodedTransaction::Versioned(tx) => {
-                                                            // Get signature from versioned transaction
-                                                            let signature = match tx.signatures.first() {
-                                                                Some(sig) => sig.to_string(),
-                                                                None => {
-                                                                    TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                                                    continue; // Skip to next tx_with_meta
-                                                                }
-                                                            };
-
-                                                            // Get the signer (fee payer) - the first account in the static account keys
-                                                            let signer = match tx.message.static_account_keys().first() {
-                                                                Some(pubkey) => pubkey.to_string(),
-                                                                None => {
-                                                                    TX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                                                                    continue; // Skip to next tx_with_meta
-                                                                }
-                                                            };
-                                                            
-                                                            (signature, signer)
-                                                        }
+                                                if let Some(sig_str) = signature_str {
+                                                    let signature = match Signature::from_str(&sig_str) {
+                                                        Ok(sig) => sig,
+                                                        Err(_) => continue,
                                                     };
-
-                                                    let block_time = block.block_time.unwrap_or_else(|| chrono::Utc::now().timestamp());
                                                     
-                                                    debug!(%signature, %signer, slot, "Processing transaction");
-
+                                                    debug!(tx_idx = tx_idx, %signature, slot, "Processing transaction signature");
+                                                    
                                                     // --- Pass to Evaluator --- 
                                                     if let Some(evaluator) = evaluator.clone() {
-                                                         // Construct Eval Data (example - needs refinement based on evaluator needs)
+                                                        // Use signatures for initial filtering - a simpler version
+                                                        // In a production system, you might fetch full transaction
+                                                        // details only for promising candidates
                                                         let eval_data = serde_json::json!({ 
-                                                            "event_type": "solana_transaction",
-                                                            "signature": signature,
+                                                            "event_type": "solana_transaction_signature",
+                                                            "signature": signature.to_string(),
                                                             "slot": slot,
-                                                            "block_time": block_time,
-                                                            "signer": signer,
-                                                            "logs": logs, 
-                                                            // TODO: Add parsed swap details if available from a parser run
-                                                            // This is where the data flow needs connection!
+                                                            "tx_idx": tx_idx,
                                                         });
 
-                                                        // Evaluate Opportunity
-                                                        debug!(data = ?eval_data, "Evaluating potential opportunity...");
+                                                        debug!(data = ?eval_data, "Evaluating transaction signature");
                                                         match evaluator.evaluate_opportunity(eval_data).await {
                                                             Ok(opportunities) => {
                                                                 if !opportunities.is_empty() {
@@ -436,7 +320,7 @@ impl ListenBot {
                                                                             }
                                                                         }
                                                                     }
-                                                                } 
+                                                                }
                                                             }
                                                             Err(e) => {
                                                                 error!(%signature, error = %e, "Error evaluating opportunity");
@@ -446,7 +330,10 @@ impl ListenBot {
                                                         warn!("No evaluator set for ListenBot, cannot evaluate transaction.");
                                                     }
                                                 }
-                                                // Else: Transaction decode or deserialize failed, already logged/counted
+                                                
+                                                // Note: The original code for parsing full transaction bytes is now bypassed
+                                                // as we're using the signature-based approach. If you need full transaction
+                                                // details, you would fetch them via get_transaction after initial filtering.
                                             }
                                         } else {
                                             debug!(slot, "Block has no transactions");
@@ -487,6 +374,71 @@ impl ListenBot {
         // The self.cmd_rx is moved into the task.
         // Maybe return the cmd_tx from from_settings and use it in main.rs?
         warn!("ListenBot::stop needs refactoring to correctly signal the processing loop.");
+        Ok(())
+    }
+
+    /// Send a transaction event to the SandoEngine for processing through the full data flow
+    pub async fn send_to_engine(&self, event: TransactionEvent) -> Result<()> {
+        debug!(event_signature = ?event.signature, "Sending transaction event to SandoEngine");
+        
+        // First check if we have an evaluator set (required for data flow)
+        if let Some(evaluator) = &self.evaluator {
+            // Create JSON representation of event for evaluation
+            let event_json = match serde_json::to_value(&event) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!(error = %e, "Failed to serialize event to JSON");
+                    return Err(SandoError::DataProcessing(
+                        format!("Failed to serialize event: {}", e)
+                    ));
+                }
+            };
+            
+            // Send to the evaluator which is our primary data flow path
+            match evaluator.evaluate_opportunity(event_json).await {
+                Ok(opportunities) => {
+                    if !opportunities.is_empty() {
+                        debug!(
+                            opportunity_count = opportunities.len(),
+                            "Found opportunities from transaction event"
+                        );
+                        
+                        // Process the first opportunity if available
+                        // In a complete implementation this would likely happen in the engine
+                        if let Some(mut opportunity) = opportunities.into_iter().next() {
+                            match evaluator.process_mev_opportunity(&mut opportunity).await {
+                                Ok(Some(signature)) => {
+                                    info!(
+                                        tx_signature = %signature,
+                                        strategy = ?opportunity.strategy,
+                                        estimated_profit = opportunity.estimated_profit,
+                                        "Successfully executed opportunity"
+                                    );
+                                }
+                                Ok(None) => {
+                                    debug!("Opportunity evaluation completed but no execution performed");
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to process opportunity");
+                                }
+                            }
+                        }
+                    } else {
+                        debug!("No opportunities found from transaction event");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to evaluate opportunity");
+                    return Err(SandoError::from(e));
+                }
+            }
+        } else {
+            warn!("Cannot process event - no evaluator set on ListenBot");
+            return Err(SandoError::DataProcessing(
+                "No evaluator set on ListenBot".to_string()
+            ));
+        }
+        
         Ok(())
     }
 }

@@ -9,6 +9,19 @@ use solana_sdk::transaction::VersionedTransaction;
 // use bincode;
 use reqwest;
 
+/// Information about a Solana token from Jupiter's API
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TokenInfo {
+    pub address: String,
+    pub chainId: i64,
+    pub decimals: i32,
+    pub name: String,
+    pub symbol: String,
+    pub logoURI: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub coingeckoId: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)] // Added Clone
 pub struct PlatformFee {
     pub amount: String,
@@ -139,9 +152,44 @@ struct AccountMeta {
 }
 
 // Make Jupiter struct public
+#[derive(Clone)]
 pub struct Jupiter;
 
 impl Jupiter {
+    /// Create a new Jupiter API client
+    pub fn new(api_url: &str) -> Self {
+        // For now, ignoring the api_url param since we're using hardcoded URLs
+        // In a future version, we could use this to configure the API endpoints
+        Jupiter {}
+    }
+
+    /// Get price of token in terms of reference token
+    pub async fn get_price(&self, token_mint: &str, reference_mint: &str) -> Result<f64> {
+        // Use a standard amount for quote (1 token with 9 decimals = 1_000_000_000)
+        let amount = 1_000_000_000;
+        
+        // Fetch the quote from Jupiter API
+        let quote = Self::fetch_quote(token_mint, reference_mint, amount).await?;
+        
+        // Calculate price from the quote
+        let in_amount = quote.in_amount.parse::<f64>().map_err(|e| 
+            anyhow!("Failed to parse input amount '{}': {}", quote.in_amount, e))?;
+        let out_amount = quote.out_amount.parse::<f64>().map_err(|e| 
+            anyhow!("Failed to parse output amount '{}': {}", quote.out_amount, e))?;
+        
+        // Price is output amount / input amount
+        let price = out_amount / in_amount;
+        
+        Ok(price)
+    }
+    
+    // Public method to get token list from Jupiter
+    pub async fn get_token_list() -> Result<Vec<TokenInfo>> {
+        let url = "https://token.jup.ag/all";
+        let response = reqwest::get(url).await?.json::<Vec<TokenInfo>>().await?;
+        Ok(response)
+    }
+
     // Make fetch_quote public
     pub async fn fetch_quote(
         input_mint: &str,

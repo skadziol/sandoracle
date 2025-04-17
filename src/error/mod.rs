@@ -40,6 +40,8 @@ pub enum SandoError {
         message: String,
     },
     
+    DataProcessing(String),
+    
     Io(std::io::Error),
     Serialization(serde_json::Error),
     HttpClient(reqwest::Error),
@@ -147,6 +149,7 @@ impl fmt::Display for SandoError {
             SandoError::EngineError(msg) => write!(f, "Engine error: {}", msg),
             SandoError::Simulation(msg) => write!(f, "Simulation error: {}", msg),
             SandoError::DependencyError(msg) => write!(f, "Dependency error: {}", msg),
+            SandoError::DataProcessing(msg) => write!(f, "Data processing error: {}", msg),
         }
     }
 }
@@ -377,6 +380,7 @@ impl std::error::Error for SandoError {
             SandoError::InternalError(_) => None,
             SandoError::EngineError(_) => None,
             SandoError::DependencyError(_) => None,
+            SandoError::DataProcessing(_) => None,
         }
     }
 }
