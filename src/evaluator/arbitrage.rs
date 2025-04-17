@@ -71,7 +71,7 @@ impl ArbitrageEvaluator {
     fn extract_token_pairs(&self, data: &Value) -> Option<(String, String)> {
         // Extract transaction logs and look for token transfers
         if let Some(transaction) = data.get("transaction") {
-            if let Some(logs) = transaction.get("logs") {
+            if let Some(_logs) = transaction.get("logs") {
                 // Look for token transfers in logs
                 trace!(target: "arbitrage_evaluator", "Analyzing logs for token transfers");
                 
@@ -186,7 +186,7 @@ impl MevStrategyEvaluator for ArbitrageEvaluator {
         }
     }
     
-    async fn validate(&self, opportunity: &MevOpportunity) -> Result<bool> {
+    async fn validate(&self, _opportunity: &MevOpportunity) -> Result<bool> {
         // In a real implementation, you would re-check prices to ensure the opportunity still exists
         // For demo purposes, let's simulate a 90% validity rate
         Ok(rand::random::<f64>() < 0.9)

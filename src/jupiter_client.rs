@@ -1,15 +1,13 @@
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
-use base64::prelude::BASE64_STANDARD;
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::VersionedTransaction;
 // Add bincode use statement if not already present transitively
 // use bincode;
-// Add reqwest use statement
-// use reqwest;
+use reqwest;
 
 #[derive(Serialize, Deserialize, Debug, Clone)] // Added Clone
 pub struct PlatformFee {

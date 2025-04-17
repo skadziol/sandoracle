@@ -2,15 +2,30 @@ use crate::listen_bot::transaction::{DexTransaction, DexTransactionParser, Trans
 use crate::listen_bot::dex::DexType;
 use anyhow::Result;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn, debug};
 use tokio_tungstenite::connect_async;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde_json::json;
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
+use tokio::sync::mpsc;
+use solana_transaction_status::{
+    EncodedTransaction, 
+    UiTransactionEncoding, 
+    TransactionDetails,
+    UiConfirmedBlock 
+};
+use solana_client::rpc_config::RpcBlockConfig;
+use solana_sdk::transaction::VersionedTransaction;
+use tokio::task;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use bs58;
+use tracing::trace;
+use crate::error::SandoError;
 
 /// Configuration for the transaction stream
 #[derive(Debug, Clone)]
@@ -42,10 +57,9 @@ impl Default for StreamConfig {
 /// Handles streaming and processing of transactions
 pub struct TransactionStream {
     config: StreamConfig,
-    monitor: Arc<TransactionMonitor>,
+    monitor: TransactionMonitor,
     parsers: Vec<Arc<dyn DexTransactionParser>>,
-    rpc_client: Arc<RpcClient>,
-    tx_sender: broadcast::Sender<DexTransaction>,
+    tx_sender: mpsc::Sender<DexTransaction>,
 }
 
 impl TransactionStream {
@@ -54,202 +68,202 @@ impl TransactionStream {
         config: StreamConfig,
         monitor: TransactionMonitor,
         parsers: Vec<Arc<dyn DexTransactionParser>>,
-    ) -> (Self, broadcast::Receiver<DexTransaction>) {
-        let (tx_sender, tx_receiver) = broadcast::channel(1000);
-        let rpc_client = Arc::new(RpcClient::new(config.rpc_url.clone()));
-
+    ) -> (Self, mpsc::Receiver<DexTransaction>) {
+        let (tx_sender, rx_receiver) = mpsc::channel(1000);
         (
             Self {
                 config,
-                monitor: Arc::new(monitor),
+                monitor,
                 parsers,
-                rpc_client,
                 tx_sender,
             },
-            tx_receiver,
+            rx_receiver,
         )
     }
 
     /// Start processing the transaction stream
-    pub async fn start(&self) -> Result<()> {
+    pub async fn start(self) -> Result<()> {
         info!("Starting transaction stream...");
         
-        loop {
-            match self.process_stream().await {
-                Ok(_) => {
-                    warn!("Transaction stream ended, reconnecting...");
-                }
-                Err(e) => {
-                    error!("Error processing transaction stream: {}", e);
-                }
-            }
+        // Use PubSub client for slot subscriptions
+        let pubsub_client = PubsubClient::new(&self.config.ws_url).await?;
+        let (mut slot_subscription, _unsubscribe) = pubsub_client.slot_subscribe().await?;
 
-            tokio::time::sleep(self.config.reconnect_delay).await;
-            info!("Attempting to reconnect...");
-        }
-    }
+        // Keep RPC client for fetching blocks
+        let rpc_client = Arc::new(RpcClient::new_with_commitment(
+            self.config.rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        ));
 
-    /// Process the transaction stream
-    async fn process_stream(&self) -> Result<()> {
-        // DEX program IDs (mainnet)
-        // These are examples; replace with actual program IDs as needed
-        const ORCA_PROGRAM_ID: &str = "9WwGQq5FQn6rQp6QwBEmcLk6RdtqvYXvyfZ7u5nE5fSL";
-        const RAYDIUM_PROGRAM_ID: &str = "4k3Dyjzvzp8e2A6A6bJ4hF6dkprdFM5ocTyT4p7gX9E5";
-        const JUPITER_PROGRAM_ID: &str = "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB";
+        info!("TransactionStream started, subscribing to slots...");
 
-        let ws_url = &self.config.ws_url;
-        info!("Connecting to Solana WebSocket endpoint: {}", ws_url);
-        let (ws_stream, _) = connect_async(ws_url).await?;
-        let (mut write, mut read) = ws_stream.split();
+        while let Some(slot_info) = slot_subscription.next().await {
+            let slot = slot_info.slot;
+            debug!(slot, "Processing slot");
 
-        // Subscribe to logs for each DEX program
-        let subscriptions = vec![
-            ORCA_PROGRAM_ID,
-            RAYDIUM_PROGRAM_ID,
-            JUPITER_PROGRAM_ID,
-        ];
-        for program_id in &subscriptions {
-            let sub_msg = json!([
-                "logsSubscribe",
-                { "mentions": [program_id] },
-                { "commitment": "confirmed" }
-            ]);
-            let sub_text = serde_json::to_string(&sub_msg)?;
-            write.send(async_tungstenite::tungstenite::Message::Text(sub_text)).await?;
-            info!("Subscribed to logs for program_id: {}", program_id);
-        }
-
-        // Listen for log notifications
-        while let Some(msg) = read.next().await {
-            debug!("Raw WebSocket message: {:?}", msg);
-            match msg {
-                Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                    info!(target: "solana_ws", "Received log notification: {}", text);
-                    // Parse the log notification JSON
-                    let parsed: serde_json::Value = match serde_json::from_str(&text) {
-                        Ok(val) => val,
-                        Err(e) => {
-                            warn!("Failed to parse log notification JSON: {}", e);
-                            continue;
-                        }
-                    };
-                    // Extract the signature from the notification
-                    let maybe_sig = parsed
-                        .get("params")
-                        .and_then(|params| params.get("result"))
-                        .and_then(|result| result.get("signature"))
-                        .and_then(|sig| sig.as_str());
-                    if let Some(signature_str) = maybe_sig {
-                        // Convert signature string to Signature type
-                        let signature = match Signature::from_str(signature_str) {
-                            Ok(sig) => sig,
-                            Err(e) => {
-                                warn!("Invalid signature string: {}", e);
-                                continue;
-                            }
-                        };
-                        // Fetch the full transaction and metadata
-                        match self.rpc_client.get_transaction(&signature, solana_transaction_status::UiTransactionEncoding::Json).await {
-                            Ok(tx_status) => {
-                                // Build TransactionInfo (simplified for now)
-                                if let Some(tx) = tx_status.transaction.transaction.decode() {
-                                    let meta = tx_status.transaction.meta.clone();
-                                    let program_id = tx.message.static_account_keys().get(0).map(|k| k.to_string()).unwrap_or_default();
-                                    let token_mint = None; // TODO: Parse from instructions
-                                    let amount = None; // TODO: Parse from instructions
-                                    let success = tx_status.transaction.meta.as_ref().map(|m| m.status.is_ok()).unwrap_or(false);
-                                    let tx_info = TransactionInfo {
-                                        transaction: tx,
-                                        meta,
-                                        signature: signature_str.to_string(),
-                                        program_id,
-                                        token_mint,
-                                        amount,
-                                        success,
-                                    };
-                                    // Call process_transaction (mutable borrow workaround)
-                                    match self.process_transaction(tx_info).await {
-                                        Ok(_) => info!("Processed transaction for signature: {}", signature_str),
-                                        Err(e) => warn!("Failed to process transaction: {}", e),
-                                    }
-                                } else {
-                                    warn!("Failed to decode transaction for signature: {}", signature_str);
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to fetch transaction for signature {}: {}", signature_str, e);
-                            }
-                        }
-                    } else {
-                        warn!("No signature found in log notification");
-                    }
-                }
-                Ok(other) => {
-                    debug!("Non-text WebSocket message: {:?}", other);
-                }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Process a single transaction
-    async fn process_transaction(
-        &self, 
-        tx_info: TransactionInfo
-    ) -> crate::error::Result<()> {
-        // Convert to TransactionEvent for filtering
-        let event = match TransactionEvent::try_from(tx_info.clone()) {
-            Ok(event) => event,
-            Err(e) => return Err(e),
-        };
-        
-        // Manual filter check based on program_id
-        let filter_check = {
-            let _program_id_str = event.program_id.to_string();
-            // Get config from TransactionMonitor and check program_ids
-            // As a fallback, just process all transactions
-            true 
-        };
-        
-        if !filter_check {
-            return Ok(());
-        }
-
-        for parser in &self.parsers {
-            if let Some(event) = parser.parse_transaction(tx_info.clone()).await? {
-                // Convert TransactionEvent to DexTransaction
-                let dex_tx = DexTransaction {
-                    signature: event.signature.clone(),
-                    program_id: event.program_id.clone(),
-                    input_token: TokenAmount {
-                        mint: event.token_mint.map_or("".to_string(), |m| m.to_string()),
-                        amount: event.amount.unwrap_or(0),
-                        decimals: 6, // Default
-                    },
-                    output_token: TokenAmount {
-                        mint: "".to_string(),
-                        amount: 0,
-                        decimals: 6,
-                    },
-                    dex_name: parser.dex_name().to_string(),
-                    timestamp: 0,
-                    succeeded: event.success,
-                    fee: 0,
-                    slippage: 0.0,
-                    dex_metadata: std::collections::HashMap::new(),
-                    dex_type: DexType::Jupiter,
+            let rpc_client_clone = rpc_client.clone();
+            let parsers_clone = self.parsers.clone();
+            let tx_sender_clone = self.tx_sender.clone();
+            
+            tokio::spawn(async move {
+                let block_config = RpcBlockConfig {
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    transaction_details: Some(TransactionDetails::Full),
+                    rewards: Some(false),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
                 };
 
-                if let Err(e) = self.tx_sender.send(dex_tx) {
-                    return Err(crate::error::SandoError::InternalError(format!("Failed to send transaction: {}", e)));
+                match Self::fetch_block_with_retry(rpc_client_clone.clone(), slot, block_config, 3, 100).await {
+                    Ok(Some(block)) => {
+                        if let Some(transactions) = block.transactions {
+                            for tx_with_meta in transactions {
+                                // Store transaction in a variable to avoid multiple clones
+                                let transaction = tx_with_meta.transaction.clone();
+                                
+                                if let (EncodedTransaction::LegacyBinary(tx_b58), Some(meta)) = 
+                                    (transaction, tx_with_meta.meta.clone())
+                                {
+                                    match bs58::decode(tx_b58).into_vec() {
+                                        Ok(tx_bytes_vec) => {
+                                            match bincode::deserialize::<solana_sdk::transaction::Transaction>(&tx_bytes_vec) {
+                                                Ok(decoded_tx) => {
+                                                    let tx_info = TransactionInfo {
+                                                        transaction: VersionedTransaction::from(decoded_tx),
+                                                        meta: Some(meta),
+                                                        signature: "legacy_tx_sig_placeholder".to_string(),
+                                                        program_id: "placeholder_program".to_string(),
+                                                        token_mint: None,
+                                                        amount: None,
+                                                        success: tx_with_meta.meta.map_or(false, |m| m.status.is_ok()),
+                                                    };
+                                                    
+                                                    for parser in &parsers_clone {
+                                                        match parser.parse_transaction(tx_info.clone()).await {
+                                                            Ok(Some(dex_tx)) => {
+                                                                if let Err(e) = tx_sender_clone.send(dex_tx).await {
+                                                                    error!(error = %e, "Failed to send parsed DexTransaction to channel");
+                                                                }
+                                                                break;
+                                                            }
+                                                            Ok(None) => {}
+                                                            Err(e) => {
+                                                                error!(error = %e, parser = parser.dex_name(), "Parser failed for transaction");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => error!(error = %e, "Failed to deserialize legacy transaction bytes"),
+                                            }
+                                        }
+                                         Err(e) => error!(error = %e, "Failed to decode base58 legacy transaction string"),
+                                    }
+                                } else if let (EncodedTransaction::Binary(tx_b64, _encoding), Some(meta)) = 
+                                    (tx_with_meta.transaction.clone(), tx_with_meta.meta.clone())
+                                {
+                                    match BASE64_STANDARD.decode(&tx_b64) {
+                                        Ok(tx_bytes_vec) => {
+                                             match bincode::deserialize::<VersionedTransaction>(&tx_bytes_vec) {
+                                                Ok(versioned_tx) => {
+                                                    let signature = versioned_tx.signatures.get(0).cloned().unwrap_or_default();
+                                                      let tx_info = TransactionInfo {
+                                                        transaction: versioned_tx,
+                                                        meta: Some(meta),
+                                                        signature: signature.to_string(),
+                                                        program_id: "placeholder_program".to_string(),
+                                                        token_mint: None,
+                                                        amount: None,
+                                                        success: tx_with_meta.meta.map_or(false, |m| m.status.is_ok()),
+                                                    };
+                                                    for parser in &parsers_clone {
+                                                         match parser.parse_transaction(tx_info.clone()).await {
+                                                            Ok(Some(dex_tx)) => {
+                                                                 if let Err(e) = tx_sender_clone.send(dex_tx).await {
+                                                                    error!(error = %e, "Failed to send parsed DexTransaction to channel");
+                                                                }
+                                                                break;
+                                                            }
+                                                            Ok(None) => {}
+                                                            Err(e) => {
+                                                                error!(error = %e, parser = parser.dex_name(), "Parser failed for transaction");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                 Err(e) => error!(error = %e, "Failed to deserialize versioned transaction bytes"),
+                                            }
+                                        }
+                                         Err(e) => error!(error = %e, "Failed to decode base64 versioned transaction string"),
+                                    }
+                                } else {
+                                    trace!("Skipping transaction with unhandled encoding or missing meta");
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => { /* Block not found or fetch timed out */ }
+                    Err(e) => error!(slot, error = %e, "Failed to fetch or process block"),
+                }
+            });
+        }
+
+        info!("TransactionStream stopped.");
+        Ok(())
+    }
+
+    async fn fetch_block_with_retry(
+        rpc_client: Arc<RpcClient>,
+        slot: u64,
+        config: RpcBlockConfig,
+        max_retries: u32,
+        initial_delay_ms: u64,
+    ) -> Result<Option<UiConfirmedBlock>, SandoError> {
+        let mut retries = 0;
+        let mut delay_ms = initial_delay_ms;
+        
+        loop {
+            let config_clone = config.clone();
+            let client = rpc_client.clone();
+            
+            // Await the JoinHandle first
+            let blocking_result = task::spawn_blocking(move || {
+                // Use the blocking version to avoid returning a Future
+                let result = futures::executor::block_on(client.get_block_with_config(slot, config_clone));
+                result
+            }).await;
+
+            // Match on the Result from spawn_blocking (handles JoinError)
+            match blocking_result {
+                Ok(rpc_result) => { 
+                    // Now match on the Result from get_block_with_config
+                    match rpc_result {
+                        Ok(block) => return Ok(Some(block)),
+                        Err(err) => { // ClientError
+                            if retries >= max_retries {
+                                error!(slot, error = %err, max_retries, "Failed to fetch block after max retries");
+                                return Err(SandoError::SolanaRpc(format!("Failed to fetch block {} after {} retries: {}", slot, max_retries, err)));
+                            }
+                            
+                            let err_str = err.to_string();
+                            let is_block_not_available = err_str.contains("Block not available") || err_str.contains("-32004");
+                            
+                            if !is_block_not_available {
+                                error!(slot, error = %err, "Non-retriable error fetching block");
+                                return Err(SandoError::SolanaRpc(format!("Non-retriable error fetching block: {}", err)));
+                            }
+                            
+                            warn!(slot, retry_count = retries + 1, max_retries, delay_ms, "Block not available, retrying...");
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            retries += 1;
+                            delay_ms = std::cmp::min(delay_ms * 2, 2000); 
+                        }
+                    }
+                }
+                Err(e) => { // JoinError (task panicked)
+                    error!(slot, error = %e, "Block fetching task panicked");
+                    return Err(SandoError::InternalError(format!("Block fetching task panicked: {}", e)));
                 }
             }
         }
-
-        Ok(())
     }
 } 

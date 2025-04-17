@@ -267,7 +267,7 @@ impl MevStrategyEvaluator for SandwichEvaluator {
         }
     }
     
-    async fn validate(&self, opportunity: &MevOpportunity) -> Result<bool> {
+    async fn validate(&self, _opportunity: &MevOpportunity) -> Result<bool> {
         // In a real implementation, you would check:
         // 1. If the target transaction is still in the mempool
         // 2. If the pool conditions have changed significantly

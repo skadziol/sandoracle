@@ -167,7 +167,7 @@ impl Default for TransactionMonitor {
 #[async_trait]
 pub trait DexTransactionParser: Send + Sync + std::fmt::Debug {
     fn dex_name(&self) -> &'static str;
-    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<TransactionEvent>>;
+    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<DexTransaction>>;
 }
 
 #[derive(Debug, Clone)]
