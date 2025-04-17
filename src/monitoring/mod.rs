@@ -3,12 +3,59 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling;
 use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::Write;
 use crate::error::{Result, SandoError};
 use std::time::Duration;
 use tokio::time::interval;
 use crate::config::Settings;
 use crate::executor::TransactionExecutor;
 use tracing::{info, warn, error};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use crate::evaluator::MevOpportunity;
+use serde::{Serialize, Deserialize};
+use serde_json;
+use chrono;
+
+pub mod log_utils;
+
+// Rate limited logger to reduce excessive log entries
+pub struct RateLimitedLogger {
+    last_logged: AtomicU64,
+    interval_ms: u64,
+}
+
+impl RateLimitedLogger {
+    pub fn new(interval_ms: u64) -> Self {
+        Self {
+            last_logged: AtomicU64::new(0),
+            interval_ms,
+        }
+    }
+    
+    pub fn should_log(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        let last = self.last_logged.load(Ordering::Relaxed);
+        if now.saturating_sub(last) > self.interval_ms {
+            self.last_logged.store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// Create loggers for different components to limit logging frequency
+lazy_static::lazy_static! {
+    pub static ref TRANSACTION_LOGGER: RateLimitedLogger = RateLimitedLogger::new(1000); // Log once per second for transactions
+    pub static ref BLOCK_LOGGER: RateLimitedLogger = RateLimitedLogger::new(5000);       // Log once per 5 seconds for blocks
+    pub static ref OPPORTUNITY_RATE_LOGGER: RateLimitedLogger = RateLimitedLogger::new(2000); // Log once per 2 seconds for opportunities
+}
 
 pub struct Monitor {
     // TODO: Add fields
@@ -49,8 +96,16 @@ pub fn init_logging(log_dir: &str, file_level: &str, console_level: &str) -> Res
     let file_appender = rolling::daily(log_dir, "sandoseer.log");
     let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
     
-    let file_filter = EnvFilter::try_new(file_level)
+    // Create custom filter for different log categories
+    let file_filter_str = std::env::var("FILE_LOG_CATEGORIES").unwrap_or_else(|_| {
+        format!("transaction_processing={},opportunity_evaluation={},sandoseer={}", 
+                file_level, file_level, file_level)
+    });
+    
+    let file_filter = EnvFilter::try_new(&file_filter_str)
+        .or_else(|_| EnvFilter::try_new(file_level))
         .map_err(|e| SandoError::ConfigError(format!("Invalid file log level filter '{}': {}", file_level, e)))?;
+        
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking_appender)
         .with_ansi(false) // No ANSI colors in files
@@ -73,6 +128,7 @@ pub fn init_logging(log_dir: &str, file_level: &str, console_level: &str) -> Res
         .try_init()
         .map_err(|e| SandoError::InternalError(format!("Failed to initialize tracing subscriber: {}", e)))?;
 
+    info!("SandoSeer logging initialized. Console: {}, File: {} (in {})", console_level, file_level, log_dir);
     Ok(guard)
 }
 
@@ -229,6 +285,162 @@ pub async fn run_periodic_health_checks(
             }
         }
     }
+}
+
+/// Logger specifically for opportunity tracking
+pub static OPPORTUNITY_LOGGER: once_cell::sync::Lazy<OpportunityLogger> = once_cell::sync::Lazy::new(|| {
+    OpportunityLogger::new()
+});
+
+/// Tracks statistics related to MEV opportunities
+#[derive(Debug)]
+pub struct OpportunityLogger {
+    opportunities_detected: AtomicU64,
+    opportunities_executed: AtomicU64,
+    opportunities_skipped: AtomicU64,
+    total_profit: std::sync::Mutex<f64>,
+    last_opportunity_time: std::sync::atomic::AtomicU64,
+}
+
+impl OpportunityLogger {
+    /// Creates a new OpportunityLogger
+    pub fn new() -> Self {
+        Self {
+            opportunities_detected: AtomicU64::new(0),
+            opportunities_executed: AtomicU64::new(0),
+            opportunities_skipped: AtomicU64::new(0),
+            total_profit: std::sync::Mutex::new(0.0),
+            last_opportunity_time: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    
+    /// Records a detected opportunity
+    pub fn record_opportunity_detected(&self) {
+        self.opportunities_detected.fetch_add(1, Ordering::Relaxed);
+        self.last_opportunity_time.store(
+            chrono::Utc::now().timestamp() as u64,
+            Ordering::Relaxed,
+        );
+    }
+    
+    /// Records an executed opportunity
+    pub fn record_opportunity_executed(&self, profit: f64) {
+        self.opportunities_executed.fetch_add(1, Ordering::Relaxed);
+        let mut total_profit = self.total_profit.lock().unwrap();
+        *total_profit += profit;
+    }
+    
+    /// Records a skipped opportunity
+    pub fn record_opportunity_skipped(&self, reason: &str) {
+        self.opportunities_skipped.fetch_add(1, Ordering::Relaxed);
+        info!(
+            reason = reason,
+            skipped_count = self.opportunities_skipped.load(Ordering::Relaxed),
+            "Opportunity skipped"
+        );
+    }
+    
+    /// Gets the current statistics
+    pub fn get_stats(&self) -> OpportunityStats {
+        let total_profit = *self.total_profit.lock().unwrap();
+        OpportunityStats {
+            opportunities_detected: self.opportunities_detected.load(Ordering::Relaxed),
+            opportunities_executed: self.opportunities_executed.load(Ordering::Relaxed),
+            opportunities_skipped: self.opportunities_skipped.load(Ordering::Relaxed),
+            total_profit,
+            last_opportunity_time: self.last_opportunity_time.load(Ordering::Relaxed),
+            timestamp: chrono::Utc::now().timestamp() as u64,
+        }
+    }
+    
+    /// Logs a detailed MEV opportunity to file
+    pub fn log_opportunity_to_file(&self, opportunity: &MevOpportunity, log_dir: &str, executed: bool) -> Result<()> {
+        let opportunity_log_path = Path::new(log_dir).join("mev_opportunities.json");
+        
+        // Create log entry
+        let log_entry = OpportunityLogEntry {
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            strategy: format!("{:?}", opportunity.strategy),
+            estimated_profit: opportunity.estimated_profit,
+            confidence: opportunity.confidence,
+            risk_level: format!("{:?}", opportunity.risk_level),
+            executed,
+            tokens_involved: opportunity.involved_tokens.clone(),
+            metadata: opportunity.metadata.clone(),
+        };
+        
+        // Serialize to JSON
+        let entry_json = serde_json::to_string(&log_entry)
+            .map_err(|e| SandoError::InternalError(format!("Failed to serialize log entry: {}", e)))?;
+        
+        // Append to file
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(opportunity_log_path)
+            .map_err(|e| SandoError::InternalError(format!("Failed to open log file: {}", e)))?;
+            
+        writeln!(file, "{}", entry_json)
+            .map_err(|e| SandoError::InternalError(format!("Failed to write to log file: {}", e)))?;
+            
+        Ok(())
+    }
+}
+
+/// Statistics for MEV opportunities
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpportunityStats {
+    pub opportunities_detected: u64,
+    pub opportunities_executed: u64,
+    pub opportunities_skipped: u64,
+    pub total_profit: f64,
+    pub last_opportunity_time: u64,
+    pub timestamp: u64,
+}
+
+/// Structure for logging MEV opportunities
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpportunityLogEntry {
+    pub timestamp: u64,
+    pub strategy: String,
+    pub estimated_profit: f64,
+    pub confidence: f64,
+    pub risk_level: String,
+    pub executed: bool,
+    pub tokens_involved: Vec<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Starts a background task to periodically log opportunity statistics
+pub async fn start_opportunity_stats_logger(log_dir: String) -> Result<()> {
+    // No need to clone log_dir since it's already owned
+    
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(60)); // Log every minute
+        
+        loop {
+            interval.tick().await;
+            
+            let stats = OPPORTUNITY_LOGGER.get_stats();
+            info!(
+                detected = stats.opportunities_detected,
+                executed = stats.opportunities_executed, 
+                skipped = stats.opportunities_skipped,
+                total_profit = stats.total_profit,
+                "MEV opportunity statistics"
+            );
+            
+            // Write stats to JSON file
+            let stats_path = Path::new(&log_dir).join("opportunity_stats.json");
+            if let Ok(serialized) = serde_json::to_string_pretty(&stats) {
+                if let Err(e) = std::fs::write(&stats_path, serialized) {
+                    error!(error = %e, "Failed to write opportunity stats to file");
+                }
+            }
+        }
+    });
+    
+    Ok(())
 }
 
 #[cfg(test)]

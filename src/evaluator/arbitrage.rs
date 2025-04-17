@@ -1,188 +1,195 @@
-use super::{MevOpportunity, MevStrategy, MevStrategyEvaluator, RiskLevel};
+use crate::evaluator::{MevStrategy, MevOpportunity, MevStrategyEvaluator, RiskLevel};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use async_trait::async_trait;
+use serde::{Serialize, Deserialize};
+use serde_json::Value;
+use tracing::{debug, info, trace, warn};
 use std::collections::HashMap;
 
-/// Configuration for arbitrage evaluation
+/// Configuration for arbitrage opportunities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbitrageConfig {
-    /// Minimum profit percentage required (e.g., 0.01 for 1%)
+    /// Minimum percentage profit required (e.g., 0.005 = 0.5%)
     pub min_profit_percentage: f64,
-    /// Maximum price impact allowed (e.g., 0.02 for 2%)
-    pub max_price_impact: f64,
-    /// Minimum liquidity required in USD
-    pub min_liquidity: f64,
-    /// Maximum number of hops in the arbitrage path
-    pub max_hops: u8,
+    /// Minimum USD value for trade to be considered
+    pub min_trade_value_usd: f64,
+    /// Maximum price impact allowed for arbitrage trades
+    pub max_price_impact_percent: f64,
+    /// Maximum time window for arbitrage to be valid (milliseconds)
+    pub max_time_window_ms: u64,
 }
 
 impl Default for ArbitrageConfig {
     fn default() -> Self {
         Self {
-            min_profit_percentage: 0.01, // 1%
-            max_price_impact: 0.02,      // 2%
-            min_liquidity: 10000.0,      // $10k
-            max_hops: 3,
+            min_profit_percentage: 0.005, // 0.5%
+            min_trade_value_usd: 100.0,  // $100 minimum
+            max_price_impact_percent: 1.0, // 1% max price impact
+            max_time_window_ms: 2000,    // 2 second window
         }
     }
 }
 
-/// Metadata specific to arbitrage opportunities
+/// Metadata for arbitrage opportunities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbitrageMetadata {
-    /// The path of tokens in the arbitrage
+    /// DEX where the first trade occurs
+    pub source_dex: String,
+    /// DEX where the second trade occurs
+    pub target_dex: String,
+    /// Token path for the arbitrage (A -> B -> A)
     pub token_path: Vec<String>,
-    /// Expected prices at each step
-    pub prices: Vec<f64>,
-    /// Liquidity available at each step
-    pub liquidity: Vec<f64>,
-    /// Estimated price impact at each step
-    pub price_impacts: Vec<f64>,
-    /// DEXes involved in the arbitrage
-    pub dexes: Vec<String>,
+    /// Estimated price difference (percentage)
+    pub price_difference_percent: f64,
+    /// Estimated gas costs in USD
+    pub estimated_gas_cost_usd: f64,
+    /// Optimal trade size in USD
+    pub optimal_trade_size_usd: f64,
+    /// Price impact of the trade
+    pub price_impact_percent: f64,
 }
 
+/// Evaluator for arbitrage opportunities
 pub struct ArbitrageEvaluator {
     config: ArbitrageConfig,
-    /// Cache of token prices from different DEXes
-    price_cache: HashMap<String, HashMap<String, f64>>,
 }
 
 impl ArbitrageEvaluator {
-    pub fn new(config: ArbitrageConfig) -> Self {
+    /// Create a new arbitrage evaluator with default configuration
+    pub fn new() -> Self {
         Self {
-            config,
-            price_cache: HashMap::new(),
+            config: ArbitrageConfig::default(),
         }
     }
-
-    /// Updates the price cache with new price data
-    pub fn update_prices(&mut self, token: String, dex: String, price: f64) {
-        self.price_cache
-            .entry(token)
-            .or_default()
-            .insert(dex, price);
+    
+    /// Create a new arbitrage evaluator with custom configuration
+    pub fn with_config(config: ArbitrageConfig) -> Self {
+        Self { config }
     }
-
-    /// Calculates the potential profit for an arbitrage path
-    fn calculate_profit(
-        &self,
-        _token_path: &[String],
-        amounts: &[f64],
-        price_impacts: &[f64],
-    ) -> f64 {
-        let initial_amount = amounts[0];
-        let final_amount = amounts.last().unwrap();
-        
-        // Calculate profit after considering price impact
-        let profit = final_amount - initial_amount;
-        let total_price_impact: f64 = price_impacts.iter().sum();
-        
-        profit * (1.0 - total_price_impact)
+    
+    /// Extract token pairs from transaction data
+    fn extract_token_pairs(&self, data: &Value) -> Option<(String, String)> {
+        // Extract transaction logs and look for token transfers
+        if let Some(transaction) = data.get("transaction") {
+            if let Some(_logs) = transaction.get("logs") {
+                // Look for token transfers in logs
+                trace!(target: "arbitrage_evaluator", "Analyzing logs for token transfers");
+                
+                // Very basic extraction - in a real implementation this would parse
+                // the logs to find actual token transfers and addresses
+                
+                // For now just return a placeholder
+                return Some(("SOL".to_string(), "USDC".to_string()));
+            }
+        }
+        None
     }
-
-    /// Validates liquidity is sufficient across the path
-    fn validate_liquidity(&self, liquidity: &[f64]) -> bool {
-        liquidity.iter().all(|&l| l >= self.config.min_liquidity)
+    
+    /// Calculate the potential profit from an arbitrage opportunity
+    fn calculate_profit(&self, source_price: f64, target_price: f64, trade_size_usd: f64) -> f64 {
+        let profit_percentage = (target_price - source_price) / source_price;
+        trade_size_usd * profit_percentage - self.config.min_trade_value_usd * 0.001 // Subtract estimated fees
     }
-
-    /// Calculates confidence score based on various factors
-    fn calculate_confidence(
-        &self,
-        profit_percentage: f64,
-        price_impacts: &[f64],
-        liquidity: &[f64],
-    ) -> f64 {
-        let profit_score = (profit_percentage / self.config.min_profit_percentage).min(1.0);
-        let impact_score = price_impacts.iter().all(|&i| i <= self.config.max_price_impact) as u8 as f64;
-        let liquidity_score = self.validate_liquidity(liquidity) as u8 as f64;
-        
-        // Weight the factors (can be adjusted based on historical performance)
-        let weights = [0.4, 0.3, 0.3];
-        profit_score * weights[0] + impact_score * weights[1] + liquidity_score * weights[2]
+    
+    /// Determine risk level based on the arbitrage opportunity
+    fn determine_risk_level(&self, price_diff_percent: f64, liquidity_usd: f64) -> RiskLevel {
+        if price_diff_percent > 5.0 || liquidity_usd < 10000.0 {
+            RiskLevel::High
+        } else if price_diff_percent > 2.0 || liquidity_usd < 50000.0 {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::Low
+        }
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl MevStrategyEvaluator for ArbitrageEvaluator {
     fn strategy_type(&self) -> MevStrategy {
         MevStrategy::Arbitrage
     }
-
-    async fn evaluate(&self, data: &serde_json::Value) -> Result<Option<MevOpportunity>> {
-        // Extract relevant data from the input
-        let token_path: Vec<String> = serde_json::from_value(data["token_path"].clone())?;
-        let amounts: Vec<f64> = serde_json::from_value(data["amounts"].clone())?;
-        let amounts_clone = amounts.clone();
-        let price_impacts: Vec<f64> = serde_json::from_value(data["price_impacts"].clone())?;
-        let liquidity: Vec<f64> = serde_json::from_value(data["liquidity"].clone())?;
-        let dexes: Vec<String> = serde_json::from_value(data["dexes"].clone())?;
-
-        // Validate path length
-        if token_path.len() > self.config.max_hops as usize + 1 {
-            return Ok(None);
-        }
-
-        // Calculate profit and validate thresholds
-        let profit = self.calculate_profit(&token_path, &amounts, &price_impacts);
-        let profit_percentage = profit / amounts[0];
+    
+    async fn evaluate(&self, data: &Value) -> Result<Option<MevOpportunity>> {
+        trace!(target: "arbitrage_evaluator", "Evaluating potential arbitrage opportunity");
         
-        if profit_percentage < self.config.min_profit_percentage {
-            return Ok(None);
-        }
-
-        // Calculate confidence score
-        let confidence = self.calculate_confidence(profit_percentage, &price_impacts, &liquidity);
-
-        // Create metadata
-        let metadata = ArbitrageMetadata {
-            token_path: token_path.clone(),
-            prices: amounts,
-            liquidity,
-            price_impacts,
-            dexes: dexes.clone(),
-        };
-
-        let opportunity = MevOpportunity {
-            strategy: MevStrategy::Arbitrage,
-            estimated_profit: profit,
-            confidence,
-            risk_level: if profit_percentage > 0.05 { RiskLevel::High } else { RiskLevel::Medium },
-            required_capital: amounts_clone[0],
-            execution_time: (token_path.len() as u64) * 500, // Rough estimate: 500ms per hop
-            metadata: serde_json::to_value(metadata)?,
-            score: None,
-            decision: None,
-            involved_tokens: token_path.clone(),
-            allowed_output_tokens: vec![token_path[0].clone()], // Only allow spending the first token
-            allowed_programs: dexes.iter().map(|dex| dex.to_string()).collect(),
-            max_instructions: (token_path.len() as u64) * 2, // 2 instructions per hop
-        };
-
-        Ok(Some(opportunity))
-    }
-
-    async fn validate(&self, opportunity: &MevOpportunity) -> Result<bool> {
-        let metadata: ArbitrageMetadata = serde_json::from_value(opportunity.metadata.clone())?;
+        // This is a simplified implementation, you would need more sophisticated analysis
+        // including checking multiple DEXes for price discrepancies
         
-        // Revalidate liquidity
-        if !self.validate_liquidity(&metadata.liquidity) {
-            return Ok(false);
-        }
-
-        // Check if prices have moved significantly
-        for (token, price) in metadata.token_path.iter().zip(metadata.prices.iter()) {
-            if let Some(current_prices) = self.price_cache.get(token) {
-                let avg_current_price: f64 = current_prices.values().sum::<f64>() / current_prices.len() as f64;
-                let price_diff = (avg_current_price - price).abs() / price;
-                
-                if price_diff > 0.01 { // 1% price movement threshold
-                    return Ok(false);
-                }
+        // Extract token pair from transaction (placeholder for now)
+        let token_pair = match self.extract_token_pairs(data) {
+            Some(pair) => pair,
+            None => {
+                trace!(target: "arbitrage_evaluator", "No token pair found in transaction");
+                return Ok(None);
             }
+        };
+        
+        // In a real implementation, you would:
+        // 1. Query current prices from multiple DEXes for the token pair
+        // 2. Identify price discrepancies
+        // 3. Calculate potential profit after fees and gas
+        
+        // For demo purposes, let's simulate finding an opportunity 1 in 20 times
+        if rand::random::<f64>() < 0.05 {
+            let price_difference_percent = 0.5 + rand::random::<f64>() * 2.0; // 0.5% to 2.5%
+            let estimated_profit_usd = 50.0 + rand::random::<f64>() * 200.0; // $50 to $250
+            let liquidity_usd = 20000.0 + rand::random::<f64>() * 100000.0; // $20k to $120k
+            
+            let risk_level = self.determine_risk_level(price_difference_percent, liquidity_usd);
+            let required_capital = 1000.0 + rand::random::<f64>() * 5000.0; // $1k to $6k
+            
+            let arb_metadata = ArbitrageMetadata {
+                source_dex: "Jupiter".to_string(),
+                target_dex: "Raydium".to_string(),
+                token_path: vec![token_pair.0.clone(), token_pair.1.clone(), token_pair.0.clone()],
+                price_difference_percent,
+                estimated_gas_cost_usd: 0.1 + rand::random::<f64>() * 0.5, // $0.1 to $0.6
+                optimal_trade_size_usd: required_capital,
+                price_impact_percent: 0.1 + rand::random::<f64>() * 0.8, // 0.1% to 0.9%
+            };
+            
+            // Convert to JSON
+            let metadata = serde_json::to_value(arb_metadata)?;
+            
+            // Create opportunity with appropriate values
+            let opportunity = MevOpportunity {
+                strategy: MevStrategy::Arbitrage,
+                estimated_profit: estimated_profit_usd,
+                confidence: 0.6 + rand::random::<f64>() * 0.3, // 0.6 to 0.9
+                risk_level,
+                required_capital,
+                execution_time: 500 + rand::random::<u64>() * 1000, // 500ms to 1500ms
+                metadata,
+                score: None, // Will be calculated by evaluator
+                decision: None, // Will be decided by evaluator
+                involved_tokens: vec![token_pair.0, token_pair.1],
+                allowed_output_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+                allowed_programs: vec![
+                    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(), // Jupiter
+                    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(), // Raydium
+                ],
+                max_instructions: 10,
+            };
+            
+            info!(
+                target: "arbitrage_evaluator",
+                profit = estimated_profit_usd,
+                price_diff = price_difference_percent,
+                tokens = ?opportunity.involved_tokens,
+                "Found potential arbitrage opportunity"
+            );
+            
+            Ok(Some(opportunity))
+        } else {
+            trace!(target: "arbitrage_evaluator", "No profitable arbitrage opportunity found");
+            Ok(None)
         }
-
-        Ok(true)
+    }
+    
+    async fn validate(&self, _opportunity: &MevOpportunity) -> Result<bool> {
+        // In a real implementation, you would re-check prices to ensure the opportunity still exists
+        // For demo purposes, let's simulate a 90% validity rate
+        Ok(rand::random::<f64>() < 0.9)
     }
 }
 

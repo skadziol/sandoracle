@@ -6,12 +6,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use async_trait::async_trait;
-use solana_sdk::{
-    transaction::Transaction,
-};
+use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status::UiTransactionStatusMeta;
 use std::fmt::Debug;
 use tracing::{debug};
+use serde::Serialize;
 
 /// Represents a DEX transaction with relevant MEV information
 #[derive(Debug, Clone)]
@@ -58,7 +57,7 @@ impl TokenAmount {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TransactionEvent {
     pub signature: Signature,
     pub program_id: Pubkey,
@@ -169,12 +168,12 @@ impl Default for TransactionMonitor {
 #[async_trait]
 pub trait DexTransactionParser: Send + Sync + std::fmt::Debug {
     fn dex_name(&self) -> &'static str;
-    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<TransactionEvent>>;
+    async fn parse_transaction(&self, tx_info: TransactionInfo) -> Result<Option<DexTransaction>>;
 }
 
 #[derive(Debug, Clone)]
 pub struct TransactionInfo {
-    pub transaction: Transaction,
+    pub transaction: VersionedTransaction,
     pub meta: Option<UiTransactionStatusMeta>,
     pub signature: String,
     pub program_id: String,

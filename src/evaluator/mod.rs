@@ -2,29 +2,36 @@ pub mod arbitrage;
 pub mod sandwich;
 pub mod token_snipe;
 
-use arbitrage::{ArbitrageConfig, ArbitrageEvaluator};
-use sandwich::{SandwichConfig, SandwichEvaluator};
-use token_snipe::{TokenSnipeConfig, TokenSnipeEvaluator};
+// use arbitrage::{ArbitrageConfig, ArbitrageEvaluator}; // Keep commented or remove
+// use sandwich::{SandwichConfig, SandwichEvaluator}; // Keep commented or remove
+// use token_snipe::{TokenSnipeConfig, TokenSnipeEvaluator}; // Keep commented or remove
+
+// use listen_engine::Engine; // REMOVE THIS LINE
+
+use crate::config::Settings;
+use crate::error::{Result as SandoResult, SandoError};
+use crate::config::RiskLevel as ConfigRiskLevel;
+use crate::rig_agent::{RigAgent, RawOpportunityData, MarketContext};
+use anyhow::{Result, Error, Context, anyhow};
 
 // Removed unused: pub use arbitrage::{ArbitrageConfig, ArbitrageEvaluator, ArbitrageMetadata};
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
-use listen_engine::Engine;
+use tracing::{debug, error, info, warn, trace};
 use crate::config; // Import config module to access config::RiskLevel
 use std::time::{SystemTime, UNIX_EPOCH};
 use chrono;
+use crate::monitoring::{OPPORTUNITY_LOGGER, OPPORTUNITY_RATE_LOGGER};
 
 /// Represents different types of MEV strategies
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum MevStrategy {
-    Sandwich,
     Arbitrage,
+    Sandwich,
     TokenSnipe,
 }
 
@@ -681,8 +688,6 @@ impl CircuitBreaker for StrategyBreaker {
 
 /// Main opportunity evaluator that coordinates different strategy evaluators
 pub struct OpportunityEvaluator {
-    /// The underlying listen-engine instance
-    engine: Arc<Engine>,
     /// Strategy registry
     strategy_registry: StrategyRegistry,
     /// Minimum confidence threshold for opportunities
@@ -695,62 +700,137 @@ pub struct OpportunityEvaluator {
     active_opportunities: Arc<RwLock<Vec<MevOpportunity>>>,
     /// Execution thresholds configuration
     execution_thresholds: ExecutionThresholds,
+    /// Strategy executor
+    strategy_executor: RwLock<Option<Arc<dyn StrategyExecutionService>>>,
+    /// RIG Agent for AI-powered decision enhancement
+    rig_agent: Option<Arc<RigAgent>>,
+}
+
+/// This trait defines the interface for strategy execution services
+#[async_trait::async_trait]
+pub trait StrategyExecutionService: Send + Sync {
+    /// Executes an MEV opportunity
+    async fn execute_opportunity(&self, opportunity: &MevOpportunity) -> anyhow::Result<solana_sdk::signature::Signature>;
 }
 
 impl OpportunityEvaluator {
-    /// Creates a new OpportunityEvaluator
-    pub async fn new(
-        min_confidence: f64,
-        max_risk_level: RiskLevel,
-        min_profit_threshold: f64,
-    ) -> Result<Self> {
-        info!(
-            min_confidence = min_confidence,
-            risk_level = ?max_risk_level,
-            min_profit = min_profit_threshold,
-            "Creating new OpportunityEvaluator"
-        );
+    /// Creates a new OpportunityEvaluator with default thresholds.
+    pub async fn new() -> Result<Self> {
+        let thresholds = ExecutionThresholds::default();
+        Self::new_with_thresholds(
+            thresholds.min_profit_threshold, 
+            thresholds.max_risk_level, 
+            0.05, // Default min_profit_percentage, adjust if needed
+            thresholds
+        ).await
+    }
 
-        let (engine_instance, _) = Engine::from_env().await?;
-        let mut evaluator = Self {
-            engine: Arc::new(engine_instance),
-            strategy_registry: StrategyRegistry::new(),
-            min_confidence,
+    /// Creates a new OpportunityEvaluator with specified thresholds.
+    pub async fn new_with_thresholds(
+        min_profit_threshold: f64,
+        max_risk_level: RiskLevel,
+        _min_profit_percentage: f64, // Parameter might be unused now or repurposed
+        execution_thresholds: ExecutionThresholds,
+    ) -> Result<Self> {
+        info!("Initializing OpportunityEvaluator...");
+
+        let registry = StrategyRegistry::new();
+        // Add registration logic here if needed later
+
+        // Removed engine initialization
+        // let (engine, _price_rx) = Engine::from_env().await
+        //     .map_err(|e| SandoError::DependencyError(format!("Failed to create listen-engine: {}", e)))?;
+
+        let evaluator = Self {
+            // engine: Arc::new(engine), // Removed engine field assignment
+            strategy_registry: registry,
+            min_confidence: execution_thresholds.min_confidence,
             max_risk_level,
             min_profit_threshold,
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
-            execution_thresholds: ExecutionThresholds::default(),
+            execution_thresholds,
+            strategy_executor: RwLock::new(None), // Initialize executor as None
+            rig_agent: None,
         };
 
-        // Register default evaluators
-        evaluator.register_evaluator(Box::new(ArbitrageEvaluator::new(ArbitrageConfig::default())));
-        evaluator.register_evaluator(Box::new(SandwichEvaluator::new(SandwichConfig::default())));
-        evaluator.register_evaluator(Box::new(TokenSnipeEvaluator::new(TokenSnipeConfig::default())));
-
+        info!("OpportunityEvaluator initialized successfully.");
         Ok(evaluator)
+    }
+
+    /// Sets the strategy executor
+    pub async fn set_strategy_executor<T: StrategyExecutionService + 'static>(&mut self, executor: Arc<T>) {
+        let mut strategy_executor = self.strategy_executor.write().await;
+        *strategy_executor = Some(executor);
+    }
+
+    /// Executes an MEV opportunity
+    pub async fn execute_opportunity(&self, opportunity: &MevOpportunity) -> Result<solana_sdk::signature::Signature> {
+        // Check if we have a strategy executor
+        let strategy_executor = self.strategy_executor.read().await;
+        
+        if let Some(executor) = strategy_executor.as_ref() {
+            // Execute the opportunity
+            executor.execute_opportunity(opportunity).await
+                .map_err(|e| anyhow::anyhow!("{}", e).into()) // Convert anyhow::Error to SandoError
+        } else {
+            Err(anyhow::anyhow!("No strategy executor available").into())
+        }
+    }
+
+    /// Processes a detected MEV opportunity, evaluating and potentially executing it
+    pub async fn process_mev_opportunity(&self, opportunity: &mut MevOpportunity) -> Result<Option<solana_sdk::signature::Signature>> {
+        // First, calculate the opportunity score if not already done
+        if opportunity.score.is_none() {
+            let score = self.calculate_opportunity_score(opportunity).await;
+            opportunity.score = Some(score);
+        }
+        
+        // Then, make execution decision if not already done
+        if opportunity.decision.is_none() {
+            let decision = self.make_execution_decision(opportunity).await;
+            opportunity.decision = Some(decision);
+        }
+        
+        // Check if we should execute this opportunity
+        if self.should_execute(opportunity).await {
+            info!(
+                strategy = ?opportunity.strategy,
+                estimated_profit = opportunity.estimated_profit,
+                confidence = opportunity.confidence,
+                score = opportunity.score.unwrap_or(0.0),
+                "Executing MEV opportunity"
+            );
+            
+            // Execute the opportunity
+            match self.execute_opportunity(opportunity).await {
+                Ok(signature) => {
+                    info!(
+                        signature = %signature,
+                        "Successfully executed MEV opportunity"
+                    );
+                    Ok(Some(signature))
+                },
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "Failed to execute MEV opportunity"
+                    );
+                    Err(e)
+                }
+            }
+        } else {
+            info!(
+                strategy = ?opportunity.strategy,
+                decision = ?opportunity.decision,
+                "Decided not to execute MEV opportunity"
+            );
+            Ok(None)
+        }
     }
 
     /// Gets the minimum confidence threshold.
     pub fn min_confidence(&self) -> f64 {
         self.min_confidence
-    }
-
-    /// Creates a new OpportunityEvaluator with custom execution thresholds
-    pub async fn new_with_thresholds(
-        min_confidence: f64,
-        max_risk_level: RiskLevel,
-        min_profit_threshold: f64,
-        execution_thresholds: ExecutionThresholds,
-    ) -> Result<Self> {
-        // `new` now handles engine creation correctly
-        let mut evaluator = Self::new(
-            min_confidence,
-            max_risk_level,
-            min_profit_threshold,
-        ).await?;
-        
-        evaluator.execution_thresholds = execution_thresholds;
-        Ok(evaluator)
     }
 
     /// Updates the execution thresholds configuration
@@ -772,64 +852,70 @@ impl OpportunityEvaluator {
 
     /// Evaluates incoming data for MEV opportunities across all registered strategies
     pub async fn evaluate_opportunity(&self, data: serde_json::Value) -> Result<Vec<MevOpportunity>> {
-        debug!(data = ?data, "Evaluating opportunity data");
+        let should_log_detailed = OPPORTUNITY_RATE_LOGGER.should_log() || 
+            std::env::var("DETAILED_LOGGING").map(|v| v == "true").unwrap_or(false);
+            
+        if should_log_detailed {
+            debug!(target: "opportunity_evaluation", data_size = data.to_string().len(), "Starting opportunity evaluation");
+        } else {
+            trace!(target: "opportunity_evaluation", "Evaluating opportunity data");
+        }
+        
         let mut opportunities = Vec::new();
-
-        for strategy in self.strategy_registry.strategies() {
-            if let Some(evaluator) = self.strategy_registry.get(&strategy) {
-                debug!(strategy = ?strategy, "Evaluating with strategy");
-                match evaluator.evaluate(&data).await {
-                    Ok(Some(mut opportunity)) => {
-                        // Calculate opportunity score
-                        let score = self.calculate_opportunity_score(&opportunity).await;
-                        opportunity.score = Some(score);
+        for (strategy_name, evaluator) in &self.strategy_registry.evaluators {
+            // Use trace for routine evaluations to reduce log volume
+            trace!(target: "opportunity_evaluation::strategy", strategy = ?strategy_name, "Evaluating with strategy");
+            
+            match evaluator.evaluate(&data).await {
+                Ok(Some(mut opportunity)) => {
+                    // Calculate score for the opportunity
+                    let score = self.calculate_opportunity_score(&opportunity).await;
+                    opportunity.score = Some(score);
+                    
+                    // Make execution decision
+                    let decision = self.make_execution_decision(&opportunity).await;
+                    opportunity.decision = Some(decision);
+                    
+                    if should_log_detailed || decision == ExecutionDecision::Execute {
                         debug!(
-                            strategy = ?strategy,
-                            score = score,
-                            "Calculated opportunity score"
-                        );
-                
-                        // Make execution decision
-                        let decision = self.make_execution_decision(&opportunity).await;
-                        opportunity.decision = Some(decision);
-                        debug!(
-                            strategy = ?strategy,
+                            target: "opportunity_evaluation::result",
+                            strategy = ?strategy_name,
+                            score,
                             decision = ?decision,
-                            "Made execution decision"
-                        );
-                
-                        // Apply filtering based on configured thresholds
-                        if self.meets_thresholds(&opportunity) {
-                            debug!(
-                                strategy = ?strategy,
-                                "Opportunity meets thresholds, adding to results"
-                            );
-                            opportunities.push(opportunity);
-                        } else {
-                            debug!(
-                                strategy = ?strategy,
-                                "Opportunity does not meet thresholds, skipping"
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        debug!(strategy = ?strategy, "No opportunity found for strategy");
-                    }
-                    Err(e) => {
-                        error!(
-                            error = %e,
-                            strategy = ?strategy,
-                            "Error evaluating opportunity"
+                            estimated_profit = opportunity.estimated_profit,
+                            "Opportunity evaluated"
                         );
                     }
+                    
+                    opportunities.push(opportunity);
+                }
+                Ok(None) => {
+                    trace!(target: "opportunity_evaluation::strategy", strategy = ?strategy_name, "No opportunity found for strategy");
+                }
+                Err(e) => {
+                    // Keep error logs at warn level for visibility
+                    warn!(
+                        target: "opportunity_evaluation::error",
+                        error = ?e,
+                        strategy = ?strategy_name,
+                        "Error evaluating with strategy"
+                    );
                 }
             }
         }
-
-        info!(
-            opportunities_found = opportunities.len(),
-            "Completed opportunity evaluation"
-        );
+        
+        // Always log the summary count at info level if opportunities found
+        if !opportunities.is_empty() {
+            info!(
+                target: "opportunity_evaluation::summary",
+                count = opportunities.len(),
+                strategies = ?opportunities.iter().map(|o| &o.strategy).collect::<Vec<_>>(),
+                "Found potential opportunities"
+            );
+        } else if should_log_detailed {
+            debug!(target: "opportunity_evaluation::summary", "No opportunities found");
+        }
+        
         Ok(opportunities)
     }
 
@@ -845,33 +931,61 @@ impl OpportunityEvaluator {
 
     /// Calculates the final opportunity score
     pub async fn calculate_opportunity_score(&self, opportunity: &MevOpportunity) -> f64 {
+        // Get all scoring factors
         let scoring_factors = Self::create_default_scoring_factors();
-        let mut total_score = 0.0;
         let mut total_weight = 0.0;
-        let mut has_critical_failure = false;
-
-        for factor in scoring_factors.iter() {
-            let factor_score = factor.calculate_score(opportunity, &self.execution_thresholds).await;
+        let mut weighted_score = 0.0;
+        
+        // Only log detailed scoring calculation if detailed logging enabled
+        let should_log_detailed = OPPORTUNITY_RATE_LOGGER.should_log() || 
+            std::env::var("DETAILED_LOGGING").map(|v| v == "true").unwrap_or(false);
             
-            if factor.is_critical() && factor_score == 0.0 {
-                has_critical_failure = true;
-                break;
+        for factor in &scoring_factors {
+            let factor_score = factor.calculate_score(opportunity, &self.execution_thresholds).await;
+            let factor_weight = factor.weight();
+            
+            if factor.is_critical() && factor_score <= 0.0 {
+                if should_log_detailed {
+                    debug!(
+                        target: "opportunity_evaluation::scoring",
+                        factor = factor.name(),
+                        is_critical = true,
+                        score = 0.0,
+                        "Critical factor rejected opportunity"
+                    );
+                }
+                return 0.0; // Critical factor failed
             }
             
-            total_score += factor_score * factor.weight();
-            total_weight += factor.weight();
+            total_weight += factor_weight;
+            weighted_score += factor_score * factor_weight;
+            
+            if should_log_detailed {
+                trace!(
+                    target: "opportunity_evaluation::scoring",
+                    factor = factor.name(),
+                    score = factor_score,
+                    weight = factor_weight,
+                    "Factor score calculated"
+                );
+            }
         }
-
-        if has_critical_failure {
+        
+        if total_weight <= 0.0 {
             return 0.0;
         }
-
-        // Normalize score
-        if total_weight > 0.0 {
-            total_score / total_weight
-        } else {
-            0.0
+        
+        let final_score = weighted_score / total_weight;
+        if should_log_detailed {
+            debug!(
+                target: "opportunity_evaluation::scoring",
+                final_score,
+                strategy = ?opportunity.strategy,
+                "Calculated final opportunity score"
+            );
         }
+        
+        final_score
     }
 
     /// Creates the default set of circuit breakers
@@ -1026,6 +1140,13 @@ impl OpportunityEvaluator {
 
     /// Get current market conditions (to be implemented based on your data sources)
     async fn get_market_conditions(&self) -> Option<MarketConditions> {
+        // TODO: Refactor market condition fetching.
+        // This method relied on the removed `engine` field.
+        // Market data should likely be fetched elsewhere (e.g., ListenBot or dedicated service)
+        // and passed to the evaluator when needed (e.g., during scoring or decision making).
+        warn!("get_market_conditions is currently disabled due to refactoring. Returning None.");
+        None
+        /*
         // Get market data from the engine
         if let Ok(prices) = self.engine.get_prices().await {
             let mut volatility_index: f64 = 0.0;
@@ -1080,6 +1201,110 @@ impl OpportunityEvaluator {
         } else {
             None
         }
+        */
+    }
+
+    /// Add RIG Agent for AI-powered decision enhancement
+    pub fn with_rig_agent(mut self, rig_agent: Arc<RigAgent>) -> Self {
+        self.rig_agent = Some(rig_agent);
+        self
+    }
+    
+    /// Sets the RIG agent for AI-enhanced decision making
+    pub async fn set_rig_agent(&mut self, agent: Arc<RigAgent>) {
+        self.rig_agent = Some(agent);
+    }
+    
+    /// Enhances opportunity evaluation with AI insights from RIG Agent
+    pub async fn enhance_with_ai(&self, opportunity: &mut MevOpportunity) -> Result<()> {
+        // Skip if no RIG agent is set
+        let Some(rig_agent) = &self.rig_agent else {
+            debug!("No RIG Agent available for opportunity enhancement");
+            return Ok(());
+        };
+        
+        debug!(strategy = ?opportunity.strategy, "Enhancing opportunity evaluation with RIG Agent");
+        
+        // Create raw opportunity data from MevOpportunity
+        let raw_opportunity = RawOpportunityData {
+            source_dex: "Unknown".to_string(), // Could be improved by adding DEX info to MevOpportunity
+            transaction_hash: opportunity.metadata.get("signature")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_tx_hash")
+                .to_string(),
+            input_token: opportunity.involved_tokens.first()
+                .cloned()
+                .unwrap_or_else(|| "UNKNOWN".to_string()),
+            output_token: opportunity.involved_tokens.get(1)
+                .cloned()
+                .unwrap_or_else(|| "UNKNOWN".to_string()),
+            input_amount: opportunity.required_capital,
+            output_amount: opportunity.required_capital + opportunity.estimated_profit,
+        };
+        
+        // Get market context data - could be further enhanced by using real market data
+        let market_context = MarketContext {
+            input_token_price_usd: 1.0, // Placeholder - should use real price data
+            output_token_price_usd: 1.0, // Placeholder
+            pool_liquidity_usd: 1_000_000.0, // Placeholder
+            recent_volatility_percent: 5.0, // Placeholder
+        };
+        
+        // Get AI evaluation using RIG Agent
+        let ai_evaluation = match rig_agent.evaluate_opportunity(&raw_opportunity, &market_context).await {
+            Ok(eval) => eval,
+            Err(e) => {
+                warn!(error = ?e, "Failed to get AI evaluation from RIG Agent, using rule-based fallback");
+                // Fallback to rule-based evaluation if AI fails
+                rig_agent.evaluate_opportunity_rule_based(&raw_opportunity, &market_context)?
+            }
+        };
+        
+        // Enhance opportunity with AI insights
+        let ai_confidence = ai_evaluation.confidence_score;
+        
+        // Average existing confidence with AI confidence, giving AI higher weight
+        let combined_confidence = (opportunity.confidence * 0.3) + (ai_confidence * 0.7);
+        opportunity.confidence = combined_confidence;
+        
+        // Update estimated profit if AI has a different view
+        if (ai_evaluation.estimated_profit_usd - opportunity.estimated_profit).abs() > 1.0 {
+            // If significant difference, choose more conservative estimate
+            opportunity.estimated_profit = opportunity.estimated_profit.min(ai_evaluation.estimated_profit_usd);
+            debug!(
+                ai_profit = ai_evaluation.estimated_profit_usd,
+                original_profit = opportunity.estimated_profit,
+                final_profit = opportunity.estimated_profit,
+                "Adjusted profit estimate based on AI insights"
+            );
+        }
+        
+        // Add AI reasoning to metadata
+        let mut metadata = opportunity.metadata.clone();
+        
+        // Clone the string values before moving them
+        let ai_reasoning = ai_evaluation.reasoning.clone();
+        let ai_suggestion = ai_evaluation.suggested_action.clone();
+        
+        metadata.as_object_mut().map(|m| {
+            m.insert("ai_reasoning".into(), serde_json::Value::String(ai_reasoning));
+            m.insert("ai_suggestion".into(), serde_json::Value::String(ai_suggestion));
+            let ai_conf_value = match serde_json::Number::from_f64(ai_confidence) {
+                Some(num) => serde_json::Value::Number(num),
+                None => serde_json::Value::Null,
+            };
+            m.insert("ai_confidence".into(), ai_conf_value);
+        });
+        opportunity.metadata = metadata;
+        
+        debug!(
+            ai_confidence = ai_confidence,
+            combined_confidence = combined_confidence,
+            ai_suggested_action = %ai_evaluation.suggested_action,
+            "Enhanced opportunity with AI insights"
+        );
+        
+        Ok(())
     }
 }
 
@@ -1095,78 +1320,97 @@ impl StrategySpecificFactor {
 
     fn calculate_arbitrage_score(&self, opportunity: &MevOpportunity) -> f64 {
         let metadata: arbitrage::ArbitrageMetadata = 
-            if let Ok(m) = serde_json::from_value(opportunity.metadata.clone()) {
-                m
-            } else {
-                return 0.0;
-            };
-
-        // Score based on number of hops (fewer is better)
-        let hop_score = 1.0 - (metadata.token_path.len() as f64 - 2.0) / 3.0;
+            serde_json::from_value(opportunity.metadata.clone()).unwrap_or_else(|_| {
+                warn!("Failed to parse arbitrage metadata");
+                arbitrage::ArbitrageMetadata {
+                    source_dex: "Unknown".to_string(),
+                    target_dex: "Unknown".to_string(),
+                    token_path: vec![],
+                    price_difference_percent: 0.0,
+                    estimated_gas_cost_usd: 0.0,
+                    optimal_trade_size_usd: 0.0,
+                    price_impact_percent: 0.0,
+                }
+            });
         
-        // Score based on liquidity (more is better)
-        let min_liquidity = metadata.liquidity.iter().copied().fold(f64::INFINITY, f64::min);
-        let liquidity_score = (min_liquidity / 100000.0).min(1.0);
+        // Calculate various subscores based on the arbitrage-specific metrics
+        let price_diff_score = metadata.price_difference_percent / 3.0; // Normalize to 0-1 range (3% diff = 1.0)
         
-        // Score based on price impact (less is better)
-        let total_impact: f64 = metadata.price_impacts.iter().sum();
-        let impact_score = (1.0 - total_impact * 10.0).max(0.0);
-
-        // Combine scores with weights
-        let weights = [0.4, 0.3, 0.3];
-        hop_score * weights[0] +
-        liquidity_score * weights[1] +
-        impact_score * weights[2]
+        // Lower price impact is better
+        let impact_score = (1.0 - metadata.price_impact_percent / 100.0 * 10.0).max(0.0); 
+        
+        // Simple calculation for now - score based on price difference and impact
+        (price_diff_score * 0.7 + impact_score * 0.3).min(1.0)
     }
 
     fn calculate_sandwich_score(&self, opportunity: &MevOpportunity) -> f64 {
         let metadata: sandwich::SandwichMetadata = 
-            if let Ok(m) = serde_json::from_value(opportunity.metadata.clone()) {
-                m
-            } else {
-                return 0.0;
-            };
-
-        // Score based on target transaction size (larger is better, up to a point)
-        let size_score = (metadata.target_tx_size / 50000.0).min(1.0);
+            serde_json::from_value(opportunity.metadata.clone()).unwrap_or_else(|_| {
+                warn!("Failed to parse sandwich metadata");
+                sandwich::SandwichMetadata {
+                    dex: "Unknown".to_string(),
+                    target_tx_hash: "Unknown".to_string(),
+                    target_tx_value_usd: 0.0,
+                    token_pair: ("Unknown".to_string(), "Unknown".to_string()),
+                    pool_liquidity_usd: 0.0,
+                    price_impact_pct: 0.0,
+                    optimal_position_size_usd: 0.0,
+                    frontrun_slippage_pct: 0.0,
+                    backrun_slippage_pct: 0.0,
+                }
+            });
         
-        // Score based on total price impact (less is better)
-        let total_impact = metadata.front_run_impact + metadata.back_run_impact;
-        let impact_score = (1.0 - total_impact * 20.0).max(0.0);
+        // Calculate score based on transaction size (normalized to 0-1)
+        let size_score = (metadata.target_tx_value_usd / 50000.0).min(1.0);
         
-        // Score based on gas costs relative to profit (less is better)
-        let gas_ratio = metadata.gas_cost / opportunity.estimated_profit;
+        // Total impact based on front and back run slippage
+        let total_impact = metadata.frontrun_slippage_pct + metadata.backrun_slippage_pct;
+        let impact_score = (1.0 - total_impact / 100.0 * 20.0).max(0.0);
+        
+        // Calculate gas-to-profit ratio (estimated via slippage)
+        let gas_cost_est = opportunity.estimated_profit * 0.05; // assume 5% gas cost
+        let gas_ratio = gas_cost_est / opportunity.estimated_profit;
         let gas_score = (1.0 - gas_ratio * 2.0).max(0.0);
-
+        
         // Combine scores with weights
-        let weights = [0.4, 0.3, 0.3];
-        size_score * weights[0] +
-        impact_score * weights[1] +
-        gas_score * weights[2]
+        (size_score * 0.3 + impact_score * 0.5 + gas_score * 0.2).min(1.0)
     }
 
     fn calculate_token_snipe_score(&self, opportunity: &MevOpportunity) -> f64 {
         let metadata: token_snipe::TokenSnipeMetadata = 
-            if let Ok(m) = serde_json::from_value(opportunity.metadata.clone()) {
-                m
-            } else {
-                return 0.0;
-            };
-
-        // Score based on verification status
-        let verification_score = if metadata.is_verified { 1.0 } else { 0.0 };
+            serde_json::from_value(opportunity.metadata.clone()).unwrap_or_else(|_| {
+                warn!("Failed to parse token snipe metadata");
+                token_snipe::TokenSnipeMetadata {
+                    token_address: "Unknown".to_string(),
+                    token_symbol: "Unknown".to_string(),
+                    dex: "Unknown".to_string(),
+                    initial_liquidity_usd: 0.0,
+                    initial_price_usd: 0.0,
+                    initial_market_cap_usd: 0.0,
+                    proposed_investment_usd: 0.0,
+                    expected_return_multiplier: 0.0,
+                    max_position_percent: 0.0,
+                    optimal_hold_time_seconds: 0,
+                    acquisition_supply_percent: 0.0,
+                }
+            });
         
-        // Score based on holder metrics
-        let holder_score = metadata.holder_metrics.unique_holders as f64 / 200.0;
-        let distribution_score = 1.0 - metadata.holder_metrics.top_holder_percentage;
-        let liquidity_score = metadata.holder_metrics.liquidity_percentage;
-
+        // Calculate various subscores for token sniping
+        
+        // Liquidity score (normalized to 0-1)
+        let liquidity_score = (metadata.initial_liquidity_usd / 500000.0).min(1.0);
+        
+        // Market cap score (normalized to 0-1)
+        let market_cap_score = (metadata.initial_market_cap_usd / 2000000.0).min(1.0);
+        
+        // Return multiplier score
+        let return_score = (metadata.expected_return_multiplier / 10.0).min(1.0);
+        
+        // Position size relative to liquidity (lower is better)
+        let position_score = (1.0 - metadata.max_position_percent / 10.0).max(0.0);
+        
         // Combine scores with weights
-        let weights = [0.4, 0.2, 0.2, 0.2];
-        verification_score * weights[0] +
-        holder_score * weights[1] +
-        distribution_score * weights[2] +
-        liquidity_score * weights[3]
+        (liquidity_score * 0.3 + market_cap_score * 0.2 + return_score * 0.3 + position_score * 0.2).min(1.0)
     }
 }
 
@@ -1354,13 +1598,15 @@ mod tests {
         let (engine_instance, _) = Engine::from_env().await
             .expect("Engine creation failed in test - check environment variables");
         OpportunityEvaluator {
-            engine: Arc::new(engine_instance),
+            // engine: Arc::new(engine_instance), // Removed engine field assignment
             strategy_registry: StrategyRegistry::new(),
             min_confidence: 0.7, // Default test confidence
             max_risk_level: RiskLevel::High, // Default test risk level
             min_profit_threshold: 50.0, // Default test profit threshold
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
             execution_thresholds: ExecutionThresholds::default(),
+            strategy_executor: RwLock::new(None), // Initialize executor as None
+            rig_agent: None,
         }
     }
 

@@ -21,6 +21,20 @@ use solana_sdk::account::Account;
 use spl_token::state::Account as TokenAccount;
 use spl_associated_token_account::solana_program::program_pack::Pack;
 
+// Export the strategies module
+pub mod strategies;
+
+// Export the strategy execution service
+pub mod strategy_execution;
+
+// Include tests module when running tests
+#[cfg(test)]
+pub mod tests;
+
+// Re-export the strategy types used by this module
+pub use self::strategies::{ArbitragePath, ArbitrageStep};
+pub use self::strategy_execution::ExecutionService;
+
 /// Represents the result of a transaction simulation
 #[derive(Debug, Clone)]
 pub struct SimulationResult {
@@ -99,25 +113,6 @@ impl std::fmt::Debug for TransactionExecutor {
     }
 }
 
-// --- Structs for Arbitrage Strategy ---
-
-/// Represents a single step in an arbitrage path
-#[derive(Debug, Clone)] // Add derives as needed
-pub struct ArbitrageStep {
-    pub dex_program_id: Pubkey,
-    pub input_token_mint: Pubkey,
-    pub output_token_mint: Pubkey,
-    pub input_amount: u64,
-    pub min_output_amount: u64, // For slippage control
-    // Add any other DEX-specific parameters (e.g., pool addresses)
-}
-
-/// Represents a full arbitrage path
-#[derive(Debug, Clone)]
-pub struct ArbitragePath {
-    pub steps: Vec<ArbitrageStep>,
-}
-
 impl TransactionExecutor {
     /// Creates a new TransactionExecutor
     pub fn new(
@@ -150,6 +145,11 @@ impl TransactionExecutor {
         self.signer.pubkey()
     }
 
+    /// Returns whether the executor is in simulation mode.
+    pub fn simulation_mode(&self) -> bool {
+        self.simulation_mode
+    }
+
     /// Fetches the current balance of the signer wallet.
     pub async fn get_wallet_balance(&self) -> Result<u64> {
         self.rpc_client
@@ -157,8 +157,8 @@ impl TransactionExecutor {
             .map_err(|e| SandoError::SolanaRpc(format!("Failed to get wallet balance: {}", e)))
     }
 
-    /// Gets the associated token account address - static method using token program's functions
-    fn get_associated_token_address(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    /// Gets the associated token account address
+    pub fn get_associated_token_address(&self, owner: &Pubkey, mint: &Pubkey) -> Pubkey {
         // Use a more compatible approach to get the associated token address
         let owner_key = owner.to_string();
         let mint_key = mint.to_string();
@@ -882,7 +882,7 @@ impl TransactionExecutor {
         }
     }
 
-    /// Builds an unsigned transaction for a given arbitrage path
+    /// Builds an arbitrage transaction
     pub fn build_arbitrage_transaction(
         &self,
         arbitrage_path: &ArbitragePath,
@@ -947,223 +947,30 @@ impl TransactionExecutor {
         info!("Arbitrage transaction built successfully (using placeholders)");
         Ok(transaction)
     }
-}
 
-// Add basic unit tests for the executor structure
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::evaluator::{MevOpportunity, RiskLevel, Strategy};
-    use solana_sdk::message::Message;
-    use solana_sdk::pubkey::Pubkey;
-    use solana_sdk::signature::{Keypair, Signer};
-    use std::str::FromStr;
-
-    // Helper to get a test keypair
-    fn get_test_keypair() -> (Keypair, String) {
-        let kp = Keypair::new();
-        let b58 = bs58::encode(kp.to_bytes()).into_string();
-        (kp, b58)
-    }
-
-    // Helper to create a test opportunity
-    fn create_test_opportunity() -> MevOpportunity {
-        MevOpportunity {
-            strategy: Strategy::Arbitrage,
-            estimated_profit: 0.1,
-            risk_level: RiskLevel::Low,
-            involved_tokens: vec![
-                solana_sdk::native_token::id().to_string(),
-                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), // USDC
-            ],
-            allowed_output_tokens: vec![
-                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), // USDC
-            ],
-            allowed_programs: vec![
-                solana_sdk::system_program::id(),
-                Pubkey::from_str("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin").unwrap(), // Serum
-            ],
-            max_instructions: 10,
-            timeout: std::time::Duration::from_secs(30),
+    /// Creates a new TransactionExecutor for testing with a mock RPC client
+    #[cfg(test)]
+    pub fn new_for_tests() -> Self {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::signer::keypair::Keypair;
+        use std::sync::Arc;
+        
+        // Use default test RPC URL
+        let rpc_client = Arc::new(RpcClient::new("https://api.testnet.solana.com".to_string()));
+        
+        // Generate a random keypair for testing
+        let signer = Arc::new(Keypair::new());
+        
+        // Always use simulation mode for tests
+        let simulation_mode = true;
+        
+        Self {
+            rpc_client,
+            signer,
+            simulation_mode,
         }
     }
+}
 
-    #[test]
-    fn test_executor_creation_with_wallet() {
-        let (_kp, b58_key) = get_test_keypair();
-        let rpc_url = "https://api.devnet.solana.com"; 
-        // Test both simulation modes
-        let executor_sim_true = TransactionExecutor::new(rpc_url, &b58_key, true);
-        assert!(executor_sim_true.is_ok());
-        assert_eq!(executor_sim_true.unwrap().simulation_mode, true);
-
-        let executor_sim_false = TransactionExecutor::new(rpc_url, &b58_key, false);
-        assert!(executor_sim_false.is_ok());
-        assert_eq!(executor_sim_false.unwrap().simulation_mode, false);
-    }
-
-    #[test]
-    fn test_executor_creation_invalid_key() {
-        let rpc_url = "https://api.devnet.solana.com"; 
-        let executor_result = TransactionExecutor::new(rpc_url, "invalid-base58-key", false);
-        assert!(executor_result.is_err());
-        assert!(matches!(executor_result.unwrap_err(), SandoError::ConfigError(_)));
-    }
-
-    #[test]
-    fn test_build_arbitrage_transaction_structure() {
-        let (_kp, b58_key) = get_test_keypair();
-        let rpc_url = "https://api.devnet.solana.com"; 
-        let executor = TransactionExecutor::new(rpc_url, &b58_key, false).unwrap();
-
-        // Define a dummy arbitrage path
-        let dummy_dex = Pubkey::new_unique();
-        let token_a = Pubkey::new_unique();
-        let token_b = Pubkey::new_unique();
-        let token_c = Pubkey::new_unique();
-
-        let path = ArbitragePath {
-            steps: vec![
-                ArbitrageStep {
-                    dex_program_id: dummy_dex,
-                    input_token_mint: token_a,
-                    output_token_mint: token_b,
-                    input_amount: 1000,
-                    min_output_amount: 990,
-                },
-                ArbitrageStep {
-                    dex_program_id: dummy_dex,
-                    input_token_mint: token_b,
-                    output_token_mint: token_c,
-                    input_amount: 990, 
-                    min_output_amount: 980,
-                },
-            ]
-        };
-
-        let result = executor.build_arbitrage_transaction(&path);
-        assert!(result.is_ok());
-        let tx = result.unwrap();
-        assert_eq!(tx.message.instructions.len(), path.steps.len()); // Should have one instruction per step (currently dummy)
-        assert_eq!(tx.message.account_keys[0], executor.signer.pubkey()); // First key should be payer
-    }
-
-    #[tokio::test]
-    async fn test_execute_transaction_simulation_mode() {
-        // Test that execute_transaction returns Ok without sending in simulation mode
-        let (_kp, b58_key) = get_test_keypair();
-        let rpc_url = "https://api.devnet.solana.com"; // Use devnet for blockhash
-        let executor = TransactionExecutor::new(rpc_url, &b58_key, true).unwrap(); // Simulation mode = true
-
-        // Create a simple dummy transaction
-        let recipient = Pubkey::new_unique();
-        let instruction = solana_sdk::system_instruction::transfer(
-            &executor.signer.pubkey(),
-            &recipient,
-            1, // lamports
-        );
-        let message = Message::new(&[instruction], Some(&executor.signer.pubkey()));
-        // Blockhash added during execute_transaction
-        let tx = Transaction::new_unsigned(message);
-
-        // Execute in simulation mode
-        let result = executor.execute_transaction(tx).await;
-
-        // Should return Ok with a signature, but no transaction sent
-        assert!(result.is_ok(), "execute_transaction in sim mode failed: {:?}", result.err());
-        let signature = result.unwrap();
-        // Check if it looks like a valid signature (not default)
-        assert_ne!(signature, solana_sdk::signature::Signature::default()); 
-        // We can't easily verify it wasn't sent without more complex mocking or querying the network
-        // but the function should return Ok without panicking or hitting the network send.
-    }
-
-    #[tokio::test]
-    async fn test_simulation_success() {
-        let (_kp, b58_key) = get_test_keypair();
-        let rpc_url = "https://api.devnet.solana.com";
-        let executor = TransactionExecutor::new(rpc_url, &b58_key, false).unwrap();
-
-        // Create a simple SOL transfer transaction
-        let recipient = Pubkey::new_unique();
-        let instruction = solana_sdk::system_instruction::transfer(
-            &executor.signer.pubkey(),
-            &recipient,
-            1_000_000, // 0.001 SOL
-        );
-        let message = Message::new(&[instruction], Some(&executor.signer.pubkey()));
-        let transaction = Transaction::new_unsigned(message);
-
-        let opportunity = create_test_opportunity();
-        let result = executor.simulate_transaction(&opportunity, &transaction).await;
-
-        assert!(result.is_ok(), "Simulation failed: {:?}", result.err());
-        let sim_result = result.unwrap();
-
-        // Basic checks
-        assert!(sim_result.compute_units_consumed > 0);
-        assert!(!sim_result.instruction_logs.is_empty());
-        assert!(sim_result.token_balance_changes.contains_key(&solana_sdk::native_token::id().to_string()));
-        assert!(sim_result.safety_checks_passed);
-    }
-
-    #[tokio::test]
-    async fn test_simulation_safety_checks() {
-        let (_kp, b58_key) = get_test_keypair();
-        let rpc_url = "https://api.devnet.solana.com";
-        let executor = TransactionExecutor::new(rpc_url, &b58_key, false).unwrap();
-
-        // Create a transaction that should fail safety checks
-        let unauthorized_program = Pubkey::new_unique();
-        let instruction = Instruction::new_with_bytes(
-            unauthorized_program,
-            &[0],
-            vec![],
-        );
-        let message = Message::new(&[instruction], Some(&executor.signer.pubkey()));
-        let transaction = Transaction::new_unsigned(message);
-
-        let opportunity = create_test_opportunity();
-        let result = executor.simulate_transaction(&opportunity, &transaction).await;
-
-        assert!(result.is_ok());
-        let sim_result = result.unwrap();
-
-        // Should fail safety checks due to unauthorized program
-        assert!(!sim_result.safety_checks_passed);
-        assert!(sim_result.error.unwrap().contains("Unauthorized program"));
-    }
-
-    #[tokio::test]
-    async fn test_profit_calculation() {
-        let (_kp, b58_key) = get_test_keypair();
-        let rpc_url = "https://api.devnet.solana.com";
-        let executor = TransactionExecutor::new(rpc_url, &b58_key, false).unwrap();
-
-        // Create a test token balance change
-        let mut token_changes = HashMap::new();
-        token_changes.insert(
-            solana_sdk::native_token::id().to_string(),
-            TokenBalanceChange {
-                mint: solana_sdk::native_token::id().to_string(),
-                ui_amount_change: 0.1,
-                ui_amount_before: 1_000_000_000, // 1 SOL
-                ui_amount_after: 1_100_000_000, // 1.1 SOL
-            },
-        );
-
-        let opportunity = create_test_opportunity();
-        let gas_cost = 5_000_000; // 0.005 SOL
-
-        let (profit_sol, profit_usd) = executor.calculate_profit(
-            &token_changes,
-            gas_cost,
-            &opportunity,
-        ).await.unwrap();
-
-        // With 0.1 SOL gain and 0.005 SOL gas cost
-        assert!(profit_sol > 0.0);
-        // With placeholder SOL price of 100 USD
-        assert!(profit_usd > 0.0);
-    }
-} 
+// Basic TransactionExecutor unit tests are now in tests/executor_test.rs
+// and strategy tests are in src/executor/tests/strategies_test.rs 

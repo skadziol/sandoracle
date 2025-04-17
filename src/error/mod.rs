@@ -40,6 +40,8 @@ pub enum SandoError {
         message: String,
     },
     
+    DataProcessing(String),
+    
     Io(std::io::Error),
     Serialization(serde_json::Error),
     HttpClient(reqwest::Error),
@@ -77,6 +79,12 @@ pub enum StrategyErrorKind {
     InsufficientLiquidity,
     PriceImpactTooHigh,
     OpportunityExpired,
+    SimulationFailed,
+    Unprofitable,
+    SafetyCheckFailed,
+    ApiError,
+    UnsupportedTransactionVersion,
+    SecurityRisk,
     Other,
 }
 
@@ -141,6 +149,7 @@ impl fmt::Display for SandoError {
             SandoError::EngineError(msg) => write!(f, "Engine error: {}", msg),
             SandoError::Simulation(msg) => write!(f, "Simulation error: {}", msg),
             SandoError::DependencyError(msg) => write!(f, "Dependency error: {}", msg),
+            SandoError::DataProcessing(msg) => write!(f, "Data processing error: {}", msg),
         }
     }
 }
@@ -165,6 +174,12 @@ impl fmt::Display for StrategyErrorKind {
             Self::InsufficientLiquidity => write!(f, "Insufficient liquidity"),
             Self::PriceImpactTooHigh => write!(f, "Price impact too high"),
             Self::OpportunityExpired => write!(f, "Opportunity expired"),
+            Self::SimulationFailed => write!(f, "Simulation failed"),
+            Self::Unprofitable => write!(f, "Unprofitable"),
+            Self::SafetyCheckFailed => write!(f, "Safety check failed"),
+            Self::ApiError => write!(f, "External API error (e.g., Jupiter)"),
+            Self::UnsupportedTransactionVersion => write!(f, "Unsupported transaction version received"),
+            Self::SecurityRisk => write!(f, "Security risk detected"),
             Self::Other => write!(f, "Other strategy error"),
         }
     }
@@ -365,6 +380,7 @@ impl std::error::Error for SandoError {
             SandoError::InternalError(_) => None,
             SandoError::EngineError(_) => None,
             SandoError::DependencyError(_) => None,
+            SandoError::DataProcessing(_) => None,
         }
     }
 }

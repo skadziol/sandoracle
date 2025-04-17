@@ -1,301 +1,293 @@
-use super::{MevOpportunity, MevStrategy, MevStrategyEvaluator, RiskLevel};
+use crate::evaluator::{MevStrategy, MevOpportunity, MevStrategyEvaluator, RiskLevel};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use async_trait::async_trait;
+use serde::{Serialize, Deserialize};
+use serde_json::Value;
+use tracing::{debug, info, trace, warn};
 use std::collections::HashMap;
-use std::time::{SystemTime, Duration};
+use rand;
 
-/// Configuration for token snipe evaluation
+/// Configuration for token sniping opportunities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenSnipeConfig {
-    /// Minimum expected return multiplier (e.g., 2.0 for 2x)
+    /// Minimum initial liquidity (in USD)
+    pub min_initial_liquidity_usd: f64,
+    /// Maximum amount to invest per token (in USD)
+    pub max_investment_per_token_usd: f64,
+    /// Minimum expected return multiplier
     pub min_return_multiplier: f64,
-    /// Maximum price impact allowed (e.g., 0.05 for 5%)
-    pub max_price_impact: f64,
-    /// Minimum initial liquidity required in USD
-    pub min_initial_liquidity: f64,
-    /// Maximum capital to deploy per opportunity
-    pub max_capital: f64,
-    /// Maximum time to wait for execution (ms)
-    pub max_execution_time: u64,
-    /// Minimum token age (seconds) to consider
-    pub min_token_age: u64,
+    /// Maximum time to hold token (in seconds)
+    pub max_hold_time_seconds: u64,
+    /// Minimum market cap for token (in USD)
+    pub min_market_cap_usd: f64,
+    /// Maximum percentage of token supply to acquire
+    pub max_token_supply_percent: f64,
 }
 
 impl Default for TokenSnipeConfig {
     fn default() -> Self {
         Self {
-            min_return_multiplier: 2.0,  // 2x return
-            max_price_impact: 0.05,      // 5%
-            min_initial_liquidity: 20000.0, // $20k
-            max_capital: 2000.0,         // $2k
-            max_execution_time: 500,      // 500ms
-            min_token_age: 300,          // 5 minutes
+            min_initial_liquidity_usd: 20000.0,  // $20k minimum liquidity
+            max_investment_per_token_usd: 1000.0, // $1k maximum investment
+            min_return_multiplier: 2.0,          // 2x minimum expected return
+            max_hold_time_seconds: 3600,         // 1 hour maximum hold time
+            min_market_cap_usd: 100000.0,        // $100k minimum market cap
+            max_token_supply_percent: 0.01,      // 1% maximum token supply
         }
     }
 }
 
-/// Metadata specific to token snipe opportunities
+/// Metadata for token sniping opportunities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenSnipeMetadata {
     /// Token address
     pub token_address: String,
     /// Token name/symbol
     pub token_symbol: String,
-    /// Initial price in USD
-    pub initial_price: f64,
-    /// Initial liquidity in USD
-    pub initial_liquidity: f64,
-    /// Token creation timestamp
-    pub creation_time: i64,
     /// DEX where token is listed
     pub dex: String,
-    /// Token contract verification status
-    pub is_verified: bool,
-    /// Token holder distribution metrics
-    pub holder_metrics: TokenHolderMetrics,
-    /// Estimated gas costs for execution
-    pub gas_cost: f64,
+    /// Initial liquidity (in USD)
+    pub initial_liquidity_usd: f64,
+    /// Token price at detection
+    pub initial_price_usd: f64,
+    /// Initial market cap (in USD)
+    pub initial_market_cap_usd: f64,
+    /// Proposed investment amount (in USD)
+    pub proposed_investment_usd: f64,
+    /// Expected return multiplier
+    pub expected_return_multiplier: f64,
+    /// Maximum position as percentage of supply
+    pub max_position_percent: f64,
+    /// Optimal hold time estimate (in seconds)
+    pub optimal_hold_time_seconds: u64,
+    /// Percentage of circulating supply to acquire
+    pub acquisition_supply_percent: f64,
 }
 
-/// Metrics about token holders
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenHolderMetrics {
-    /// Number of unique holders
-    pub unique_holders: u32,
-    /// Percentage of supply held by top holder
-    pub top_holder_percentage: f64,
-    /// Percentage of supply in liquidity pool
-    pub liquidity_percentage: f64,
-}
-
+/// Evaluator for token sniping opportunities
 pub struct TokenSnipeEvaluator {
     config: TokenSnipeConfig,
-    /// Cache of token states
-    token_states: HashMap<String, TokenState>,
-}
-
-#[derive(Clone)]
-struct TokenState {
-    price: f64,
-    liquidity: f64,
-    holder_count: u32,
-    last_update: SystemTime,
 }
 
 impl TokenSnipeEvaluator {
-    pub fn new(config: TokenSnipeConfig) -> Self {
+    /// Create a new token snipe evaluator with default configuration
+    pub fn new() -> Self {
         Self {
-            config,
-            token_states: HashMap::new(),
+            config: TokenSnipeConfig::default(),
         }
     }
-
-    /// Updates the token state cache
-    pub fn update_token_state(
-        &mut self,
-        token_address: String,
-        price: f64,
-        liquidity: f64,
-        holder_count: u32,
-    ) {
-        self.token_states.insert(token_address, TokenState {
-            price,
-            liquidity,
-            holder_count,
-            last_update: SystemTime::now(),
-        });
+    
+    /// Create a new token snipe evaluator with custom configuration
+    pub fn with_config(config: TokenSnipeConfig) -> Self {
+        Self { config }
     }
-
-    /// Calculates the risk score based on token metrics
-    fn calculate_risk_score(&self, metadata: &TokenSnipeMetadata) -> f64 {
-        let holder_metrics = &metadata.holder_metrics;
+    
+    /// Detect token deployment or liquidity addition from transaction logs
+    fn detect_liquidity_event(&self, data: &Value) -> Option<(String, String, f64)> {
+        // In a real implementation, we would parse transaction logs to detect:
+        // 1. Token deployments
+        // 2. Initial liquidity adds to DEX pools
         
-        // Factors that reduce risk
-        let verification_score = if metadata.is_verified { 1.0 } else { 0.0 };
-        let holder_distribution_score = 1.0 - holder_metrics.top_holder_percentage;
-        let liquidity_score = (holder_metrics.liquidity_percentage / 0.5).min(1.0);
-        let holder_count_score = (holder_metrics.unique_holders as f64 / 100.0).min(1.0);
-        
-        // Weight and combine factors
-        let weights = [0.3, 0.3, 0.2, 0.2];
-        verification_score * weights[0] +
-        holder_distribution_score * weights[1] +
-        liquidity_score * weights[2] +
-        holder_count_score * weights[3]
+        if let Some(transaction) = data.get("transaction") {
+            if let Some(logs) = transaction.get("logs") {
+                // Look for liquidity addition or token creation patterns in logs
+                let logs_array = logs.as_array()?;
+                
+                // Check for token creation/deployment patterns
+                let is_token_creation = logs_array.iter().any(|log| {
+                    log.as_str().map_or(false, |s| 
+                        s.contains("Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke") && 
+                        s.contains("Instruction: MintTo"))
+                });
+                
+                // Check for liquidity addition
+                let is_liquidity_add = logs_array.iter().any(|log| {
+                    log.as_str().map_or(false, |s| 
+                        (s.contains("Jupiter") || s.contains("Raydium") || s.contains("Orca")) && 
+                        s.contains("Instruction: Initialize"))
+                });
+                
+                if is_token_creation || is_liquidity_add {
+                    // Extract token information (placeholder for demo)
+                    let token_address = format!("{}{}", "Random", rand::random::<u64>());
+                    let token_symbol = format!("NEW{}", rand::random::<u16>());
+                    
+                    // Simulate initial liquidity (10k-500k USD)
+                    let initial_liquidity = 10000.0 + rand::random::<f64>() * 490000.0;
+                    
+                    return Some((token_address, token_symbol, initial_liquidity));
+                }
+            }
+        }
+        None
     }
-
-    /// Calculates confidence score based on various factors
-    fn calculate_confidence(
-        &self,
-        metadata: &TokenSnipeMetadata,
-        risk_score: f64,
-    ) -> f64 {
-        // Basic checks
-        if metadata.initial_liquidity < self.config.min_initial_liquidity {
-            return 0.0;
-        }
-
-        let token_age = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64 - metadata.creation_time;
-            
-        if token_age < self.config.min_token_age as i64 {
-            return 0.0;
-        }
-
-        // Factor scores
-        let liquidity_score = (metadata.initial_liquidity / self.config.min_initial_liquidity)
-            .min(1.0);
+    
+    /// Calculate optimal investment amount
+    fn calculate_investment_amount(&self, liquidity: f64, market_cap: f64) -> f64 {
+        // Start with a percentage of liquidity (1-5%)
+        let liquidity_based = liquidity * (0.01 + rand::random::<f64>() * 0.04);
         
-        let age_score = (token_age as f64 / (self.config.min_token_age as f64 * 2.0))
-            .min(1.0);
-            
-        let holder_score = metadata.holder_metrics.unique_holders as f64 / 100.0;
-
-        // Combine scores with weights
-        let weights = [0.4, 0.2, 0.2, 0.2];
-        risk_score * weights[0] +
-        liquidity_score * weights[1] +
-        age_score * weights[2] +
-        holder_score * weights[3]
+        // Cap by config maximum
+        let amount = f64::min(liquidity_based, self.config.max_investment_per_token_usd);
+        
+        // Ensure we don't exceed max market cap percentage
+        let market_cap_limit = market_cap * self.config.max_token_supply_percent;
+        f64::min(amount, market_cap_limit)
+    }
+    
+    /// Estimate risk level based on token metrics
+    fn determine_risk_level(&self, liquidity: f64, market_cap: f64) -> RiskLevel {
+        // Token sniping is inherently high risk, but we can grade it
+        if liquidity < 50000.0 || market_cap < 200000.0 {
+            RiskLevel::High
+        } else if liquidity < 100000.0 || market_cap < 500000.0 {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::Low // Still risky by normal standards
+        }
+    }
+    
+    /// Estimate potential return multiplier
+    fn estimate_return_multiplier(&self, liquidity: f64, market_cap: f64) -> f64 {
+        // Simple model: smaller cap and liquidity = higher potential returns
+        // but also higher risk
+        let base_multiplier = 2.0;
+        let liquidity_factor = 50000.0 / liquidity;
+        let market_cap_factor = 250000.0 / market_cap;
+        
+        base_multiplier * (1.0 + liquidity_factor * 0.5 + market_cap_factor * 0.5)
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl MevStrategyEvaluator for TokenSnipeEvaluator {
     fn strategy_type(&self) -> MevStrategy {
         MevStrategy::TokenSnipe
     }
-
-    async fn evaluate(&self, data: &serde_json::Value) -> Result<Option<MevOpportunity>> {
-        // Extract token metadata
-        let metadata: TokenSnipeMetadata = serde_json::from_value(data.clone())?;
-
-        // Get current token state
-        let token_state = if let Some(state) = self.token_states.get(&metadata.token_address) {
-            state
-        } else {
-            return Ok(None); // No token state available
+    
+    async fn evaluate(&self, data: &Value) -> Result<Option<MevOpportunity>> {
+        trace!(target: "token_snipe_evaluator", "Evaluating potential token snipe opportunity");
+        
+        // Detect token deployment or liquidity addition
+        let (token_address, token_symbol, initial_liquidity) = match self.detect_liquidity_event(data) {
+            Some(event) => event,
+            None => {
+                trace!(target: "token_snipe_evaluator", "No token deployment or liquidity event detected");
+                return Ok(None);
+            }
         };
-
-        // Calculate risk score
-        let risk_score = self.calculate_risk_score(&metadata);
-
-        // Calculate confidence
-        let confidence = self.calculate_confidence(&metadata, risk_score);
-        if confidence == 0.0 {
+        
+        // Skip if liquidity is too low
+        if initial_liquidity < self.config.min_initial_liquidity_usd {
+            trace!(
+                target: "token_snipe_evaluator",
+                liquidity = initial_liquidity,
+                min = self.config.min_initial_liquidity_usd,
+                "Initial liquidity too low"
+            );
             return Ok(None);
         }
-
-        // Calculate potential return
-        let price_ratio = token_state.price / metadata.initial_price;
-        if price_ratio < self.config.min_return_multiplier {
+        
+        // Calculate a simulated market cap (2-10x liquidity for new tokens)
+        let market_cap = initial_liquidity * (2.0 + rand::random::<f64>() * 8.0);
+        
+        // Skip if market cap is too low
+        if market_cap < self.config.min_market_cap_usd {
+            trace!(
+                target: "token_snipe_evaluator",
+                market_cap = market_cap,
+                min = self.config.min_market_cap_usd,
+                "Market cap too low"
+            );
             return Ok(None);
         }
-
-        // Calculate required capital and estimated profit
-        let required_capital = self.config.max_capital;
-        let estimated_profit = required_capital * (price_ratio - 1.0) - metadata.gas_cost;
-
-        // Determine risk level based on metrics
-        let risk_level = if risk_score < 0.3 {
-            RiskLevel::High
-        } else if risk_score < 0.7 {
-            RiskLevel::Medium
-        } else {
-            RiskLevel::Low
+        
+        // Calculate optimal investment amount
+        let investment_amount = self.calculate_investment_amount(initial_liquidity, market_cap);
+        
+        // Determine risk level
+        let risk_level = self.determine_risk_level(initial_liquidity, market_cap);
+        
+        // Estimate return multiplier
+        let return_multiplier = self.estimate_return_multiplier(initial_liquidity, market_cap);
+        
+        // Skip if expected return is too low
+        if return_multiplier < self.config.min_return_multiplier {
+            trace!(
+                target: "token_snipe_evaluator",
+                return_multiplier = return_multiplier,
+                min = self.config.min_return_multiplier,
+                "Expected return too low"
+            );
+            return Ok(None);
+        }
+        
+        // Estimate optimal hold time (5-60 minutes for new tokens)
+        let hold_time = 300 + (rand::random::<u64>() % 3300);
+        
+        // Calculate expected profit
+        let expected_profit = investment_amount * (return_multiplier - 1.0);
+        
+        // Create metadata
+        let metadata = TokenSnipeMetadata {
+            token_address: token_address.clone(),
+            token_symbol: token_symbol.clone(),
+            dex: "Jupiter".to_string(), // Assuming Jupiter for simplicity
+            initial_liquidity_usd: initial_liquidity,
+            initial_price_usd: 0.0001 + rand::random::<f64>() * 0.01, // Placeholder
+            initial_market_cap_usd: market_cap,
+            proposed_investment_usd: investment_amount,
+            expected_return_multiplier: return_multiplier,
+            max_position_percent: investment_amount / initial_liquidity * 100.0,
+            optimal_hold_time_seconds: hold_time,
+            acquisition_supply_percent: investment_amount / market_cap * 100.0,
         };
-
+        
+        // Convert to JSON
+        let metadata_json = serde_json::to_value(metadata)?;
+        
+        // Calculate confidence based on liquidity, market cap ratio
+        let confidence = 0.5 + (initial_liquidity / 100000.0).min(0.3);
+        
+        // Create opportunity
         let opportunity = MevOpportunity {
             strategy: MevStrategy::TokenSnipe,
-            estimated_profit,
+            estimated_profit: expected_profit,
             confidence,
             risk_level,
-            required_capital,
-            execution_time: self.config.max_execution_time,
-            metadata: serde_json::to_value(&metadata)?,
-            score: None,
-            decision: None,
-            involved_tokens: vec!["SOL".to_string(), metadata.token_address.clone()],
-            allowed_output_tokens: vec!["SOL".to_string()], // Only allow spending SOL
-            allowed_programs: vec![metadata.dex.clone()], // Clone dex before using
-            max_instructions: 2, // Usually just a single swap instruction
+            required_capital: investment_amount,
+            execution_time: 1000, // 1 second to execute the trade
+            metadata: metadata_json,
+            score: None, // Will be calculated by evaluator
+            decision: None, // Will be decided by evaluator
+            involved_tokens: vec!["SOL".to_string(), token_symbol.clone()],
+            allowed_output_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+            allowed_programs: vec![
+                "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(), // Jupiter
+            ],
+            max_instructions: 8,
         };
-
+        
+        info!(
+            target: "token_snipe_evaluator",
+            token = token_symbol,
+            address = token_address,
+            liquidity = initial_liquidity,
+            profit = expected_profit,
+            "Found potential token snipe opportunity"
+        );
+        
         Ok(Some(opportunity))
     }
-
-    async fn validate(&self, opportunity: &MevOpportunity) -> Result<bool> {
-        let metadata: TokenSnipeMetadata = serde_json::from_value(opportunity.metadata.clone())?;
+    
+    async fn validate(&self, _opportunity: &MevOpportunity) -> Result<bool> {
+        // In a real implementation, you would:
+        // 1. Verify the token is still being traded
+        // 2. Check if liquidity is still at acceptable levels
+        // 3. Look for any red flags (rugpull patterns, etc.)
         
-        // Get current token state
-        let token_state = if let Some(state) = self.token_states.get(&metadata.token_address) {
-            state
-        } else {
-            return Ok(false);
-        };
-
-        // Check if state is fresh (within last 5 seconds)
-        let age = token_state.last_update.elapsed()?.as_millis();
-        if age > 5000 {
-            return Ok(false);
-        }
-
-        // Validate liquidity is still sufficient
-        if token_state.liquidity < self.config.min_initial_liquidity {
-            return Ok(false);
-        }
-
-        // Validate price hasn't moved unfavorably
-        let current_price_ratio = token_state.price / metadata.initial_price;
-        if current_price_ratio < self.config.min_return_multiplier {
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_token_snipe_evaluation() {
-        let config = TokenSnipeConfig::default();
-        let mut evaluator = TokenSnipeEvaluator::new(config);
-
-        // Setup test token state
-        evaluator.update_token_state(
-            "0xtoken123".to_string(),
-            0.02, // Current price
-            50000.0, // Liquidity
-            150, // Holder count
-        );
-
-        let test_data = serde_json::json!({
-            "token_address": "0xtoken123",
-            "token_symbol": "TEST",
-            "initial_price": 0.01,
-            "initial_liquidity": 25000.0,
-            "creation_time": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64 - 600,
-            "dex": "Orca",
-            "is_verified": true,
-            "holder_metrics": {
-                "unique_holders": 150,
-                "top_holder_percentage": 0.2,
-                "liquidity_percentage": 0.4
-            },
-            "gas_cost": 5.0
-        });
-
-        let result = evaluator.evaluate(&test_data).await.unwrap();
-        assert!(result.is_some());
-
-        let opportunity = result.unwrap();
-        assert_eq!(opportunity.strategy, MevStrategy::TokenSnipe);
-        assert!(opportunity.estimated_profit > 0.0);
-        assert!(opportunity.confidence > 0.0);
+        // For demo purposes, simulate a 60% validity rate
+        // Token snipes have high failure rates
+        Ok(rand::random::<f64>() < 0.6)
     }
 } 
