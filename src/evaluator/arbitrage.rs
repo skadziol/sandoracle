@@ -5,6 +5,7 @@ use serde::{Serialize, Deserialize};
 use serde_json::Value;
 use tracing::{debug, info, trace, warn};
 use std::collections::HashMap;
+use anyhow::anyhow;
 
 /// Configuration for arbitrage opportunities
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,85 +112,73 @@ impl MevStrategyEvaluator for ArbitrageEvaluator {
     
     async fn evaluate(&self, data: &Value) -> Result<Option<MevOpportunity>> {
         trace!(target: "arbitrage_evaluator", "Evaluating potential arbitrage opportunity");
-        
-        // This is a simplified implementation, you would need more sophisticated analysis
-        // including checking multiple DEXes for price discrepancies
-        
-        // Extract token pair from transaction (placeholder for now)
-        let token_pair = match self.extract_token_pairs(data) {
-            Some(pair) => pair,
-            None => {
-                trace!(target: "arbitrage_evaluator", "No token pair found in transaction");
-                return Ok(None);
-            }
-        };
-        
-        // In a real implementation, you would:
-        // 1. Query current prices from multiple DEXes for the token pair
-        // 2. Identify price discrepancies
-        // 3. Calculate potential profit after fees and gas
-        
-        // For demo purposes, let's simulate finding an opportunity 1 in 20 times
-        if rand::random::<f64>() < 0.05 {
-            let price_difference_percent = 0.5 + rand::random::<f64>() * 2.0; // 0.5% to 2.5%
-            let estimated_profit_usd = 50.0 + rand::random::<f64>() * 200.0; // $50 to $250
-            let liquidity_usd = 20000.0 + rand::random::<f64>() * 100000.0; // $20k to $120k
-            
-            let risk_level = self.determine_risk_level(price_difference_percent, liquidity_usd);
-            let required_capital = 1000.0 + rand::random::<f64>() * 5000.0; // $1k to $6k
-            
-            let arb_metadata = ArbitrageMetadata {
-                source_dex: "Jupiter".to_string(),
-                target_dex: "Raydium".to_string(),
-                token_path: vec![token_pair.0.clone(), token_pair.1.clone(), token_pair.0.clone()],
-                price_difference_percent,
-                estimated_gas_cost_usd: 0.1 + rand::random::<f64>() * 0.5, // $0.1 to $0.6
-                optimal_trade_size_usd: required_capital,
-                price_impact_percent: 0.1 + rand::random::<f64>() * 0.8, // 0.1% to 0.9%
-            };
-            
-            // Convert to JSON
-            let metadata = serde_json::to_value(arb_metadata)?;
-            
-            // Create opportunity with appropriate values
-            let opportunity = MevOpportunity {
-                strategy: MevStrategy::Arbitrage,
-                estimated_profit: estimated_profit_usd,
-                confidence: 0.6 + rand::random::<f64>() * 0.3, // 0.6 to 0.9
-                risk_level,
-                required_capital,
-                execution_time: 500 + rand::random::<u64>() * 1000, // 500ms to 1500ms
-                metadata,
-                score: None, // Will be calculated by evaluator
-                decision: None, // Will be decided by evaluator
-                involved_tokens: vec![token_pair.0, token_pair.1],
-                allowed_output_tokens: vec!["SOL".to_string(), "USDC".to_string()],
-                allowed_programs: vec![
-                    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(), // Jupiter
-                    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(), // Raydium
-                ],
-                max_instructions: 10,
-            };
-            
-            info!(
-                target: "arbitrage_evaluator",
-                profit = estimated_profit_usd,
-                price_diff = price_difference_percent,
-                tokens = ?opportunity.involved_tokens,
-                "Found potential arbitrage opportunity"
-            );
-            
-            Ok(Some(opportunity))
-        } else {
-            trace!(target: "arbitrage_evaluator", "No profitable arbitrage opportunity found");
-            Ok(None)
+        // Use real DEX price data if available
+        let price_map = data.get("real_dex_prices")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| anyhow!("No real_dex_prices in input data"))?;
+        // Collect all DEX prices (filter out None)
+        let mut dex_prices: Vec<(String, f64)> = price_map.iter()
+            .filter_map(|(dex, price)| price.as_f64().map(|p| (dex.clone(), p)))
+            .collect();
+        if dex_prices.len() < 2 {
+            trace!(target: "arbitrage_evaluator", "Not enough DEX prices for arbitrage");
+            return Ok(None);
         }
+        // Find best buy (lowest price) and best sell (highest price)
+        dex_prices.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let (buy_dex, buy_price) = &dex_prices[0];
+        let (sell_dex, sell_price) = &dex_prices[dex_prices.len() - 1];
+        let price_difference_percent = (sell_price - buy_price) / buy_price * 100.0;
+        // Only consider if spread is above config threshold
+        if price_difference_percent < self.config.min_profit_percentage * 100.0 {
+            trace!(target: "arbitrage_evaluator", "No profitable arbitrage spread");
+            return Ok(None);
+        }
+        // Estimate profit (for demo, use $1000 trade size)
+        let trade_size_usd = 1000.0;
+        let estimated_profit_usd = (sell_price - buy_price) / buy_price * trade_size_usd;
+        let liquidity_usd = 50000.0; // TODO: Use real liquidity if available
+        let risk_level = self.determine_risk_level(price_difference_percent, liquidity_usd);
+        let required_capital = trade_size_usd;
+        let arb_metadata = ArbitrageMetadata {
+            source_dex: buy_dex.clone(),
+            target_dex: sell_dex.clone(),
+            token_path: vec!["SOL".to_string(), "USDC".to_string(), "SOL".to_string()],
+            price_difference_percent,
+            estimated_gas_cost_usd: 0.2, // TODO: Use real gas estimate
+            optimal_trade_size_usd: trade_size_usd,
+            price_impact_percent: 0.1, // TODO: Use real price impact
+        };
+        let metadata = serde_json::to_value(arb_metadata)?;
+        let opportunity = MevOpportunity {
+            strategy: MevStrategy::Arbitrage,
+            estimated_profit: estimated_profit_usd,
+            confidence: 0.9, // TODO: Compute based on data quality
+            risk_level,
+            required_capital,
+            execution_time: 800, // ms, TODO: Estimate
+            metadata,
+            score: None,
+            decision: None,
+            involved_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+            allowed_output_tokens: vec!["SOL".to_string(), "USDC".to_string()],
+            allowed_programs: vec![buy_dex.clone(), sell_dex.clone()],
+            max_instructions: 10,
+        };
+        info!(
+            target: "arbitrage_evaluator",
+            profit = estimated_profit_usd,
+            price_diff = price_difference_percent,
+            buy_dex = %buy_dex,
+            sell_dex = %sell_dex,
+            "Found real arbitrage opportunity"
+        );
+        Ok(Some(opportunity))
     }
     
     async fn validate(&self, _opportunity: &MevOpportunity) -> Result<bool> {
         // In a real implementation, you would re-check prices to ensure the opportunity still exists
-        // For demo purposes, let's simulate a 90% validity rate
-        Ok(rand::random::<f64>() < 0.9)
+        Ok(true)
     }
 }
 

@@ -28,7 +28,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono;
 use crate::monitoring::{OPPORTUNITY_LOGGER, OPPORTUNITY_RATE_LOGGER};
 use crate::market_data::MarketDataCollector;
-use crate::jupiter_client::Jupiter;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
 
 /// Represents different types of MEV strategies
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -707,8 +709,8 @@ pub struct OpportunityEvaluator {
     strategy_executor: RwLock<Option<Arc<dyn StrategyExecutionService>>>,
     /// RIG Agent for AI-powered decision enhancement
     rig_agent: Option<Arc<RigAgent>>,
-    /// Market data collector for price and liquidity information
-    market_data_collector: Option<Arc<crate::market_data::MarketDataCollector>>,
+    /// Market data collector
+    market_data_collector: Option<Arc<MarketDataCollector>>,
 }
 
 /// This trait defines the interface for strategy execution services
@@ -784,48 +786,8 @@ impl OpportunityEvaluator {
     }
 
     /// Processes a detected MEV opportunity, evaluating and potentially executing it
-    ///
-    /// This method implements an "AI for Refinement" approach where:
-    /// 1. Quick initial threshold checks are performed first to filter out obviously non-viable opportunities
-    /// 2. For opportunities that pass the initial check, we enhance them with AI analysis
-    /// 3. The enhanced opportunity is then scored and a final execution decision is made
-    ///
-    /// This approach optimizes for:
-    /// - Speed: Fast initial filtering avoids AI latency for clearly non-viable opportunities
-    /// - Cost: Reduces API calls by only sending promising opportunities to the AI
-    /// - Quality: Still leverages AI for nuanced analysis of viable opportunities
     pub async fn process_mev_opportunity(&self, opportunity: &mut MevOpportunity) -> Result<Option<solana_sdk::signature::Signature>> {
-        // Perform quick initial checks before calling AI
-        // This saves API calls for opportunities that clearly don't meet basic thresholds
-        if !self.meets_thresholds(opportunity) {
-            debug!(
-                strategy = ?opportunity.strategy,
-                estimated_profit = opportunity.estimated_profit,
-                confidence = opportunity.confidence,
-                "Opportunity rejected by initial threshold check, skipping AI enhancement"
-            );
-            
-            // Set decision to Decline
-            opportunity.decision = Some(ExecutionDecision::Decline);
-            return Ok(None);
-        }
-        
-        // If we have a RIG agent and the opportunity passed initial checks, enhance with AI
-        if self.rig_agent.is_some() {
-            debug!(
-                strategy = ?opportunity.strategy,
-                estimated_profit = opportunity.estimated_profit,
-                confidence = opportunity.confidence,
-                "Initial threshold checks passed, enhancing with AI"
-            );
-            
-            match self.enhance_with_ai(opportunity).await {
-                Ok(_) => debug!("Successfully enhanced opportunity with AI"),
-                Err(e) => warn!(error = ?e, "Failed to enhance opportunity with AI, continuing with base evaluation"),
-            }
-        }
-        
-        // Calculate the opportunity score if not already done
+        // First, calculate the opportunity score if not already done
         if opportunity.score.is_none() {
             let score = self.calculate_opportunity_score(opportunity).await;
             opportunity.score = Some(score);
@@ -882,17 +844,6 @@ impl OpportunityEvaluator {
     /// Updates the execution thresholds configuration
     pub fn update_execution_thresholds(&mut self, thresholds: ExecutionThresholds) {
         self.execution_thresholds = thresholds;
-        // Access the values from self.execution_thresholds now that thresholds has been moved
-        self.min_confidence = self.execution_thresholds.min_confidence;
-        self.min_profit_threshold = self.execution_thresholds.min_profit_threshold;
-        self.max_risk_level = self.execution_thresholds.max_risk_level;
-        
-        info!(
-            min_confidence = self.min_confidence,
-            min_profit = self.min_profit_threshold,
-            max_risk = ?self.max_risk_level,
-            "Updated execution thresholds"
-        );
     }
 
     /// Registers a new strategy evaluator
@@ -911,28 +862,42 @@ impl OpportunityEvaluator {
     pub async fn evaluate_opportunity(&self, data: serde_json::Value) -> Result<Vec<MevOpportunity>> {
         let should_log_detailed = OPPORTUNITY_RATE_LOGGER.should_log() || 
             std::env::var("DETAILED_LOGGING").map(|v| v == "true").unwrap_or(false);
-            
         if should_log_detailed {
             debug!(target: "opportunity_evaluation", data_size = data.to_string().len(), "Starting opportunity evaluation");
         } else {
             trace!(target: "opportunity_evaluation", "Evaluating opportunity data");
         }
-        
         let mut opportunities = Vec::new();
         for (strategy_name, evaluator) in &self.strategy_registry.evaluators {
-            // Use trace for routine evaluations to reduce log volume
             trace!(target: "opportunity_evaluation::strategy", strategy = ?strategy_name, "Evaluating with strategy");
-            
-            match evaluator.evaluate(&data).await {
+            let mut strategy_data = data.clone();
+            if *strategy_name == MevStrategy::Arbitrage {
+                // Extract token pair (for demo, use SOL/USDC)
+                let input_token = "So11111111111111111111111111111111111111112"; // SOL
+                let output_token = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
+                // TODO: Use real extraction from data if available
+                // Hardcoded Raydium/Orca pool addresses for SOL/USDC
+                let raydium_pool = Some(Pubkey::from_str("8HoQnePLqPj4M7PUDzfw8e3Yw1E1Z9Qe7bE9i9P6h9bM").unwrap());
+                let orca_pool = Some(Pubkey::from_str("6UeJjQKk5QnKQ2rYZRk5vjnzzakDx4zYdE3KXy3Q3r5E").unwrap());
+                // Get RPC client (assume available globally or via config)
+                let rpc_client = RpcClient::new("https://api.mainnet-beta.solana.com");
+                // Fetch prices from all DEXes
+                let price_map = self.market_data_collector.as_ref().unwrap().fetch_all_dex_prices(
+                    &rpc_client,
+                    input_token,
+                    output_token,
+                    raydium_pool.as_ref(),
+                    orca_pool.as_ref(),
+                ).await;
+                // Inject into strategy data
+                strategy_data["real_dex_prices"] = serde_json::to_value(price_map).unwrap();
+            }
+            match evaluator.evaluate(&strategy_data).await {
                 Ok(Some(mut opportunity)) => {
-                    // Calculate score for the opportunity
                     let score = self.calculate_opportunity_score(&opportunity).await;
                     opportunity.score = Some(score);
-                    
-                    // Make execution decision
                     let decision = self.make_execution_decision(&opportunity).await;
                     opportunity.decision = Some(decision);
-                    
                     if should_log_detailed || decision == ExecutionDecision::Execute {
                         debug!(
                             target: "opportunity_evaluation::result",
@@ -943,14 +908,12 @@ impl OpportunityEvaluator {
                             "Opportunity evaluated"
                         );
                     }
-                    
                     opportunities.push(opportunity);
                 }
                 Ok(None) => {
                     trace!(target: "opportunity_evaluation::strategy", strategy = ?strategy_name, "No opportunity found for strategy");
                 }
                 Err(e) => {
-                    // Keep error logs at warn level for visibility
                     warn!(
                         target: "opportunity_evaluation::error",
                         error = ?e,
@@ -960,19 +923,9 @@ impl OpportunityEvaluator {
                 }
             }
         }
-        
-        // Always log the summary count at info level if opportunities found
         if !opportunities.is_empty() {
-            info!(
-                target: "opportunity_evaluation::summary",
-                count = opportunities.len(),
-                strategies = ?opportunities.iter().map(|o| &o.strategy).collect::<Vec<_>>(),
-                "Found potential opportunities"
-            );
-        } else if should_log_detailed {
-            debug!(target: "opportunity_evaluation::summary", "No opportunities found");
+            info!(target: "opportunity_evaluation::summary", count = opportunities.len(), "Opportunities found");
         }
-        
         Ok(opportunities)
     }
 
@@ -1163,50 +1116,9 @@ impl OpportunityEvaluator {
 
     /// Checks if an opportunity meets the configured thresholds
     fn meets_thresholds(&self, opportunity: &MevOpportunity) -> bool {
-        // Get strategy-specific parameters if available
-        let strategy_min_profit = self.execution_thresholds.strategy_params
-            .get(&opportunity.strategy)
-            .map(|params| params.min_profit)
-            .unwrap_or_else(|| self.min_profit_threshold);
-            
-        let strategy_min_confidence = self.execution_thresholds.strategy_params
-            .get(&opportunity.strategy)
-            .map(|params| params.min_confidence)
-            .unwrap_or_else(|| self.min_confidence);
-            
-        let strategy_max_risk = self.execution_thresholds.strategy_params
-            .get(&opportunity.strategy)
-            .map(|params| params.max_risk_level)
-            .unwrap_or_else(|| self.max_risk_level);
-        
-        // Apply slightly relaxed thresholds for initial screening
-        // We want to be a bit permissive here to allow AI to evaluate borderline cases
-        let min_profit_relaxed = strategy_min_profit * 0.7; // 70% of the normal threshold
-        let min_confidence_relaxed = strategy_min_confidence * 0.7; // 70% of the normal threshold
-        
-        // Basic viability checks - we can be more lenient on confidence but strict on profit
-        let meets_profit = opportunity.estimated_profit >= min_profit_relaxed;
-        let meets_confidence = opportunity.confidence >= min_confidence_relaxed;
-        let meets_risk = (opportunity.risk_level as u8) <= (strategy_max_risk as u8);
-        
-        // Log the threshold check results
-        if !meets_profit || !meets_confidence || !meets_risk {
-            trace!(
-                strategy = ?opportunity.strategy,
-                profit = opportunity.estimated_profit,
-                min_profit = min_profit_relaxed,
-                meets_profit = meets_profit,
-                confidence = opportunity.confidence,
-                min_confidence = min_confidence_relaxed,
-                meets_confidence = meets_confidence,
-                risk_level = ?opportunity.risk_level,
-                max_risk = ?strategy_max_risk,
-                meets_risk = meets_risk,
-                "Opportunity failed initial threshold check"
-            );
-        }
-        
-        meets_profit && meets_confidence && meets_risk
+        opportunity.confidence >= self.min_confidence
+            && (opportunity.risk_level.clone() as u8) <= (self.max_risk_level.clone() as u8)
+            && opportunity.estimated_profit >= self.min_profit_threshold
     }
 
     /// Checks if an opportunity should be executed based on the decision system
@@ -1308,20 +1220,9 @@ impl OpportunityEvaluator {
         self
     }
     
-    /// Add market data collector for token price and liquidity information
-    pub fn with_market_data_collector(mut self, collector: Arc<crate::market_data::MarketDataCollector>) -> Self {
-        self.market_data_collector = Some(collector);
-        self
-    }
-    
     /// Sets the RIG agent for AI-enhanced decision making
     pub async fn set_rig_agent(&mut self, agent: Arc<RigAgent>) {
         self.rig_agent = Some(agent);
-    }
-    
-    /// Sets the market data collector for token price and liquidity information
-    pub async fn set_market_data_collector(&mut self, collector: Arc<crate::market_data::MarketDataCollector>) {
-        self.market_data_collector = Some(collector);
     }
     
     /// Enhances opportunity evaluation with AI insights from RIG Agent
@@ -1334,16 +1235,9 @@ impl OpportunityEvaluator {
         
         debug!(strategy = ?opportunity.strategy, "Enhancing opportunity evaluation with RIG Agent");
         
-        // Extract DEX info from metadata if available
-        let source_dex = opportunity.metadata.get("dex")
-            .and_then(|v| v.as_str())
-            .or_else(|| opportunity.metadata.get("source_dex").and_then(|v| v.as_str()))
-            .unwrap_or("Unknown")
-            .to_string();
-        
         // Create raw opportunity data from MevOpportunity
         let raw_opportunity = RawOpportunityData {
-            source_dex,
+            source_dex: "Unknown".to_string(), // Could be improved by adding DEX info to MevOpportunity
             transaction_hash: opportunity.metadata.get("signature")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown_tx_hash")
@@ -1358,20 +1252,20 @@ impl OpportunityEvaluator {
             output_amount: opportunity.required_capital + opportunity.estimated_profit,
         };
         
-        // Extract tokens from the opportunity
-        let input_token = raw_opportunity.input_token.clone();
-        let output_token = raw_opportunity.output_token.clone();
-        
-        // Get market context using helper method
-        let market_context = self.create_market_context(&input_token, &output_token).await;
-        
-        debug!(
-            input_token = %raw_opportunity.input_token,
-            input_price = market_context.input_token_price_usd,
-            output_token = %raw_opportunity.output_token,
-            output_price = market_context.output_token_price_usd,
-            "Market data prepared for AI evaluation"
-        );
+        // Get market context data - could be further enhanced by using real market data
+        let market_context = MarketContext {
+            input_token_price_usd: 1.0, // Placeholder - should use real price data
+            output_token_price_usd: 1.0, // Placeholder
+            pool_liquidity_usd: 1_000_000.0, // Placeholder
+            recent_volatility_percent: 5.0, // Placeholder
+            average_market_price: 1.0,
+            average_market_price_change: 0.0,
+            average_market_volatility: 0.0,
+            market_token_prices: Default::default(),
+            market_token_price_changes: Default::default(),
+            market_token_volatility: Default::default(),
+            market_token_forecasts: Default::default(),
+        };
         
         // Get AI evaluation using RIG Agent
         let ai_evaluation = match rig_agent.evaluate_opportunity(&raw_opportunity, &market_context).await {
@@ -1402,31 +1296,16 @@ impl OpportunityEvaluator {
             );
         }
         
-        // Check if AI suggests this is not viable
-        if !ai_evaluation.is_viable && ai_confidence > 0.7 {
-            debug!(
-                ai_confidence = ai_confidence,
-                ai_reason = %ai_evaluation.reasoning,
-                "AI suggested this opportunity is not viable with high confidence"
-            );
-            
-            // Lower the confidence significantly if AI is highly confident it's not viable
-            opportunity.confidence *= 0.5;
-        }
-        
         // Add AI reasoning to metadata
         let mut metadata = opportunity.metadata.clone();
         
         // Clone the string values before moving them
         let ai_reasoning = ai_evaluation.reasoning.clone();
         let ai_suggestion = ai_evaluation.suggested_action.clone();
-        let is_viable = ai_evaluation.is_viable;
         
         metadata.as_object_mut().map(|m| {
             m.insert("ai_reasoning".into(), serde_json::Value::String(ai_reasoning));
             m.insert("ai_suggestion".into(), serde_json::Value::String(ai_suggestion));
-            m.insert("ai_is_viable".into(), serde_json::Value::Bool(is_viable));
-            
             let ai_conf_value = match serde_json::Number::from_f64(ai_confidence) {
                 Some(num) => serde_json::Value::Number(num),
                 None => serde_json::Value::Null,
@@ -1439,141 +1318,14 @@ impl OpportunityEvaluator {
             ai_confidence = ai_confidence,
             combined_confidence = combined_confidence,
             ai_suggested_action = %ai_evaluation.suggested_action,
-            ai_is_viable = is_viable,
             "Enhanced opportunity with AI insights"
         );
         
         Ok(())
     }
 
-    /// Creates a detailed market context with real market data for multiple tokens
-    pub async fn create_market_context_detailed(
-        &self,
-        market_data_collector: &MarketDataCollector,
-        market_tokens: &[String],
-        reference_token: &str,
-    ) -> Result<crate::rig_agent::MarketContext> {
-        debug!(tokens = ?market_tokens, "Creating detailed market context");
-        
-        let mut token_prices = HashMap::new();
-        let mut token_volatility = HashMap::new();
-        let mut token_price_changes = HashMap::new();
-        let mut avg_price = 0.0;
-        let mut avg_volatility = 0.0;
-        let mut avg_price_change = 0.0;
-        let mut count = 0;
-        
-        // Fetch full market data for each token
-        for token in market_tokens {
-            match market_data_collector.get_market_data(token, reference_token).await {
-                Ok(Some(market_data)) => {
-                    token_prices.insert(token.clone(), market_data.price);
-                    token_volatility.insert(token.clone(), market_data.volatility);
-                    token_price_changes.insert(token.clone(), market_data.price_change_24h);
-                    
-                    avg_price += market_data.price;
-                    avg_volatility += market_data.volatility;
-                    avg_price_change += market_data.price_change_24h;
-                    count += 1;
-                    
-                    debug!(
-                        token = %token, 
-                        price = %market_data.price, 
-                        volatility = %market_data.volatility,
-                        price_change = %market_data.price_change_24h,
-                        "Added token to market context"
-                    );
-                },
-                _ => {
-                    warn!(token = %token, "Failed to get market data for token");
-                }
-            }
-        }
-        
-        // Calculate averages
-        if count > 0 {
-            avg_price /= count as f64;
-            avg_volatility /= count as f64;
-            avg_price_change /= count as f64;
-        }
-        
-        // Create price forecasts for relevant tokens (5 minutes ahead)
-        let mut token_forecasts = HashMap::new();
-        for token in market_tokens {
-            if let Ok(Some(forecast)) = market_data_collector.get_price_forecast(token, 5).await {
-                token_forecasts.insert(token.clone(), forecast);
-                debug!(token = %token, forecast = %forecast, "Added price forecast");
-            }
-        }
-        
-        // Build the context
-        let context = crate::rig_agent::MarketContext {
-            input_token_price_usd: token_prices.get(&market_tokens[0]).cloned().unwrap_or(0.0),
-            output_token_price_usd: if market_tokens.len() > 1 {
-                token_prices.get(&market_tokens[1]).cloned().unwrap_or(0.0)
-            } else {
-                0.0
-            },
-            pool_liquidity_usd: 0.0, // Not available yet
-            recent_volatility_percent: avg_volatility * 100.0, // Convert to percentage
-            
-            // Additional fields
-            market_token_prices: token_prices,
-            market_token_volatility: token_volatility,
-            market_token_price_changes: token_price_changes,
-            market_token_forecasts: token_forecasts,
-            average_market_price: avg_price,
-            average_market_volatility: avg_volatility,
-            average_market_price_change: avg_price_change,
-        };
-        
-        Ok(context)
-    }
-
-    /// Creates a market context with real market data from string tokens
-    pub async fn create_market_context(&self, input_token: &str, output_token: &str) -> crate::rig_agent::MarketContext {
-        if let Some(collector) = &self.market_data_collector {
-            // Convert input and output tokens to a vector for compatibility with new implementation
-            let market_tokens = vec![input_token.to_string(), output_token.to_string()];
-            
-            // Use USDC as the reference token for prices
-            match self.create_market_context_detailed(collector, &market_tokens, "USDC").await {
-                Ok(context) => context,
-                Err(e) => {
-                    warn!("Error creating market context: {}", e);
-                    // Fallback to default context
-                    crate::rig_agent::MarketContext {
-                        input_token_price_usd: 1.0,
-                        output_token_price_usd: 1.0,
-                        pool_liquidity_usd: 1_000_000.0,
-                        recent_volatility_percent: 5.0,
-                        market_token_prices: HashMap::new(),
-                        market_token_volatility: HashMap::new(),
-                        market_token_price_changes: HashMap::new(),
-                        market_token_forecasts: HashMap::new(),
-                        average_market_price: 0.0,
-                        average_market_volatility: 0.0,
-                        average_market_price_change: 0.0,
-                    }
-                }
-            }
-        } else {
-            // If no market data collector is available, use default values
-            debug!("No market data collector available, using placeholder values");
-            crate::rig_agent::MarketContext {
-                input_token_price_usd: 1.0,
-                output_token_price_usd: 1.0,
-                pool_liquidity_usd: 1_000_000.0,
-                recent_volatility_percent: 5.0,
-                market_token_prices: HashMap::new(),
-                market_token_volatility: HashMap::new(),
-                market_token_price_changes: HashMap::new(),
-                market_token_forecasts: HashMap::new(),
-                average_market_price: 0.0,
-                average_market_volatility: 0.0,
-                average_market_price_change: 0.0,
-            }
-        }
+    pub async fn set_market_data_collector(&mut self, collector: Arc<MarketDataCollector>) {
+        self.market_data_collector = Some(collector);
     }
 }
 

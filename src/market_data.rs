@@ -9,9 +9,9 @@ use tracing::{info, error, warn, debug};
 use futures::future;
 use tokio::time::sleep;
 use std::cmp::min;
-use crate::price_provider::{MultiSourceProvider, PriceProvider, PriceData};
-use crate::price_provider::jupiter::JupiterProvider;
-use crate::price_provider::birdeye::BirdeyeProvider;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
 
 /// Enhanced market data with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,8 +86,8 @@ pub struct MarketDataCollector {
     /// List of supported token mints
     supported_tokens: Arc<RwLock<HashMap<String, bool>>>,
     
-    /// Multi-source price provider
-    multi_source_provider: Option<MultiSourceProvider>,
+    // Multi-source price provider (commented out)
+    // multi_source_provider: Option<MultiSourceProvider>,
 }
 
 impl MarketDataCollector {
@@ -111,7 +111,7 @@ impl MarketDataCollector {
             last_batch_update,
             max_retries: 3,
             supported_tokens,
-            multi_source_provider: None,
+            // multi_source_provider: None,
         };
         
         // Spawn a task to migrate old cache to new format
@@ -139,21 +139,19 @@ impl MarketDataCollector {
         // Initialize Jupiter client
         self.jupiter_client = Some(Jupiter::new(jupiter_api_url));
         
-        // Initialize Jupiter price provider
-        let jupiter_provider = match JupiterProvider::new(jupiter_api_url) {
-            Ok(provider) => provider,
-            Err(e) => {
-                error!("Failed to initialize Jupiter price provider: {}", e);
-                return Err(e);
-            }
-        };
-        
-        // Initialize multi-source provider with Jupiter
-        let providers: Vec<Box<dyn PriceProvider>> = vec![
-            Box::new(jupiter_provider),
-        ];
-        
-        self.multi_source_provider = Some(MultiSourceProvider::new(providers));
+        // Remove all price provider related code
+        // let jupiter_provider = match JupiterProvider::new(jupiter_api_url) {
+        //     Ok(provider) => provider,
+        //     Err(e) => {
+        //         error!("Failed to initialize Jupiter price provider: {}", e);
+        //         return Err(e);
+        //     }
+        // };
+        // 
+        // // Initialize multi-source provider with Jupiter
+        // let providers: Vec<Box<dyn PriceProvider>> = vec![
+        //     Box::new(jupiter_provider),
+        // ];
         
         info!("Initialized Jupiter client for real-time market data");
         Ok(self)
@@ -261,99 +259,98 @@ impl MarketDataCollector {
         }
         
         // Try to get price from multi-source provider first if available
-        if let Some(provider) = &self.multi_source_provider {
-            debug!(token=%token, "Attempting to get price from multi-source provider");
-            
-            // First try to get all prices and aggregate them
-            let prices = provider.get_prices_from_all_sources(token, reference_token).await?;
-            
-            if !prices.is_empty() {
-                debug!(token=%token, sources=%prices.len(), "Got prices from multiple sources");
-                
-                // Aggregate the prices
-                if let Some(aggregate) = provider.aggregate_prices(&prices) {
-                    // Update cache with the aggregated price
-                    {
-                        let mut cache = self.price_cache.write().await;
-                        cache.insert(
-                            token.to_string(), 
-                            CacheEntry::new(aggregate.price, self.default_ttl)
-                        );
-                    }
-                    
-                    // Create market data from the aggregate
-                    let market_data = MarketData {
-                        price: aggregate.price,
-                        market_cap: 0.0, // Unknown from price alone
-                        volume_24h: 0.0, // Unknown from price alone
-                        price_change_24h: 0.0, // Need historical data
-                        liquidity: 0.0, // Unknown from price alone
-                        volatility: 0.0, // Need historical data
-                        last_update: aggregate.timestamp,
-                        expires_at: Some(SystemTime::now() + Duration::from_secs(self.default_ttl)),
-                        source: format!("aggregate-{}", prices.len()),
-                        confidence: aggregate.confidence,
-                    };
-                    
-                    // Update market data cache
-                    self.update_market_data(token, market_data).await?;
-                    
-                    // Mark as supported
-                    {
-                        let mut supported = self.supported_tokens.write().await;
-                        supported.insert(token.to_string(), true);
-                    }
-                    
-                    return Ok(Some(aggregate.price));
-                }
-            }
-            
-            // If aggregation failed, try to get the best price
-            if let Ok(Some(best_price)) = provider.get_best_price(token, reference_token).await {
-                debug!(token=%token, source=?best_price.source, "Using best price from available sources");
-                
-                // Update cache with the best price
-                {
-                    let mut cache = self.price_cache.write().await;
-                    cache.insert(
-                        token.to_string(), 
-                        CacheEntry::new(best_price.price, self.default_ttl)
-                    );
-                }
-                
-                // Create market data from the best price
-                let market_data = MarketData {
-                    price: best_price.price,
-                    market_cap: 0.0, // Unknown from price alone
-                    volume_24h: 0.0, // Unknown from price alone
-                    price_change_24h: 0.0, // Need historical data
-                    liquidity: 0.0, // Unknown from price alone
-                    volatility: 0.0, // Need historical data
-                    last_update: best_price.timestamp,
-                    expires_at: Some(SystemTime::now() + Duration::from_secs(self.default_ttl)),
-                    source: format!("{:?}", best_price.source),
-                    confidence: best_price.confidence,
-                };
-                
-                // Update market data cache
-                self.update_market_data(token, market_data).await?;
-                
-                // Mark as supported
-                {
-                    let mut supported = self.supported_tokens.write().await;
-                    supported.insert(token.to_string(), true);
-                }
-                
-                return Ok(Some(best_price.price));
-            }
-        }
+        // if let Some(provider) = &self.multi_source_provider {
+        //     debug!(token=%token, "Attempting to get price from multi-source provider");
+        //     
+        //     // First try to get all prices and aggregate them
+        //     let prices = provider.get_prices_from_all_sources(token, reference_token).await?;
+        //     
+        //     if !prices.is_empty() {
+        //         debug!(token=%token, sources=%prices.len(), "Got prices from multiple sources");
+        //         
+        //         // Aggregate the prices
+        //         if let Some(aggregate) = provider.aggregate_prices(&prices) {
+        //             // Update cache with the aggregated price
+        //             {
+        //                 let mut cache = self.price_cache.write().await;
+        //                 cache.insert(
+        //                     token.to_string(), 
+        //                     CacheEntry::new(aggregate.price, self.default_ttl)
+        //                 );
+        //             }
+        //             
+        //             // Create market data from the aggregate
+        //             let market_data = MarketData {
+        //                 price: aggregate.price,
+        //                 market_cap: 0.0, // Unknown from price alone
+        //                 volume_24h: 0.0, // Unknown from price alone
+        //                 price_change_24h: 0.0, // Need historical data
+        //                 liquidity: 0.0, // Unknown from price alone
+        //                 volatility: 0.0, // Need historical data
+        //                 last_update: aggregate.timestamp,
+        //                 expires_at: Some(SystemTime::now() + Duration::from_secs(self.default_ttl)),
+        //                 source: format!("aggregate-{}", prices.len()),
+        //                 confidence: aggregate.confidence,
+        //             };
+        //             
+        //             // Update market data cache
+        //             self.update_market_data(token, market_data).await?;
+        //             
+        //             // Mark as supported
+        //             {
+        //                 let mut supported = self.supported_tokens.write().await;
+        //                 supported.insert(token.to_string(), true);
+        //             }
+        //             
+        //             return Ok(Some(aggregate.price));
+        //         }
+        //     }
+        //     
+        //     // If aggregation failed, try to get the best price
+        //     if let Ok(Some(best_price)) = provider.get_best_price(token, reference_token).await {
+        //         debug!(token=%token, source=?best_price.source, "Using best price from available sources");
+        //         
+        //         // Update cache with the best price
+        //         {
+        //             let mut cache = self.price_cache.write().await;
+        //             cache.insert(
+        //                 token.to_string(), 
+        //                 CacheEntry::new(best_price.price, self.default_ttl)
+        //             );
+        //         }
+        //         
+        //         // Create market data from the best price
+        //         let market_data = MarketData {
+        //             price: best_price.price,
+        //             market_cap: 0.0, // Unknown from price alone
+        //             volume_24h: 0.0, // Unknown from price alone
+        //             price_change_24h: 0.0, // Need historical data
+        //             liquidity: 0.0, // Unknown from price alone
+        //             volatility: 0.0, // Need historical data
+        //             last_update: best_price.timestamp,
+        //             expires_at: Some(SystemTime::now() + Duration::from_secs(self.default_ttl)),
+        //             source: format!("{:?}", best_price.source),
+        //             confidence: best_price.confidence,
+        //         };
+        //         
+        //         // Update market data cache
+        //         self.update_market_data(token, market_data).await?;
+        //         
+        //         // Mark as supported
+        //         {
+        //             let mut supported = self.supported_tokens.write().await;
+        //             supported.insert(token.to_string(), true);
+        //         }
+        //         
+        //         return Ok(Some(best_price.price));
+        //     }
+        // }
         
         // Fall back to direct Jupiter client if multi-source fails or is not available
         if let Some(jupiter) = &self.jupiter_client {
             // Try with exponential backoff
             let mut retry_count = 0;
             let mut backoff_ms = 500; // Start with 500ms
-            let mut last_error = None;
             
             while retry_count <= self.max_retries {
                 match jupiter.get_price(token, reference_token).await {
@@ -404,29 +401,9 @@ impl MarketDataCollector {
                         return Ok(Some(price));
                     },
                     Err(e) => {
-                        last_error = Some(e.to_string());
-                        
-                        if retry_count == self.max_retries {
-                            error!(token=%token, error=%last_error.as_ref().unwrap(), "Failed to fetch price from Jupiter after {} retries", retry_count);
-                            
-                            // Mark as unsupported if consistently failing
-                            let mut supported = self.supported_tokens.write().await;
-                            supported.insert(token.to_string(), false);
-                            
-                            // Check if this is a "token not found" error to provide better logging
-                            if last_error.as_ref().unwrap().contains("not found") {
-                                warn!(
-                                    token=%token,
-                                    "Token not available in Jupiter API. Consider using a different token address or removing it from the monitored tokens list."
-                                );
-                            }
-                            
-                            return Ok(None);
-                        }
-                        
                         warn!(
                             token=%token,
-                            error=%last_error.as_ref().unwrap(),
+                            error=%e,
                             retry_count=%retry_count,
                             backoff_ms=%backoff_ms,
                             "Jupiter price fetch failed, retrying with backoff"
@@ -699,32 +676,187 @@ impl MarketDataCollector {
         Ok(Some(forecast))
     }
 
-    /// Add the Birdeye provider
-    pub fn with_birdeye(mut self, api_key: String) -> Result<Self> {
-        // Initialize Birdeye provider
-        let birdeye_provider = BirdeyeProvider::new(api_key);
-        
-        // Add Birdeye to the multi-source provider
-        if let Some(provider) = &mut self.multi_source_provider {
-            let providers = vec![
-                Box::new(birdeye_provider),
-            ];
-            
-            for provider_box in providers {
-                provider.providers.push(provider_box);
-            }
-            
-            info!("Added Birdeye as a price provider");
-        } else {
-            // If multi-source provider doesn't exist yet, create it
-            let providers: Vec<Box<dyn PriceProvider>> = vec![
-                Box::new(birdeye_provider),
-            ];
-            
-            self.multi_source_provider = Some(MultiSourceProvider::new(providers));
-            info!("Initialized Birdeye as the only price provider");
-        }
-        
+    /// Add the Birdeye provider (stub implementation)
+    pub fn with_birdeye(mut self, _api_key: String) -> Result<Self> {
+        // Just return self - Birdeye provider is not implemented
+        info!("Birdeye integration not yet implemented");
         Ok(self)
     }
+
+    /// Fetch prices for a token pair from all supported DEXes (Jupiter, Raydium, Orca)
+    pub async fn fetch_all_dex_prices(
+        &self,
+        rpc_client: &RpcClient,
+        input_token: &str,
+        output_token: &str,
+        raydium_pool: Option<&Pubkey>,
+        orca_pool: Option<&Pubkey>,
+    ) -> HashMap<String, Option<f64>> {
+        let mut prices = HashMap::new();
+
+        // Jupiter (API-based)
+        if let Some(jupiter) = &self.jupiter_client {
+            match jupiter.get_price(input_token, output_token).await {
+                Ok(price) => { prices.insert("jupiter".to_string(), Some(price)); },
+                Err(e) => { warn!("Jupiter price fetch failed: {}", e); prices.insert("jupiter".to_string(), None); }
+            }
+        }
+
+        // Raydium (on-chain)
+        if let Some(pool_addr) = raydium_pool {
+            let input_pub = Pubkey::from_str(input_token).ok();
+            let output_pub = Pubkey::from_str(output_token).ok();
+            if let (Some(input_pub), Some(output_pub)) = (input_pub, output_pub) {
+                match fetch_raydium_pool_price(rpc_client, pool_addr, &input_pub, &output_pub).await {
+                    Ok(Some(price)) => { prices.insert("raydium".to_string(), Some(price)); },
+                    Ok(None) => { prices.insert("raydium".to_string(), None); },
+                    Err(e) => { warn!("Raydium price fetch failed: {}", e); prices.insert("raydium".to_string(), None); }
+                }
+            } else {
+                prices.insert("raydium".to_string(), None);
+            }
+        }
+
+        // Orca (on-chain)
+        if let Some(pool_addr) = orca_pool {
+            let input_pub = Pubkey::from_str(input_token).ok();
+            let output_pub = Pubkey::from_str(output_token).ok();
+            if let (Some(input_pub), Some(output_pub)) = (input_pub, output_pub) {
+                match fetch_orca_whirlpool_price(rpc_client, pool_addr, &input_pub, &output_pub).await {
+                    Ok(Some(price)) => { prices.insert("orca".to_string(), Some(price)); },
+                    Ok(None) => { prices.insert("orca".to_string(), None); },
+                    Err(e) => { warn!("Orca price fetch failed: {}", e); prices.insert("orca".to_string(), None); }
+                }
+            } else {
+                prices.insert("orca".to_string(), None);
+            }
+        }
+
+        prices
+    }
+}
+
+/// Fetch the price of a Raydium pool given the pool address and token mints.
+/// Returns the price as output_token per input_token (e.g., USDC per SOL).
+/// This is a minimal implementation and assumes the pool follows Raydium's AMM layout.
+pub async fn fetch_raydium_pool_price(
+    rpc_client: &RpcClient,
+    pool_address: &Pubkey,
+    input_token: &Pubkey,
+    output_token: &Pubkey,
+) -> Result<Option<f64>> {
+    // Fetch the pool account data
+    let account = match rpc_client.get_account(pool_address) {
+        Ok(acc) => acc,
+        Err(e) => {
+            warn!("Failed to fetch Raydium pool account: {}", e);
+            return Ok(None);
+        }
+    };
+    // Raydium AMM pool layout: coin_vault, pc_vault, etc.
+    // For simplicity, we assume the first 64 bytes are coin_vault and pc_vault pubkeys,
+    // and the next 16 bytes are coin_vault_amount and pc_vault_amount (u64 each).
+    // In production, use the actual Raydium AMM layout struct.
+    if account.data.len() < 160 {
+        warn!("Raydium pool account data too short");
+        return Ok(None);
+    }
+    // Offsets based on Raydium's AMMInfo struct (see Raydium SDK)
+    let coin_vault_offset = 72;
+    let pc_vault_offset = 104;
+    let coin_vault_amount_offset = 136;
+    let pc_vault_amount_offset = 144;
+    let coin_vault = match account.data[coin_vault_offset..coin_vault_offset+32].try_into() {
+        Ok(arr) => Pubkey::new_from_array(arr),
+        Err(_) => {
+            warn!("Failed to parse coin_vault pubkey from Raydium pool data");
+            return Ok(None);
+        }
+    };
+    let pc_vault = match account.data[pc_vault_offset..pc_vault_offset+32].try_into() {
+        Ok(arr) => Pubkey::new_from_array(arr),
+        Err(_) => {
+            warn!("Failed to parse pc_vault pubkey from Raydium pool data");
+            return Ok(None);
+        }
+    };
+    let coin_vault_amount = u64::from_le_bytes(account.data[coin_vault_amount_offset..coin_vault_amount_offset+8].try_into().unwrap());
+    let pc_vault_amount = u64::from_le_bytes(account.data[pc_vault_amount_offset..pc_vault_amount_offset+8].try_into().unwrap());
+    // Determine which vault is input/output
+    let (input_amount, output_amount) = if input_token == &coin_vault {
+        (coin_vault_amount, pc_vault_amount)
+    } else if input_token == &pc_vault {
+        (pc_vault_amount, coin_vault_amount)
+    } else {
+        warn!("Input token does not match pool vaults");
+        return Ok(None);
+    };
+    if input_amount == 0 {
+        warn!("Input vault amount is zero");
+        return Ok(None);
+    }
+    let price = output_amount as f64 / input_amount as f64;
+    Ok(Some(price))
+}
+
+/// Fetch the price of an Orca Whirlpool pool given the pool address and token mints.
+/// Returns the price as output_token per input_token (e.g., USDC per SOL).
+/// This is a minimal implementation and assumes the pool follows Orca's Whirlpool layout.
+pub async fn fetch_orca_whirlpool_price(
+    rpc_client: &RpcClient,
+    pool_address: &Pubkey,
+    input_token: &Pubkey,
+    output_token: &Pubkey,
+) -> Result<Option<f64>> {
+    // Fetch the pool account data
+    let account = match rpc_client.get_account(pool_address) {
+        Ok(acc) => acc,
+        Err(e) => {
+            warn!("Failed to fetch Orca Whirlpool pool account: {}", e);
+            return Ok(None);
+        }
+    };
+    // Orca Whirlpool layout: skip 8 bytes (anchor discriminator), then parse fields
+    if account.data.len() < 300 {
+        warn!("Orca Whirlpool account data too short");
+        return Ok(None);
+    }
+    let data = &account.data[8..]; // skip anchor discriminator
+    // Offsets based on Orca Whirlpool struct (see orca.rs and on-chain layout)
+    let sqrt_price_offset = 48; // u128
+    let token_mint_a_offset = 96; // Pubkey
+    let token_mint_b_offset = 128; // Pubkey
+    // Parse sqrt_price (u128, little endian)
+    let sqrt_price = u128::from_le_bytes(data[sqrt_price_offset..sqrt_price_offset+16].try_into().unwrap());
+    // Parse token mints
+    let token_mint_a = match data[token_mint_a_offset..token_mint_a_offset+32].try_into() {
+        Ok(arr) => Pubkey::new_from_array(arr),
+        Err(_) => {
+            warn!("Failed to parse token_mint_a pubkey from Orca Whirlpool data");
+            return Ok(None);
+        }
+    };
+    let token_mint_b = match data[token_mint_b_offset..token_mint_b_offset+32].try_into() {
+        Ok(arr) => Pubkey::new_from_array(arr),
+        Err(_) => {
+            warn!("Failed to parse token_mint_b pubkey from Orca Whirlpool data");
+            return Ok(None);
+        }
+    };
+    // Compute price: price = (sqrt_price^2) / 2^128
+    let price = (sqrt_price as f64).powi(2) / (2f64).powi(128);
+    // Determine direction
+    let result = if input_token == &token_mint_a && output_token == &token_mint_b {
+        Some(price)
+    } else if input_token == &token_mint_b && output_token == &token_mint_a {
+        if price == 0.0 {
+            None
+        } else {
+            Some(1.0 / price)
+        }
+    } else {
+        warn!("Input/output tokens do not match pool mints");
+        None
+    };
+    Ok(result)
 }
