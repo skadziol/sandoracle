@@ -67,6 +67,12 @@ impl MarketDataCollector {
 
     /// Fetch real market data from Jupiter API
     pub async fn fetch_real_market_data(&self, token: &str, reference_token: &str) -> Result<Option<f64>> {
+        // If token and reference token are the same, the price is always 1:1
+        if token == reference_token {
+            info!(token=%token, "Token and reference token are identical, returning 1.0 as price");
+            return Ok(Some(1.0));
+        }
+        
         if let Some(jupiter) = &self.jupiter_client {
             match jupiter.get_price(token, reference_token).await {
                 Ok(price) => return Ok(Some(price)),

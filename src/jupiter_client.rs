@@ -168,6 +168,11 @@ impl Jupiter {
         // Use a standard amount for quote (1 token with 9 decimals = 1_000_000_000)
         let amount = 1_000_000_000;
         
+        // Fetch token info to get decimals
+        let token_list = Self::get_token_list().await?;
+        let token_info = Self::find_token_info(&token_list, token_mint)?;
+        let reference_info = Self::find_token_info(&token_list, reference_mint)?;
+        
         // Fetch the quote from Jupiter API
         let quote = Self::fetch_quote(token_mint, reference_mint, amount).await?;
         
@@ -177,12 +182,24 @@ impl Jupiter {
         let out_amount = quote.out_amount.parse::<f64>().map_err(|e| 
             anyhow!("Failed to parse output amount '{}': {}", quote.out_amount, e))?;
         
-        // Price is output amount / input amount
-        let price = out_amount / in_amount;
+        // Calculate the correct price considering decimals
+        // Price = (out_amount / 10^reference_decimals) / (in_amount / 10^token_decimals)
+        let token_decimals = token_info.decimals as f64;
+        let reference_decimals = reference_info.decimals as f64;
+        
+        // For 1 token, adjust for decimals difference
+        let price = (out_amount / 10f64.powf(reference_decimals)) / (in_amount / 10f64.powf(token_decimals));
         
         Ok(price)
     }
     
+    // Helper to find token info by mint address
+    fn find_token_info<'a>(token_list: &'a [TokenInfo], mint: &str) -> Result<&'a TokenInfo> {
+        token_list.iter()
+            .find(|token| token.address == mint)
+            .ok_or_else(|| anyhow!("Token with mint {} not found in Jupiter token list", mint))
+    }
+
     // Public method to get token list from Jupiter
     pub async fn get_token_list() -> Result<Vec<TokenInfo>> {
         let url = "https://token.jup.ag/all";
@@ -197,12 +214,60 @@ impl Jupiter {
         amount: u64,
     ) -> Result<QuoteResponse> {
         let url = format!(
-            "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}",
+            "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50",
             input_mint, output_mint, amount,
         );
         // Ensure reqwest is available
-        let response = reqwest::get(&url).await?.json::<QuoteResponse>().await?;
-        Ok(response)
+        let response = reqwest::get(&url).await?;
+        
+        // Check if the response was successful
+        if !response.status().is_success() {
+            let error_body = response.text().await.unwrap_or_else(|_| "Unknown error body".to_string());
+            return Err(anyhow!("Jupiter quote API failed: {}", error_body));
+        }
+        
+        // Parse the response
+        match response.json::<QuoteResponse>().await {
+            Ok(quote) => Ok(quote),
+            Err(e) => {
+                // Try parsing as a different response structure that might have an error field
+                #[derive(Deserialize, Debug)]
+                struct ErrorResponse {
+                    error: String,
+                }
+                
+                // Reset the response to try parsing as an error
+                let error_body = e.to_string();
+                if error_body.contains("missing field `inputMint`") {
+                    // Try the newer API endpoint format
+                    return Self::fetch_quote_v1(input_mint, output_mint, amount).await;
+                }
+                
+                Err(anyhow!("Failed to parse Jupiter quote: {}", error_body))
+            }
+        }
+    }
+    
+    // Add a v1 quote endpoint function as fallback
+    async fn fetch_quote_v1(
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+    ) -> Result<QuoteResponse> {
+        let url = format!(
+            "https://lite-api.jup.ag/swap/v1/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50",
+            input_mint, output_mint, amount,
+        );
+        
+        let response = reqwest::get(&url).await?;
+        
+        if !response.status().is_success() {
+            let error_body = response.text().await.unwrap_or_else(|_| "Unknown error body".to_string());
+            return Err(anyhow!("Jupiter v1 quote API failed: {}", error_body));
+        }
+        
+        let quote = response.json::<QuoteResponse>().await?;
+        Ok(quote)
     }
 
     // Make swap public

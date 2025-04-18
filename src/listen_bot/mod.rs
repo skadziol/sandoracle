@@ -728,7 +728,7 @@ impl ListenBot {
                                                         continue;
                                                     }
                                                     
-                                                    info!(tx_idx = tx_idx, %signature, slot, "Processing transaction signature");
+                                                    debug!(tx_idx = tx_idx, %signature, slot, "Processing transaction signature");
                                                     
                                                     // --- Pass to Evaluator --- 
                                                     if let Some(evaluator) = evaluator.clone() {
@@ -745,10 +745,10 @@ impl ListenBot {
                                                             "account_keys": account_keys,
                                                         });
 
-                                                        info!(data = ?eval_data, "Sending transaction to evaluator");
+                                                        debug!(data = ?eval_data, "Sending transaction to evaluator");
                                                         match evaluator.evaluate_opportunity(eval_data).await {
                                                             Ok(opportunities) => {
-                                                                info!(
+                                                                debug!(
                                                                     count = opportunities.len(),
                                                                     %signature, 
                                                                     "Evaluator response: found {} potential opportunities",
@@ -756,9 +756,9 @@ impl ListenBot {
                                                                 );
                                                                 
                                                                 if !opportunities.is_empty() {
-                                                                    info!(count = opportunities.len(), %signature, "Found potential MEV opportunities");
+                                                                    debug!(count = opportunities.len(), %signature, "Found potential MEV opportunities");
                                                                     for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
-                                                                        info!(
+                                                                        debug!(
                                                                             idx = idx,
                                                                             strategy = ?opportunity.strategy,
                                                                             estimated_profit = opportunity.estimated_profit,
@@ -766,10 +766,10 @@ impl ListenBot {
                                                                         );
                                                                         match evaluator.process_mev_opportunity(&mut opportunity).await {
                                                                             Ok(Some(exec_sig)) => {
-                                                                                info!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
+                                                                                debug!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
                                                                             },
                                                                             Ok(None) => {
-                                                                                info!(idx = idx, strategy = ?opportunity.strategy, decision = ?opportunity.decision, "Decided not to execute MEV opportunity");
+                                                                                debug!(idx = idx, strategy = ?opportunity.strategy, decision = ?opportunity.decision, "Decided not to execute MEV opportunity");
                                                                             },
                                                                             Err(e) => {
                                                                                 error!(idx = idx, strategy = ?opportunity.strategy, error = %e, "Error executing MEV opportunity");
@@ -879,7 +879,7 @@ impl ListenBot {
                         if let Some(mut opportunity) = opportunities.into_iter().next() {
                             match evaluator.process_mev_opportunity(&mut opportunity).await {
                                 Ok(Some(signature)) => {
-                                    info!(
+                                    debug!(
                                         tx_signature = %signature,
                                         strategy = ?opportunity.strategy,
                                         estimated_profit = opportunity.estimated_profit,

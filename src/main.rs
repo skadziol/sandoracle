@@ -286,7 +286,7 @@ async fn main() -> SandoResult<()> {
                     let market_data = match market_data_collector_for_update.fetch_real_market_data(token_mint, usdc_mint).await {
                         Ok(Some(price)) => {
                             // We have real price data from Jupiter
-                            info!(token = token, price = price, "Fetched real-time price");
+                            info!(token = token, price = %format!("{:.2}", price), reference = "USDC", "TOKEN PRICE");
                             
                             // Create complete market data (some fields are estimated)
                             MarketData {
