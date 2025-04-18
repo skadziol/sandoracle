@@ -136,6 +136,13 @@ impl SandoEngine {
             output_token_price_usd: 1.0, // Placeholder
             pool_liquidity_usd: 1000000.0, // Placeholder
             recent_volatility_percent: 2.5, // Placeholder
+            market_token_prices: HashMap::new(),
+            market_token_volatility: HashMap::new(),
+            market_token_price_changes: HashMap::new(),
+            market_token_forecasts: HashMap::new(),
+            average_market_price: 0.0,
+            average_market_volatility: 0.0,
+            average_market_price_change: 0.0,
         };
         
         Ok(context)

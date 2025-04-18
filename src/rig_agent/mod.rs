@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize}; // For parsing LLM response
 use serde_json; // For JSON handling
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 
 /// Interface for the RIG AI Agent
 #[derive(Clone)]
@@ -34,7 +35,32 @@ pub struct MarketContext {
     pub output_token_price_usd: f64,
     pub pool_liquidity_usd: f64,
     pub recent_volatility_percent: f64, // Example field
-    // Add other relevant market data (sentiment? gas price?)
+    
+    // Enhanced market data fields
+    #[serde(default)]
+    pub market_token_prices: HashMap<String, f64>,
+    
+    #[serde(default)]
+    pub market_token_volatility: HashMap<String, f64>,
+    
+    #[serde(default)]
+    pub market_token_price_changes: HashMap<String, f64>,
+    
+    #[serde(default)]
+    pub market_token_forecasts: HashMap<String, f64>,
+    
+    #[serde(default = "default_f64")]
+    pub average_market_price: f64,
+    
+    #[serde(default = "default_f64")]
+    pub average_market_volatility: f64,
+    
+    #[serde(default = "default_f64")]
+    pub average_market_price_change: f64,
+}
+
+fn default_f64() -> f64 {
+    0.0
 }
 
 /// Represents the structured evaluation expected from the RIG agent
@@ -94,16 +120,43 @@ Opportunity Data:
 Market Context:
 {}
 
+Enhanced Market Analysis:
+- Token Price Forecasts (5 min): {}
+- Average Market Volatility: {:.2}%
+- Price Change 24h: {:.2}%
+- Market Pattern: {}
+
 Instructions:
 1. Assess if this is a potentially viable MEV opportunity (e.g., arbitrage, sandwich potential).
-2. Estimate the potential profit in USD, considering swap amounts and prices.
+2. Estimate the potential profit in USD, considering swap amounts, prices, and the price forecasts.
 3. Provide a confidence score (0.0 to 1.0) for the viability and profitability estimate.
-4. Briefly explain your reasoning.
+4. Briefly explain your reasoning, including consideration of the price forecasts and market volatility.
 5. Suggest an action: Execute Arbitrage, Execute Sandwich, Monitor, Decline.
 6. Respond ONLY with a valid JSON object containing these fields: "is_viable" (boolean), "confidence_score" (float), "estimated_profit_usd" (float), "reasoning" (string), "suggested_action" (string), "error" (string or null).
 Example JSON: {{"is_viable\": true, \"confidence_score\": 0.85, \"estimated_profit_usd\": 150.50, \"reasoning\": \"Significant price difference observed...\", \"suggested_action\": \"Execute Arbitrage\", \"error\": null}}"#,
             serde_json::to_string_pretty(raw_opportunity).unwrap_or_else(|_| "Invalid opportunity data".to_string()),
-            serde_json::to_string_pretty(market_context).unwrap_or_else(|_| "Invalid market context".to_string())
+            serde_json::to_string_pretty(market_context).unwrap_or_else(|_| "Invalid market context".to_string()),
+            // Format forecasts as a readable string
+            market_context.market_token_forecasts.iter()
+                .map(|(token, &forecast)| format!("{}: ${:.4}", token, forecast))
+                .collect::<Vec<_>>()
+                .join(", "),
+            market_context.recent_volatility_percent,
+            market_context.average_market_price_change,
+            // Provide a simple market pattern description based on volatility and price changes
+            if market_context.average_market_volatility > 0.05 && market_context.average_market_price_change > 2.0 {
+                "Volatile uptrend"
+            } else if market_context.average_market_volatility > 0.05 && market_context.average_market_price_change < -2.0 {
+                "Volatile downtrend"
+            } else if market_context.average_market_volatility > 0.05 {
+                "High volatility, sideways"
+            } else if market_context.average_market_price_change > 2.0 {
+                "Stable uptrend"
+            } else if market_context.average_market_price_change < -2.0 {
+                "Stable downtrend"
+            } else {
+                "Stable, sideways"
+            }
         );
 
         info!(prompt_length = prompt_text.len(), "Constructed prompt for RIG agent");
@@ -214,6 +267,13 @@ mod tests {
             output_token_price_usd: 1.0,
             pool_liquidity_usd: 1_000_000.0,
             recent_volatility_percent: 5.0,
+            market_token_prices: HashMap::new(),
+            market_token_volatility: HashMap::new(),
+            market_token_price_changes: HashMap::new(),
+            market_token_forecasts: HashMap::new(),
+            average_market_price: 0.0,
+            average_market_volatility: 0.0,
+            average_market_price_change: 0.0,
         };
 
         let response_result = agent.evaluate_opportunity(&raw_opportunity, &market_context).await;
@@ -251,6 +311,13 @@ mod tests {
             output_token_price_usd: 160.0,
             pool_liquidity_usd: 500000.0,
             recent_volatility_percent: 1.5,
+            market_token_prices: HashMap::new(),
+            market_token_volatility: HashMap::new(),
+            market_token_price_changes: HashMap::new(),
+            market_token_forecasts: HashMap::new(),
+            average_market_price: 0.0,
+            average_market_volatility: 0.0,
+            average_market_price_change: 0.0,
         };
 
         let result = agent.evaluate_opportunity(&opportunity_data, &market_data).await;
@@ -296,6 +363,13 @@ mod tests {
             output_token_price_usd: 160.0,
             pool_liquidity_usd: 500000.0,
             recent_volatility_percent: 1.5,
+            market_token_prices: HashMap::new(),
+            market_token_volatility: HashMap::new(),
+            market_token_price_changes: HashMap::new(),
+            market_token_forecasts: HashMap::new(),
+            average_market_price: 0.0,
+            average_market_volatility: 0.0,
+            average_market_price_change: 0.0,
         };
 
         let eval_profit = agent.evaluate_opportunity_rule_based(&opportunity_data_profit, &market_data);

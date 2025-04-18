@@ -13,7 +13,7 @@ use crate::error::{Result as SandoResult, SandoError};
 use crate::monitoring::init_logging;
 use crate::monitoring::log_utils::{check_log_directory, rotate_logs, clear_debug_logs};
 use crate::listen_bot::{ListenBot, ListenBotCommand};
-use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds, MevOpportunity};
+use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds, MevOpportunity, MevStrategy};
 use crate::executor::{TransactionExecutor, ExecutionService};
 use crate::rig_agent::RigAgent;
 use crate::market_data::{MarketDataCollector, MarketData};
@@ -120,7 +120,9 @@ async fn main() -> SandoResult<()> {
     info!("Initializing MarketDataCollector...");
     let price_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let historical_data = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let market_data_collector = MarketDataCollector::new(price_cache.clone(), historical_data.clone());
+    let market_data_collector = MarketDataCollector::new(price_cache.clone(), historical_data.clone())
+        .with_default_ttl(300)         // 5 minute default TTL
+        .with_max_retries(3);          // 3 retries with exponential backoff
     
     // Initialize with Jupiter API if URL is available
     let market_data_collector = if let Some(jupiter_api_url) = &settings.jupiter_api_url {
@@ -139,6 +141,27 @@ async fn main() -> SandoResult<()> {
         market_data_collector
     };
     
+    // Add Birdeye price provider if API key is available
+    let market_data_collector = if let Some(birdeye_api_key) = std::env::var("BIRDEYE_API_KEY").ok() {
+        if !birdeye_api_key.is_empty() {
+            match market_data_collector.clone().with_birdeye(birdeye_api_key) {
+                Ok(collector) => {
+                    info!("Birdeye API integration enabled for additional price data");
+                    collector
+                },
+                Err(e) => {
+                    error!(error = %e, "Failed to initialize Birdeye client, continuing without it");
+                    market_data_collector
+                }
+            }
+        } else {
+            market_data_collector
+        }
+    } else {
+        info!("No Birdeye API key configured, continuing with Jupiter only");
+        market_data_collector
+    };
+    
     // Clone the market data collector for use in the update loop
     let market_data_collector_for_update = market_data_collector.clone();
     
@@ -152,10 +175,54 @@ async fn main() -> SandoResult<()> {
     let eval_risk_level = evaluator::RiskLevel::from(settings.risk_level.clone());
     
     let mut evaluator = OpportunityEvaluator::new_with_thresholds(
-        settings.min_profit_threshold,  // Use settings for minimum profit threshold
+        match settings.risk_level {
+            crate::config::RiskLevel::Low => 20.0,     // Min $20 profit for low risk
+            crate::config::RiskLevel::Medium => 10.0,  // Min $10 profit for medium risk
+            crate::config::RiskLevel::High => 5.0,     // Min $5 profit for high risk
+        },
         eval_risk_level,                // Use converted risk level
         settings.min_profit_threshold,  // Duplicate setting as a fallback
-        ExecutionThresholds::default(), // Use default thresholds for now
+        {
+            // Create customized execution thresholds
+            let mut exec_thresholds = ExecutionThresholds::default();
+            
+            // Update global thresholds
+            exec_thresholds.min_profit_threshold = match settings.risk_level {
+                crate::config::RiskLevel::Low => 20.0,     // Min $20 profit for low risk
+                crate::config::RiskLevel::Medium => 10.0,  // Min $10 profit for medium risk
+                crate::config::RiskLevel::High => 5.0,     // Min $5 profit for high risk
+            };
+            exec_thresholds.min_confidence = match settings.risk_level {
+                crate::config::RiskLevel::Low => 0.85,    // Higher confidence for low risk
+                crate::config::RiskLevel::Medium => 0.75, // Medium confidence
+                crate::config::RiskLevel::High => 0.65,   // Lower confidence for high risk
+            };
+            
+            // Strategy-specific improvements for Arbitrage
+            if let Some(arb_params) = exec_thresholds.strategy_params.get_mut(&MevStrategy::Arbitrage) {
+                arb_params.min_profit = match settings.risk_level {
+                    crate::config::RiskLevel::Low => 25.0,
+                    crate::config::RiskLevel::Medium => 15.0,
+                    crate::config::RiskLevel::High => 8.0,
+                };
+            }
+            
+            // Strategy-specific improvements for Sandwich
+            if let Some(sandwich_params) = exec_thresholds.strategy_params.get_mut(&MevStrategy::Sandwich) {
+                sandwich_params.min_profit = match settings.risk_level {
+                    crate::config::RiskLevel::Low => 120.0,
+                    crate::config::RiskLevel::Medium => 80.0,
+                    crate::config::RiskLevel::High => 50.0,
+                };
+                sandwich_params.min_confidence = match settings.risk_level {
+                    crate::config::RiskLevel::Low => 0.95,
+                    crate::config::RiskLevel::Medium => 0.9,
+                    crate::config::RiskLevel::High => 0.85,
+                };
+            }
+            
+            exec_thresholds
+        }, // Use customized thresholds
     )
     .await
     .map_err(|e| SandoError::DependencyError(format!("Failed to create OpportunityEvaluator: {}", e)))?;
@@ -180,6 +247,9 @@ async fn main() -> SandoResult<()> {
     
     // Set the RIG Agent on the evaluator for AI-powered decision making
     evaluator.set_rig_agent(rig_agent_arc.clone()).await;
+    
+    // Set the market data collector on the evaluator for real-time price and liquidity data
+    evaluator.set_market_data_collector(market_data_collector_arc.clone()).await;
 
     // Wrap the evaluator in an Arc for safe sharing between threads
     let evaluator_arc = Arc::new(evaluator);
@@ -198,6 +268,19 @@ async fn main() -> SandoResult<()> {
         ("BTC", "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"),  // BTC (Wormhole)
         ("BONK", "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"), // BONK
         ("JUP", "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"),   // JUP
+        ("USDT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"), // USDT 
+        ("RAY", "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"),  // RAY
+        ("ORCA", "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE"), // ORCA
+        // Using corrected token address for mSOL
+        ("MSOL", "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"), // MSOL (Marinade)
+        ("STSOL", "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj"), // stSOL (Lido)
+        // Using correct address for WIF (Woof)
+        ("WIF", "5tN42n9vMi6ubp67Uy4NnmM5DMZYN8aS8GeB3bEDHr6E"), // WIF (Dog token)
+        ("BSOL", "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"), // BSOL (Blazestake)
+        ("USDH", "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX"), // USDH (Hubble)
+        // Removing USDR due to lack of Jupiter support
+        // If needed, replace with another common token like SAMO
+        ("SAMO", "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"), // SAMO (Samoyedcoin)
     ]);
 
     // Configure ListenBot filtering based on token mints from market data
@@ -205,34 +288,47 @@ async fn main() -> SandoResult<()> {
         .map(|(_, mint)| mint.to_string())
         .collect();
     
-    // Prepare program IDs to monitor
+    // Prepare program IDs to monitor - expanded with more DEXes and protocols
     let program_ids_to_monitor = vec![
-        // Jupiter v4 and v6
-        "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
-        "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB".to_string(),
+        // Jupiter
+        "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),   // Jupiter v6
+        "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB".to_string(),   // Jupiter v4
         // Orca
-        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string(), // Whirlpools
-        "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP".to_string(), // v2
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string(),   // Whirlpools
+        "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP".to_string(),  // Orca v2
+        "DjVE6JNiYqPL2QXyCUUh8rNjHrbz9hXHNYt99MQ4t1RQ".to_string(),  // Orca Swap
         // Raydium
-        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(), // SwapV2
-        "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(), // CLMM
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string(),  // Raydium SwapV2
+        "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(),  // Raydium CLMM
+        "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1".to_string(),  // Raydium SwapV1
+        // Meteora
+        "Met4x4gQHx3V6ypUJUaZBUjEF8ip8kxZQK2ZBquhZEU".to_string(),   // Meteora
+        // Phoenix
+        "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY".to_string(),   // Phoenix
+        // Invariant
+        "HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt".to_string(),  // Invariant
+        // Lending platforms for complex MEV strategies
+        "7vxeyaXGLqcp66fFShqUdHxdedvfnJR6aqXKCBLQ3che".to_string(),  // Solend Main Pool
+        "SLNDm9n9W3yuVGJ6TdY9sKYRYTv9LMi9jNLRUmHLdLM".to_string(),   // Solend Token
+        "MarBmsSgKXdrN1egZf5sqe1TMai9K1rChYNDJgjq7aD".to_string(),   // Marinade Staking
+        "KAM11EfrRRPrDmZP62et4p5gPP6qPg9SdNUvSkKKTLm".to_string(),   // Kamino
     ];
     
-    // Set minimum transaction value based on risk level
+    // Set minimum transaction value based on risk level - increased for better signal-to-noise ratio
     let min_tx_value = match settings.risk_level {
-        crate::config::RiskLevel::Low => 5_000_000,    // 5 SOL in lamports for low risk
-        crate::config::RiskLevel::Medium => 1_000_000, // 1 SOL in lamports for medium risk
-        crate::config::RiskLevel::High => 500_000,     // 0.5 SOL in lamports for high risk
+        crate::config::RiskLevel::Low => 10_000_000,    // 10 SOL in lamports for low risk
+        crate::config::RiskLevel::Medium => 2_500_000,  // 2.5 SOL in lamports for medium risk
+        crate::config::RiskLevel::High => 1_000_000,    // 1 SOL in lamports for high risk
     };
     
-    // Configure the block filter
+    // Configure the block filter with higher standards
     listen_bot.configure_block_filter(
         Some(program_ids_to_monitor),
         Some(token_mint_list),
         Some(min_tx_value),
         Some(1), // At least 1 transaction per block
     );
-    
+
     // If in debug mode, run block filter calibration
     if std::env::var("RUST_LOG").map(|v| v.to_lowercase().contains("debug")).unwrap_or(false) {
         info!("Running block filter calibration for optimized filtering...");
@@ -259,156 +355,71 @@ async fn main() -> SandoResult<()> {
         }
     });
 
-    // Start the MarketDataCollector update loop in a separate task
-    // This task will periodically update market data for decision making
-    let market_data_update_handle = tokio::spawn(async move {
-        // Update market data every 15 seconds
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
-        
-        // Sample token list - in production this would be dynamic based on current transactions
-        let tokens = vec!["SOL", "USDC", "ETH", "BTC", "BONK", "JUP"];
-        let token_mints = HashMap::from([
+    // Spawn a task to update market data periodically
+    tokio::spawn(async move {
+        // Define token mints for monitoring (same as above)
+        let token_mints = std::collections::HashMap::from([
             ("SOL", "So11111111111111111111111111111111111111112"),  // SOL
             ("USDC", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), // USDC
             ("ETH", "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"),  // ETH (Wormhole)
             ("BTC", "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"),  // BTC (Wormhole)
             ("BONK", "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"), // BONK
             ("JUP", "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"),   // JUP
+            ("USDT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"), // USDT 
+            ("RAY", "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"),  // RAY
+            ("ORCA", "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE"), // ORCA
+            // Using corrected token address for mSOL
+            ("MSOL", "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"), // MSOL (Marinade)
+            ("STSOL", "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj"), // stSOL (Lido)
+            // Using correct address for WIF (Woof)
+            ("WIF", "5tN42n9vMi6ubp67Uy4NnmM5DMZYN8aS8GeB3bEDHr6E"), // WIF (Dog token)
+            ("BSOL", "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"), // BSOL (Blazestake)
+            ("USDH", "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX"), // USDH (Hubble)
+            // Removing USDR due to lack of Jupiter support
+            // If needed, replace with another common token like SAMO
+            ("SAMO", "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"), // SAMO (Samoyedcoin)
         ]);
-        let usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        
+        let reference_token = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // 1 minute interval
         
         loop {
             interval.tick().await;
             
-            // Try to get real market data for each token
-            for &token in &tokens {
-                if let Some(token_mint) = token_mints.get(token) {
-                    let market_data = match market_data_collector_for_update.fetch_real_market_data(token_mint, usdc_mint).await {
-                        Ok(Some(price)) => {
-                            // We have real price data from Jupiter
-                            info!(token = token, price = %format!("{:.2}", price), reference = "USDC", "TOKEN PRICE");
-                            
-                            // Create complete market data (some fields are estimated)
-                            MarketData {
-                                price,
-                                // Placeholder market cap and other metrics - in production would fetch from CoinGecko or similar
-                                market_cap: price * match token {
-                                    "SOL" => 550_000_000.0,
-                                    "USDC" => 35_000_000_000.0,
-                                    "ETH" => 120_000_000.0,
-                                    "BTC" => 19_400_000.0,
-                                    "BONK" => 500_000_000_000.0,
-                                    "JUP" => 1_000_000_000.0,
-                                    _ => 1_000_000.0,
-                                },
-                                volume_24h: price * match token {
-                                    "SOL" => 2_000_000_000.0,
-                                    "USDC" => 5_000_000_000.0,
-                                    "ETH" => 10_000_000_000.0,
-                                    "BTC" => 30_000_000_000.0,
-                                    "BONK" => 500_000_000.0,
-                                    "JUP" => 100_000_000.0,
-                                    _ => 1_000_000.0,
-                                },
-                                // Calculate price change using history
-                                price_change_24h: 0.0, // Will be updated with historical data
-                                liquidity: price * match token {
-                                    "SOL" => 500_000_000.0,
-                                    "USDC" => 1_000_000_000.0,
-                                    "ETH" => 2_000_000_000.0,
-                                    "BTC" => 5_000_000_000.0,
-                                    "BONK" => 100_000_000.0,
-                                    "JUP" => 50_000_000.0,
-                                    _ => 100_000.0,
-                                },
-                                volatility: 0.01, // Default placeholder
-                                last_update: chrono::Utc::now().timestamp() as u64,
-                            }
-                        },
-                        Ok(None) | Err(_) => {
-                            // Fallback to simulated data
-                            let now = chrono::Utc::now().timestamp() as f64;
-                            let price = match token {
-                                "SOL" => 150.0 + (now.sin() * 5.0), // Simple price simulation
-                                "USDC" => 1.0,
-                                "ETH" => 3500.0 + (now.cos() * 50.0),
-                                "BTC" => 65000.0 + (now.sin() * 1000.0),
-                                "BONK" => 0.00001 + (now.cos() * 0.000001),
-                                "JUP" => 1.2 + (now.sin() * 0.1),
-                                _ => 1.0,
-                            };
-                            
-                            // Update price in the shared cache
-                            let mut cache = price_cache.write().await;
-                            cache.insert(token.to_string(), price);
-                            
-                            // Update historical data (keep last 24 data points)
-                            let mut history = historical_data.write().await;
-                            let token_history = history.entry(token.to_string()).or_insert_with(Vec::new);
-                            token_history.push(price);
-                            
-                            // Keep only the last 24 data points (assuming 15-second intervals = 6 minutes)
-                            if token_history.len() > 24 {
-                                token_history.remove(0);
-                            }
-                            
-                            // Create simulated market data
-                            MarketData {
-                                price,
-                                market_cap: price * match token {
-                                    "SOL" => 550_000_000.0, // Rough supply estimates
-                                    "USDC" => 35_000_000_000.0,
-                                    "ETH" => 120_000_000.0,
-                                    "BTC" => 19_400_000.0,
-                                    "BONK" => 500_000_000_000.0,
-                                    "JUP" => 1_000_000_000.0,
-                                    _ => 1_000_000.0,
-                                },
-                                volume_24h: price * match token {
-                                    "SOL" => 2_000_000_000.0,
-                                    "USDC" => 5_000_000_000.0, 
-                                    "ETH" => 10_000_000_000.0,
-                                    "BTC" => 30_000_000_000.0,
-                                    "BONK" => 500_000_000.0,
-                                    "JUP" => 100_000_000.0,
-                                    _ => 1_000_000.0,
-                                },
-                                // Calculate simple price change using history
-                                price_change_24h: if token_history.len() >= 2 {
-                                    let oldest = token_history.first().unwrap();
-                                    ((price - oldest) / oldest) * 100.0
-                                } else {
-                                    0.0
-                                },
-                                liquidity: price * match token {
-                                    "SOL" => 500_000_000.0,
-                                    "USDC" => 1_000_000_000.0,
-                                    "ETH" => 2_000_000_000.0,
-                                    "BTC" => 5_000_000_000.0, 
-                                    "BONK" => 100_000_000.0,
-                                    "JUP" => 50_000_000.0,
-                                    _ => 100_000.0,
-                                },
-                                volatility: if token_history.len() >= 3 {
-                                    // Simple volatility calculation
-                                    token_history.windows(2)
-                                        .map(|w| ((w[1] - w[0]) / w[0]).abs())
-                                        .sum::<f64>() / (token_history.len() - 1) as f64
-                                } else {
-                                    0.01 // Default low volatility
-                                },
-                                last_update: chrono::Utc::now().timestamp() as u64,
-                            }
-                        }
-                    };
+            let start_time = std::time::Instant::now();
+            info!("Starting market data batch update...");
+            
+            match market_data_collector_for_update.fetch_batch_market_data(&token_mints, reference_token).await {
+                Ok(prices) => {
+                    let updated_count = prices.values().filter(|p| p.is_some()).count();
                     
-                    if let Err(e) = market_data_collector_for_update.update_market_data(token, market_data).await {
-                        error!(token = token, error = ?e, "Failed to update market data");
+                    if updated_count < token_mints.len() {
+                        warn!(
+                            "Some tokens failed to update: {}/{}", 
+                            token_mints.len() - updated_count,
+                            token_mints.len()
+                        );
                     }
+                    
+                    let elapsed = start_time.elapsed();
+                    info!(
+                        "Market data batch update completed: updated tokens={}/{}, elapsed={:.2?}",
+                        updated_count,
+                        token_mints.len(),
+                        elapsed
+                    );
+                    
+                    // If update took less than 30 seconds, wait at least 30 seconds before next update
+                    if elapsed < std::time::Duration::from_secs(30) {
+                        let wait_time = std::time::Duration::from_secs(30) - elapsed;
+                        tokio::time::sleep(wait_time).await;
+                    }
+                },
+                Err(e) => {
+                    error!(error = ?e, "Failed to perform batch market data update");
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await; // Short retry on error
                 }
             }
-            
-            info!("Market data updated for {} tokens", tokens.len());
         }
     });
 
