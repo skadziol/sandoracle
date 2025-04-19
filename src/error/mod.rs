@@ -1,5 +1,6 @@
 use std::fmt;
 use reqwest::StatusCode;
+use solana_client::nonblocking::pubsub_client::PubsubClientError;
 
 mod utils;
 
@@ -382,6 +383,13 @@ impl std::error::Error for SandoError {
             SandoError::DependencyError(_) => None,
             SandoError::DataProcessing(_) => None,
         }
+    }
+}
+
+// Add the PubsubClientError implementation 
+impl From<PubsubClientError> for SandoError {
+    fn from(err: PubsubClientError) -> Self {
+        SandoError::SolanaRpc(format!("Pubsub client error: {}", err))
     }
 }
 

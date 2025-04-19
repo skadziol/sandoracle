@@ -6,11 +6,12 @@ use listen_core::{
 
 use crate::config::Settings;
 use crate::error::{Result, SandoError};
-use crate::evaluator::{OpportunityEvaluator, MevOpportunity};
+use crate::evaluator::{OpportunityEvaluator, MevOpportunity, ExecutionDecision};
+use crate::market_data::MarketDataCollector;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, error, warn, debug};
+use tracing::{info, error, warn, debug, trace};
 use std::sync::Arc;
-use chrono;
+use chrono::{DateTime, Utc};
 use uuid;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -19,6 +20,10 @@ use solana_sdk::signature::Signature;
 use futures::stream::StreamExt;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcBlockConfig, RpcTransactionConfig};
+use solana_client::rpc_response::{RpcLogsResponse, RpcKeyedAccount};
+use solana_rpc_client_api::filter::RpcFilterType;
+use solana_client::nonblocking::pubsub_client::PubsubClient;
+use solana_rpc_client_api::config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter};
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_transaction_status::{
     UiTransactionEncoding,
@@ -29,6 +34,7 @@ use solana_transaction_status::{
     UiParsedMessage,  // Add this for accessing the parsed message fields
     UiInstruction,    // Add this for working with instruction types
     UiParsedInstruction, // Add UiParsedInstruction for proper pattern matching
+    EncodedConfirmedTransactionWithStatusMeta,
 };
 use solana_transaction_status::parse_accounts::ParsedAccount;  // Import from correct module
 use solana_sdk::transaction::VersionedTransaction;
@@ -37,7 +43,12 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::time::Duration; // Add this for retry delay
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashSet;
-use serde_json::Value; // Add Value for JSON handling
+use serde_json::{json, Value};
+use tokio::time::{sleep, timeout};
+use anyhow::anyhow;
+use regex::Regex;
+use tokio_stream::StreamExt as TokioStreamExt;
+use futures_util;
 
 // Set to true to relax filtering criteria for debugging (more transactions will pass)
 const DEBUG_RELAX_FILTERS: bool = false;
@@ -49,109 +60,108 @@ mod transaction;
 mod stream;
 
 pub use config::ListenBotConfig;
-pub use transaction::TransactionEvent;
 
-/// Block filtering to reduce unnecessary processing
+/// Transaction event from ListenBot
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransactionEvent {
+    /// Block slot
+    pub slot: u64,
+    /// Transaction signature / hash
+    pub signature: String,
+    /// Transaction data (parsed)
+    pub data: Value,
+    /// Transaction program IDs (for filtering)
+    pub program_ids: Vec<String>,
+    /// Transaction account keys (for filtering)
+    pub account_keys: Vec<String>,
+    /// Transaction timestamp
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Transaction value in lamports
+    pub transaction_value: u64,
+    /// Transaction instructions count
+    pub instructions_count: u32,
+    /// Unique ID for this event
+    pub id: String,
+    /// Whether the transaction is pending (mempool) or confirmed
+    pub is_pending: bool,
+}
+
+/// Filter criteria for blocks and transactions
 #[derive(Debug, Clone)]
 pub struct BlockFilter {
-    /// Minimum number of transactions to consider processing a block
-    pub min_transactions: usize,
-    /// Program IDs to monitor
-    pub monitored_program_ids: HashSet<String>,
-    /// Token mints to monitor
-    pub monitored_token_mints: HashSet<String>,
-    /// DEXes to monitor
-    pub monitored_dexes: HashSet<String>,
-    /// Minimum transaction value in lamports
+    /// Minimum transaction value (in lamports)
     pub min_transaction_value: u64,
+    /// Monitored program IDs (DEXs, etc.)
+    pub monitored_program_ids: HashSet<String>,
+    /// Monitored token mints
+    pub monitored_token_mints: HashSet<String>,
+    /// Minimum number of transactions required to process a block
+    pub min_transactions: usize,
 }
 
 impl Default for BlockFilter {
     fn default() -> Self {
-        // Default Jupiter program ID
-        let jupiter_v4 = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string();
-        let jupiter_v6 = "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB".to_string();
-        
-        // Default Orca Whirlpools program ID
-        let orca_whirlpools = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string();
-        
-        // Default Raydium program IDs
-        let raydium_swap = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string();
-        let raydium_clmm = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string();
-        
-        // Common tokens
-        let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
-        let sol = "So11111111111111111111111111111111111111112".to_string();
-        let msol = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So".to_string();
-        let bonk = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".to_string();
-        
-        let mut program_ids = HashSet::new();
-        program_ids.insert(jupiter_v4);
-        program_ids.insert(jupiter_v6);
-        program_ids.insert(orca_whirlpools);
-        program_ids.insert(raydium_swap);
-        program_ids.insert(raydium_clmm);
-        
-        let mut token_mints = HashSet::new();
-        token_mints.insert(usdc);
-        token_mints.insert(sol);
-        token_mints.insert(msol);
-        token_mints.insert(bonk);
-        
-        let mut dexes = HashSet::new();
-        dexes.insert("Jupiter".to_string());
-        dexes.insert("Orca".to_string());
-        dexes.insert("Raydium".to_string());
-        
         Self {
-            min_transactions: 1,
-            monitored_program_ids: program_ids,
-            monitored_token_mints: token_mints,
-            monitored_dexes: dexes,
-            min_transaction_value: 1_000_000, // 1 SOL in lamports
+            min_transaction_value: 1_000_000, // 0.001 SOL minimum
+            monitored_program_ids: HashSet::new(),
+            monitored_token_mints: HashSet::new(),
+            min_transactions: 1, // Default to processing all blocks with at least 1 transaction
         }
     }
 }
 
 impl BlockFilter {
-    /// Creates a new BlockFilter with custom configuration
-    pub fn new() -> Self {
-        Self::default()
-    }
-    
-    /// Add a program ID to monitor
-    pub fn add_program_id(&mut self, program_id: impl Into<String>) {
-        self.monitored_program_ids.insert(program_id.into());
-    }
-    
-    /// Add a token mint to monitor
-    pub fn add_token_mint(&mut self, token_mint: impl Into<String>) {
-        self.monitored_token_mints.insert(token_mint.into());
-    }
-    
-    /// Add a DEX to monitor
-    pub fn add_dex(&mut self, dex: impl Into<String>) {
-        self.monitored_dexes.insert(dex.into());
-    }
-    
-    /// Set minimum number of transactions to consider processing a block
-    pub fn with_min_transactions(mut self, min_transactions: usize) -> Self {
-        self.min_transactions = min_transactions;
+    /// Adds solana program IDs to monitor
+    pub fn with_monitored_programs(mut self, program_ids: Vec<String>) -> Self {
+        for id in program_ids {
+            self.monitored_program_ids.insert(id);
+        }
         self
     }
     
-    /// Set minimum transaction value in lamports
-    pub fn with_min_transaction_value(mut self, min_value: u64) -> Self {
-        self.min_transaction_value = min_value;
+    /// Adds token mints to monitor
+    pub fn with_monitored_tokens(mut self, token_mints: Vec<String>) -> Self {
+        for mint in token_mints {
+            self.monitored_token_mints.insert(mint);
+        }
         self
     }
     
-    /// Check if a block should be processed based on preliminary transaction count
-    pub fn should_process_block(&self, transaction_count: usize) -> bool {
-        transaction_count >= self.min_transactions
+    /// Sets the minimum transaction value
+    pub fn with_min_transaction_value(mut self, value: u64) -> Self {
+        self.min_transaction_value = value;
+        self
     }
     
-    /// Check if a transaction should be processed based on its program IDs and accounts
+    /// Sets the minimum number of transactions required to process a block
+    pub fn with_min_transactions(mut self, count: usize) -> Self {
+        self.min_transactions = count;
+        self
+    }
+    
+    /// Checks whether a block should be processed based on transaction count
+    pub fn should_process_block(&self, tx_count: usize) -> bool {
+        // If DEBUG_RELAX_FILTERS is true, we'll skip the filtering for debugging
+        if DEBUG_RELAX_FILTERS {
+            debug!("DEBUG_RELAX_FILTERS enabled: bypassing block transaction count filter");
+            return true;
+        }
+        
+        // Check if the block has enough transactions to process
+        if tx_count < self.min_transactions {
+            debug!(
+                tx_count,
+                min_transactions = self.min_transactions,
+                "Block filtered: insufficient transaction count"
+            );
+            return false;
+        }
+        
+        debug!("Block passed filter: has sufficient transaction count");
+        true
+    }
+    
+    /// Checks whether a transaction should be processed
     pub fn should_process_transaction(&self, program_ids: &[String], account_keys: &[String]) -> bool {
         // If DEBUG_RELAX_FILTERS is true, we'll skip the filtering for debugging
         if DEBUG_RELAX_FILTERS {
@@ -212,6 +222,8 @@ pub struct ListenBot {
     evaluator: Option<Arc<OpportunityEvaluator>>,
     /// Block filtering settings
     block_filter: BlockFilter,
+    /// Flag indicating whether to use mempool or confirmed blocks
+    use_mempool: bool,
 }
 
 impl ListenBot {
@@ -268,6 +280,7 @@ impl ListenBot {
                 cmd_rx,
                 evaluator: None,
                 block_filter,
+                use_mempool: false,
             },
             cmd_tx,
         ))
@@ -450,7 +463,7 @@ impl ListenBot {
                         }
                     }
                     // Process next slot from the listen-core stream
-                    maybe_slot = slot_stream.next() => {
+                    maybe_slot = futures::stream::StreamExt::next(&mut slot_stream) => {
                         match maybe_slot {
                             Some(slot) => {
                                 debug!(slot, "Received slot, fetching block...");
@@ -539,254 +552,84 @@ impl ListenBot {
                                                     continue;
                                                 }
                                                 
-                                                // Get transaction account keys for filtering
-                                                let account_keys: Vec<String> = match &tx_with_meta.transaction {
-                                                    EncodedTransaction::Json(json_tx) => {
-                                                        // Log the JSON message to investigate
-                                                        if tx_idx < 2 { // Only log first two transactions to avoid spam
-                                                            debug!(?json_tx.message, "JSON message structure");
-                                                        }
-                                                        
-                                                        // Access account_keys through the message field by pattern matching
-                                                        match &json_tx.message {
-                                                            UiMessage::Parsed(parsed_msg) => {
-                                                                // Log parsed message structure for debugging
-                                                                if tx_idx < 2 {
-                                                                    debug!(?parsed_msg.account_keys, "Parsed message account_keys");
-                                                                }
-                                                                
-                                                                // Convert ParsedAccount to String using pubkey field
-                                                                parsed_msg.account_keys.iter()
-                                                                    .map(|account| account.pubkey.clone())
-                                                                    .collect()
-                                                            },
-                                                            UiMessage::Raw(raw_msg) => {
-                                                                // Log raw message structure for debugging
-                                                                if tx_idx < 2 {
-                                                                    debug!(?raw_msg, "Raw message structure");
-                                                                    debug!(keys_len = raw_msg.account_keys.len(), "Raw message account_keys");
-                                                                }
-                                                                
-                                                                // Raw message account_keys is already a Vec<String>, just clone it
-                                                                raw_msg.account_keys.clone()
-                                                            },
-                                                        }
-                                                    },
-                                                    EncodedTransaction::Binary(_, _) => {
-                                                        // Log that we got a binary transaction despite requesting JSON
-                                                        if tx_idx < 2 {
-                                                            debug!("Received Binary transaction despite requesting JSON encoding");
-                                                        }
-                                                        Vec::new()
-                                                    },
-                                                    _ => Vec::new(),
+                                                // Extract transaction value if available - simplified approach
+                                                let transaction_value = if let Some(meta) = &tx_with_meta.meta {
+                                                    meta.fee
+                                                } else {
+                                                    0
                                                 };
                                                 
-                                                // Get program IDs for filtering (from instructions)
-                                                let program_ids: Vec<String> = match &tx_with_meta.transaction {
-                                                    EncodedTransaction::Json(json_tx) => {
-                                                        // Extract program IDs from instructions by pattern matching on message first
-                                                        match &json_tx.message {
-                                                            UiMessage::Parsed(parsed_msg) => {
-                                                                // Log instructions for first two transactions for debugging
-                                                                if tx_idx < 2 {
-                                                                    debug!(?parsed_msg.instructions, "Parsed message instructions");
-                                                                }
-                                                                
-                                                                parsed_msg.instructions.iter()
-                                                                    .filter_map(|ix| {
-                                                                        match ix {
-                                                                            UiInstruction::Compiled(compiled_ix) => {
-                                                                                // program_id_index is a u8, not an Option
-                                                                                let program_idx = compiled_ix.program_id_index;
-                                                                                if let UiMessage::Parsed(ref parsed_msg) = json_tx.message {
-                                                                                    if program_idx < parsed_msg.account_keys.len() as u8 {
-                                                                                        let program_id = parsed_msg.account_keys[program_idx as usize].pubkey.clone();
-                                                                                        Some(program_id)
-                                                                                    } else {
-                                                                                        None
-                                                                                    }
-                                                                                } else {
-                                                                                    None
-                                                                                }
-                                                                            },
-                                                                            UiInstruction::Parsed(parsed_ix) => {
-                                                                                // Extract program_id based on the variant
-                                                                                match parsed_ix {
-                                                                                    UiParsedInstruction::Parsed(parsed) => {
-                                                                                        // For fully parsed instructions, program_id is in the program field
-                                                                                        Some(parsed.program_id.clone())
-                                                                                    },
-                                                                                    UiParsedInstruction::PartiallyDecoded(partial) => {
-                                                                                        // For partially decoded instructions, program_id is available directly
-                                                                                        Some(partial.program_id.to_string())
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    })
-                                                                    .collect()
-                                                            },
-                                                            UiMessage::Raw(raw_msg) => {
-                                                                // Log raw message instructions for first two transactions
-                                                                if tx_idx < 2 {
-                                                                    debug!(?raw_msg.instructions, "Raw message instructions");
-                                                                }
-                                                                
-                                                                // Extract program IDs from raw instructions
-                                                                raw_msg.instructions.iter()
-                                                                    .filter_map(|ix| {
-                                                                        let program_idx = ix.program_id_index;
-                                                                        if program_idx < raw_msg.account_keys.len() as u8 {
-                                                                            Some(raw_msg.account_keys[program_idx as usize].clone())
-                                                                        } else {
-                                                                            None
-                                                                        }
-                                                                    })
-                                                                    .collect()
-                                                            },
-                                                        }
-                                                    },
-                                                    _ => Vec::new(),
-                                                };
-                                                
-                                                // Apply transaction filtering
+                                                // Filter by transaction value
                                                 debug!(
                                                     tx_idx = tx_idx,
-                                                    slot = slot,
-                                                    program_ids_count = program_ids.len(),
-                                                    account_keys_count = account_keys.len(),
-                                                    "Transaction filter check starting"
+                                                    %transaction_value,
+                                                    min_value = block_filter.min_transaction_value,
+                                                    "Transaction value check"
                                                 );
                                                 
-                                                let has_monitored_program = program_ids.iter()
-                                                    .any(|id| block_filter.monitored_program_ids.contains(id));
-                                                
-                                                let has_monitored_token = account_keys.iter()
-                                                    .any(|key| block_filter.monitored_token_mints.contains(key));
-                                                
-                                                debug!(
-                                                    tx_idx = tx_idx,
-                                                    has_monitored_program = has_monitored_program,
-                                                    has_monitored_token = has_monitored_token,
-                                                    "Transaction filter check results"
-                                                );
-                                                
-                                                if !block_filter.should_process_transaction(&program_ids, &account_keys) {
-                                                    debug!(
-                                                        tx_idx = tx_idx,
-                                                        "Transaction filtered: did not pass should_process_transaction check"
-                                                    );
+                                                if transaction_value < block_filter.min_transaction_value {
+                                                    debug!(tx_idx = tx_idx, %transaction_value, "Skipping low-value transaction");
                                                     continue;
                                                 }
                                                 
-                                                transactions_processed += 1;
+                                                debug!(tx_idx = tx_idx, %transaction_value, slot, "Processing transaction signature");
                                                 
-                                                // We're only supporting JSON transactions for now
-                                                // This is safe because we're using TransactionDetails::Signatures
-                                                // which should encode transactions in JSON format
-                                                let signature_str = if let EncodedTransaction::Json(json_tx) = &tx_with_meta.transaction {
-                                                    json_tx.signatures.get(0).cloned()
-                                                } else {
-                                                    // Log other encoding types that we encounter
-                                                    debug!(
-                                                        tx_idx = tx_idx, 
-                                                        slot,
-                                                        encoding = ?tx_with_meta.transaction, 
-                                                        "Unsupported transaction encoding"
-                                                    );
-                                                    None
-                                                };
-                                                
-                                                if let Some(sig_str) = signature_str {
-                                                    let signature = match Signature::from_str(&sig_str) {
-                                                        Ok(sig) => sig,
-                                                        Err(_) => continue,
-                                                    };
-                                                    
-                                                    // Calculate transaction value if possible
-                                                    let transaction_value = tx_with_meta.meta.as_ref()
-                                                        .and_then(|meta_data| meta_data.pre_balances.get(0))
-                                                        .and_then(|pre| {
-                                                            tx_with_meta.meta.as_ref()
-                                                                .and_then(|meta_data| meta_data.post_balances.get(0))
-                                                                .map(|post| pre.saturating_sub(*post))
-                                                        })
-                                                        .unwrap_or(0);
-                                                    
-                                                    // Filter by transaction value
-                                                    debug!(
-                                                        tx_idx = tx_idx,
-                                                        %signature,
-                                                        value = transaction_value,
-                                                        min_value = block_filter.min_transaction_value,
-                                                        "Transaction value check"
-                                                    );
-                                                    
-                                                    if transaction_value < block_filter.min_transaction_value {
-                                                        debug!(tx_idx = tx_idx, %signature, value = transaction_value, "Skipping low-value transaction");
-                                                        continue;
-                                                    }
-                                                    
-                                                    debug!(tx_idx = tx_idx, %signature, slot, "Processing transaction signature");
-                                                    
-                                                    // --- Pass to Evaluator --- 
-                                                    if let Some(evaluator) = evaluator.clone() {
-                                                        // Use signatures for initial filtering - a simpler version
-                                                        // In a production system, you might fetch full transaction
-                                                        // details only for promising candidates
-                                                        let eval_data = serde_json::json!({ 
-                                                            "event_type": "solana_transaction_signature",
-                                                            "signature": signature.to_string(),
-                                                            "slot": slot,
-                                                            "tx_idx": tx_idx,
-                                                            "value": transaction_value,
-                                                            "program_ids": program_ids,
-                                                            "account_keys": account_keys,
-                                                        });
+                                                // --- Pass to Evaluator --- 
+                                                if let Some(evaluator) = evaluator.clone() {
+                                                    // Use signatures for initial filtering - a simpler version
+                                                    // In a production system, you might fetch full transaction
+                                                    // details only for promising candidates
+                                                    let eval_data = serde_json::json!({ 
+                                                        "event_type": "solana_transaction_signature",
+                                                        "signature": transaction_value.to_string(),
+                                                        "slot": slot,
+                                                        "tx_idx": tx_idx,
+                                                        "value": transaction_value,
+                                                        "program_ids": Vec::<String>::new(),  // Empty for now
+                                                        "account_keys": Vec::<String>::new(), // Empty for now
+                                                    });
 
-                                                        debug!(data = ?eval_data, "Sending transaction to evaluator");
-                                                        match evaluator.evaluate_opportunity(eval_data).await {
-                                                            Ok(opportunities) => {
-                                                                debug!(
-                                                                    count = opportunities.len(),
-                                                                    %signature, 
-                                                                    "Evaluator response: found {} potential opportunities",
-                                                                    opportunities.len()
-                                                                );
-                                                                
-                                                                if !opportunities.is_empty() {
-                                                                    debug!(count = opportunities.len(), %signature, "Found potential MEV opportunities");
-                                                                    for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
-                                                                        debug!(
-                                                                            idx = idx,
-                                                                            strategy = ?opportunity.strategy,
-                                                                            estimated_profit = opportunity.estimated_profit,
-                                                                            "Processing opportunity"
-                                                                        );
-                                                                        match evaluator.process_mev_opportunity(&mut opportunity).await {
-                                                                            Ok(Some(exec_sig)) => {
-                                                                                debug!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
-                                                                            },
-                                                                            Ok(None) => {
-                                                                                debug!(idx = idx, strategy = ?opportunity.strategy, decision = ?opportunity.decision, "Decided not to execute MEV opportunity");
-                                                                            },
-                                                                            Err(e) => {
-                                                                                error!(idx = idx, strategy = ?opportunity.strategy, error = %e, "Error executing MEV opportunity");
-                                                                            }
+                                                    debug!(data = ?eval_data, "Sending transaction to evaluator");
+                                                    match evaluator.evaluate_opportunity(eval_data).await {
+                                                        Ok(opportunities) => {
+                                                            debug!(
+                                                                count = opportunities.len(),
+                                                                %transaction_value, 
+                                                                "Evaluator response: found {} potential opportunities",
+                                                                opportunities.len()
+                                                            );
+                                                            
+                                                            if !opportunities.is_empty() {
+                                                                debug!(count = opportunities.len(), %transaction_value, "Found potential MEV opportunities");
+                                                                for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
+                                                                    debug!(
+                                                                        idx = idx,
+                                                                        strategy = ?opportunity.strategy,
+                                                                        estimated_profit = opportunity.estimated_profit,
+                                                                        "Processing opportunity"
+                                                                    );
+                                                                    match evaluator.process_mev_opportunity(&mut opportunity).await {
+                                                                        Ok(Some(exec_sig)) => {
+                                                                            debug!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
+                                                                        },
+                                                                        Ok(None) => {
+                                                                            debug!(idx = idx, strategy = ?opportunity.strategy, decision = ?opportunity.decision, "Decided not to execute MEV opportunity");
+                                                                        },
+                                                                        Err(e) => {
+                                                                            error!(idx = idx, strategy = ?opportunity.strategy, error = %e, "Error executing MEV opportunity");
                                                                         }
                                                                     }
-                                                                } else {
-                                                                    debug!(%signature, "Evaluator found no opportunities in transaction");
                                                                 }
-                                                            }
-                                                            Err(e) => {
-                                                                error!(%signature, error = %e, "Error evaluating opportunity");
+                                                            } else {
+                                                                debug!(%transaction_value, "Evaluator found no opportunities in transaction");
                                                             }
                                                         }
-                                                    } else {
-                                                        warn!("No evaluator set for ListenBot, cannot evaluate transaction.");
+                                                        Err(e) => {
+                                                            error!(%transaction_value, error = %e, "Error evaluating opportunity");
+                                                        }
                                                     }
+                                                } else {
+                                                    warn!("No evaluator set for ListenBot, cannot evaluate transaction.");
                                                 }
                                             }
                                         } else {
@@ -1091,13 +934,18 @@ impl ListenBot {
                             }
                             
                             // Collect transaction sizes
-                            if let Some(meta) = &tx.meta {
-                                if let (Some(pre), Some(post)) = (meta.pre_balances.get(0), meta.post_balances.get(0)) {
-                                    let value = pre.saturating_sub(*post);
-                                    if value > 0 {
-                                        transaction_sizes.push(value);
+                            match &tx.transaction {
+                                EncodedTransaction::Json(_) => {
+                                    if let Some(meta) = &tx.meta {
+                                        if let (Some(pre), Some(post)) = (meta.pre_balances.get(0), meta.post_balances.get(0)) {
+                                            let value = pre.saturating_sub(*post);
+                                            if value > 0 {
+                                                transaction_sizes.push(value);
+                                            }
+                                        }
                                     }
-                                }
+                                },
+                                _ => {}
                             }
                         }
                     }
@@ -1153,6 +1001,233 @@ impl ListenBot {
         */
         
         Ok(())
+    }
+
+    /// Listen to the mempool for pending transactions
+    pub async fn listen_mempool(&self) -> Result<()> {
+        // Get the opportunity evaluator from the service
+        let evaluator = self.evaluator.clone()
+            .ok_or_else(|| anyhow!("Opportunity evaluator not available"))?;
+            
+        // Get the RPC client from the service
+        let rpc_client = Arc::new(RpcClient::new(self.core_config.rpc_url.clone()));
+            
+        info!(target: "listen_bot", "Starting mempool listener...");
+            
+        // Create a websocket connection to the Solana node
+        let wsock_url = self.core_config.ws_url.clone().unwrap_or_else(|| {
+            self.core_config.rpc_url.replace("http", "ws")
+        });
+        
+        info!(target: "listen_bot", "Connecting to mempool via WebSocket: {}", wsock_url);
+        
+        // Create a new pubsub client for WebSocket connection
+        let pubsub_client = PubsubClient::new(&wsock_url).await?;
+        
+        // Subscribe to transaction logs notifications
+        info!(target: "listen_bot", "Subscribing to mempool transactions via logs");
+        
+        // Create configuration for logs subscription
+        let logs_config = RpcTransactionLogsConfig {
+            commitment: Some(CommitmentConfig::confirmed()),
+        };
+        
+        // Subscribe to all transaction logs
+        let (mut transaction_stream, _unsubscribe) = pubsub_client
+            .logs_subscribe(
+                RpcTransactionLogsFilter::All,
+                logs_config,
+            )
+            .await?;
+            
+        info!(target: "listen_bot", "Successfully subscribed to transaction logs");
+        
+        // Load the monitored tokens from the block filter
+        let monitored_tokens: Vec<String> = self.block_filter.monitored_token_mints.iter().cloned().collect();
+        
+        // Process transactions as they come in
+        while let Some(transaction_info) = StreamExt::next(&mut transaction_stream).await {
+            // Create a JSON representation with all necessary fields
+            let transaction_data = json!({
+                "is_pending": true,
+                "signature": transaction_info.value.signature,
+                "transaction": {
+                    "signature": transaction_info.value.signature,
+                    "meta": {
+                        "logMessages": transaction_info.value.logs,
+                        "preBalances": [],
+                        "postBalances": [],
+                    },
+                }
+            });
+            
+            // Get details via RPC if available
+            let tx_signature = match Signature::from_str(&transaction_info.value.signature) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    warn!(target: "listen_bot", error = %e, "Invalid transaction signature, skipping");
+                    continue;
+                }
+            };
+            
+            // Enhance transaction data with more details if available
+            let enhanced_data = match self.get_transaction_details(&rpc_client, &tx_signature).await {
+                Ok(Some(details)) => {
+                    // Merge the details with our base data
+                    let mut data = serde_json::to_value(details).unwrap_or(transaction_data);
+                    data["is_pending"] = json!(true);
+                    data
+                },
+                Ok(None) => transaction_data,
+                Err(e) => {
+                    warn!(target: "listen_bot", error = %e, "Failed to get transaction details, using base data");
+                    transaction_data
+                }
+            };
+            
+            // Check if this is a DEX interaction
+            if !self.is_dex_interaction(&enhanced_data) {
+                trace!(target: "listen_bot", sig = transaction_info.value.signature, "Not a DEX interaction, skipping");
+                continue;
+            }
+            
+            // Send to evaluator using the evaluate_opportunity method
+            match evaluator.evaluate_opportunity(enhanced_data).await {
+                Ok(opportunities) if !opportunities.is_empty() => {
+                    // Process each opportunity found
+                    for mut opportunity in opportunities {
+                        info!(
+                            target: "listen_bot",
+                            sig = transaction_info.value.signature,
+                            strategy = ?opportunity.strategy,
+                            profit = opportunity.estimated_profit,
+                            "Found potential opportunity"
+                        );
+                        
+                        // Process the opportunity
+                        if let Err(e) = evaluator.process_mev_opportunity(&mut opportunity).await {
+                            warn!(target: "listen_bot", error = %e, "Failed to process opportunity");
+                        } else if let Some(decision) = opportunity.decision {
+                            info!(
+                                target: "listen_bot",
+                                sig = transaction_info.value.signature,
+                                strategy = ?opportunity.strategy,
+                                decision = ?decision,
+                                "Processed opportunity with decision"
+                            );
+                        }
+                    }
+                },
+                Ok(_) => {
+                    trace!(target: "listen_bot", sig = transaction_info.value.signature, "No opportunities found");
+                },
+                Err(e) => {
+                    warn!(target: "listen_bot", error = %e, sig = transaction_info.value.signature, "Error evaluating transaction");
+                }
+            }
+        }
+        
+        warn!(target: "listen_bot", "Transaction log stream ended unexpectedly");
+        Ok(())
+    }
+
+    /// Get transaction details using the RPC client
+    async fn get_transaction_details(&self, rpc_client: &Arc<RpcClient>, signature: &Signature) -> Result<Option<serde_json::Value>> {
+        // Get transaction details
+        match rpc_client.get_transaction(signature, UiTransactionEncoding::Json) {
+            Ok(tx) => {
+                let tx_value = serde_json::to_value(tx)?;
+                Ok(Some(tx_value))
+            },
+            Err(e) => {
+                // This is often expected for very recent transactions
+                debug!(target: "listen_bot", error = %e, signature = %signature, "Transaction not found via RPC");
+                Ok(None)
+            }
+        }
+    }
+    
+    /// Check if transaction interacts with a known DEX
+    fn is_dex_interaction(&self, tx_data: &serde_json::Value) -> bool {
+        // Look for DEX program IDs in transaction
+        if let Some(logs) = tx_data
+            .get("transaction")
+            .and_then(|tx| tx.get("meta"))
+            .and_then(|meta| meta.get("logMessages"))
+            .and_then(|logs| logs.as_array())
+        {
+            // Extract program IDs from logs
+            for log in logs {
+                if let Some(log_str) = log.as_str() {
+                    // Check for known DEX programs
+                    if log_str.contains("Program JUP") ||  // Jupiter
+                       log_str.contains("Program 9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin") || // Serum
+                       log_str.contains("Program srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX") || // OpenBook
+                       log_str.contains("Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8") || // Raydium
+                       log_str.contains("Program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")   // Orca
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Process a detected MEV opportunity
+    /// This is now a wrapper around OpportunityEvaluator's process_mev_opportunity
+    async fn process_opportunity(&self, mut opportunity: MevOpportunity) -> Result<()> {
+        // Log the opportunity
+        info!(
+            target: "listen_bot",
+            strategy = ?opportunity.strategy,
+            profit = opportunity.estimated_profit,
+            "Processing MEV opportunity"
+        );
+        
+        // Get evaluator from self
+        if let Some(evaluator) = &self.evaluator {
+            // Let the OpportunityEvaluator process the opportunity
+            match evaluator.process_mev_opportunity(&mut opportunity).await {
+                Ok(Some(signature)) => {
+                    info!(
+                        target: "listen_bot",
+                        signature = %signature,
+                        "Successfully executed MEV opportunity"
+                    );
+                },
+                Ok(None) => {
+                    info!(
+                        target: "listen_bot", 
+                        decision = ?opportunity.decision,
+                        "Decided not to execute opportunity"
+                    );
+                },
+                Err(e) => {
+                    warn!(
+                        target: "listen_bot",
+                        error = %e,
+                        "Error processing opportunity"
+                    );
+                }
+            }
+        } else {
+            warn!(target: "listen_bot", "No evaluator available to process opportunity");
+        }
+        
+        Ok(())
+    }
+
+    /// Set whether to use mempool or confirmed blocks
+    pub fn set_use_mempool(&mut self, use_mempool: bool) {
+        info!("Setting ListenBot to use mempool: {}", use_mempool);
+        self.use_mempool = use_mempool;
+    }
+    
+    /// Get whether mempool is being used
+    pub fn is_using_mempool(&self) -> bool {
+        self.use_mempool
     }
 }
 

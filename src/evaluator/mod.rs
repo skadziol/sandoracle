@@ -1351,6 +1351,11 @@ impl StrategySpecificFactor {
                     estimated_gas_cost_usd: 0.0,
                     optimal_trade_size_usd: 0.0,
                     price_impact_percent: 0.0,
+                    source_liquidity_usd: 0.0,
+                    target_liquidity_usd: 0.0,
+                    estimated_instruction_count: 0,
+                    estimated_compute_units: 0,
+                    timestamp: chrono::Utc::now().timestamp(), // Add missing timestamp field
                 }
             });
         
@@ -1378,6 +1383,14 @@ impl StrategySpecificFactor {
                     optimal_position_size_usd: 0.0,
                     frontrun_slippage_pct: 0.0,
                     backrun_slippage_pct: 0.0,
+                    victim_slippage_tolerance_pct: 0.0,
+                    frontrun_gas_cost_usd: 0.0,
+                    backrun_gas_cost_usd: 0.0,
+                    priority_fee: 0,
+                    estimated_compute_units: 0,
+                    front_run_amount: 0.0,
+                    time_window_ms: 0,
+                    timestamp: chrono::Utc::now().timestamp(), // Add missing timestamp field
                 }
             });
         
@@ -1413,6 +1426,17 @@ impl StrategySpecificFactor {
                     max_position_percent: 0.0,
                     optimal_hold_time_seconds: 0,
                     acquisition_supply_percent: 0.0,
+                    blocks_to_wait: 0,
+                    is_pending: false,
+                    security_checks_passed: false,
+                    exit_strategy: token_snipe::TokenExitStrategy {
+                        take_profit_stages: vec![],
+                        stop_loss_percentage: 0.0,
+                        trailing_stop_percentage: 0.0,
+                        max_hold_time_seconds: 0,
+                        initial_price: 0.0,
+                        investment_amount: 0.0,
+                    },
                 }
             });
         

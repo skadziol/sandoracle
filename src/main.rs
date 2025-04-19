@@ -17,7 +17,7 @@ use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds, MevOpportunity
 use crate::executor::{TransactionExecutor, ExecutionService};
 use crate::rig_agent::RigAgent;
 use crate::market_data::{MarketDataCollector, MarketData};
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 use dotenv::dotenv;
 use tokio::signal;
 use std::sync::Arc;
@@ -28,6 +28,8 @@ use crate::monitoring::OPPORTUNITY_LOGGER;
 use crate::evaluator::arbitrage::ArbitrageEvaluator;
 use crate::evaluator::sandwich::SandwichEvaluator;
 use crate::evaluator::token_snipe::TokenSnipeEvaluator;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
 
 // Add this struct definition for HealthCheckService
 pub struct HealthCheckService {
@@ -348,12 +350,27 @@ async fn main() -> SandoResult<()> {
         "All components initialized successfully"
     );
 
-    // Start the ListenBot in its own task
-    let listen_bot_handle = tokio::spawn(async move {
-        if let Err(e) = listen_bot.start().await {
-            error!(error = %e, "ListenBot failed to start or encountered an error");
+    // Create RPC client for market data
+    let _rpc_client = Arc::new(RpcClient::new(settings.solana_rpc_url.clone()));
+
+    // Start the ListenBot
+    let mut listen_bot = listen_bot;
+    
+    // Set use_mempool to true - this is critical for sandwich attacks
+    listen_bot.set_use_mempool(true);
+
+    // Start mempool listener
+    if listen_bot.is_using_mempool() {
+        debug!("Starting mempool listener...");
+        if let Err(e) = listen_bot.listen_mempool().await {
+            error!("Mempool listener error: {:?}", e);
         }
-    });
+    } else {
+        debug!("Starting confirmed transaction listener...");
+        if let Err(e) = listen_bot.start().await {
+            error!("Confirmed transaction listener error: {:?}", e);
+        }
+    }
 
     // Spawn a task to update market data periodically
     tokio::spawn(async move {
@@ -466,10 +483,9 @@ async fn main() -> SandoResult<()> {
 
     info!("SandoSeer main loop running. Press Ctrl+C to exit.");
 
-    // Wait for the listen_bot task to complete (it will run until shutdown)
-    if let Err(e) = listen_bot_handle.await {
-        error!(error = ?e, "ListenBot task failed or panicked");
-    }
+    // The listen_bot is already running in its own task after start() or listen_mempool()
+    // Just wait for Ctrl+C signal
+    signal::ctrl_c().await.expect("Failed to wait for Ctrl+C signal");
 
     info!("SandoSeer shutting down...");
     // The logging _guard will be dropped here, flushing file logs

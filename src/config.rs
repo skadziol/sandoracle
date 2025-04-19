@@ -53,6 +53,9 @@ pub struct Settings {
 
     // Solana Configuration
     pub commitment: Option<String>, // Added commitment level
+
+    /// Enable mempool monitoring (if false, uses confirmed blocks)
+    pub use_mempool: Option<bool>,
 }
 
 impl Settings {
@@ -106,6 +109,7 @@ impl Settings {
             commitment: env::var("SOLANA_COMMITMENT_LEVEL").ok(),
             allowed_tokens: env::var("ALLOWED_TOKENS").ok().map(|s| s.split(',').map(String::from).collect()),
             blocked_tokens: env::var("BLOCKED_TOKENS").ok().map(|s| s.split(',').map(String::from).collect()),
+            use_mempool: env::var("USE_MEMPOOL").ok().and_then(|v| v.parse().ok()),
         })
     }
 
@@ -113,6 +117,7 @@ impl Settings {
     pub fn default_for_tests() -> Self {
         Self {
             solana_rpc_url: "https://api.testnet.solana.com".to_string(),
+            solana_ws_url: "wss://api.testnet.solana.com".to_string(),
             wallet_private_key: "Test1111111111111111111111111111111111111111111".to_string(),
             simulation_mode: true,
             rig_api_key: Some("test_api_key".to_string()),
@@ -126,7 +131,6 @@ impl Settings {
             min_profit_threshold: 10.0,
             max_slippage: 0.01,
             max_position_size: 1000.0,
-            whitelisted_dexes: Some(vec!["Jupiter".to_string(), "Orca".to_string(), "Raydium".to_string()]),
             allowed_tokens: Some(vec!["SOL".to_string(), "USDC".to_string(), "ETH".to_string()]),
             blocked_tokens: Some(vec![]),
             request_timeout_secs: Some(30),
@@ -139,6 +143,8 @@ impl Settings {
             sandwich_min_profit: Some(20.0),
             snipe_min_profit: Some(50.0),
             geyser_plugin_endpoint_url: "ws://localhost:8900/".to_string(),
+            commitment: Some("processed".to_string()),
+            use_mempool: Some(true),
         }
     }
 
