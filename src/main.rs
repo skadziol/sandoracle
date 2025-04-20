@@ -1,33 +1,38 @@
-mod config;
-mod error;
-mod evaluator;
-mod listen_bot;
-mod rig_agent;
-mod monitoring;
-mod executor;
-mod market_data;
-mod jupiter_client;
+// Remove mod declarations for library modules
+// mod config;
+// mod error;
+// mod evaluator;
+// Remove mod listen_bot declaration
+// mod listen_bot;
+// mod rig_agent;
+// mod monitoring;
+// mod executor;
+// mod market_data;
+// mod jupiter_client;
+// No `mod types;` declaration needed here
 
-use crate::config::Settings;
-use crate::error::{Result as SandoResult, SandoError};
-use crate::monitoring::init_logging;
-use crate::monitoring::log_utils::{check_log_directory, rotate_logs, clear_debug_logs};
-use crate::listen_bot::{ListenBot, ListenBotCommand};
-use crate::evaluator::{OpportunityEvaluator, ExecutionThresholds, MevOpportunity, MevStrategy};
-use crate::executor::{TransactionExecutor, ExecutionService};
-use crate::rig_agent::RigAgent;
-use crate::market_data::{MarketDataCollector, MarketData};
+// Use crate name for library items
+use sandoseer::config::Settings;
+use sandoseer::error::{Result as SandoResult, SandoError};
+use sandoseer::monitoring::init_logging;
+use sandoseer::monitoring::log_utils::{check_log_directory, rotate_logs, clear_debug_logs};
+// Use library path for listen_bot
+use sandoseer::listen_bot::{ListenBot, ListenBotCommand}; 
+use sandoseer::evaluator::{OpportunityEvaluator, ExecutionThresholds, MevOpportunity, MevStrategy};
+use sandoseer::executor::{TransactionExecutor, ExecutionService};
+use sandoseer::rig_agent::RigAgent;
+use sandoseer::market_data::{MarketDataCollector, MarketData};
 use tracing::{info, error, warn, debug};
 use dotenv::dotenv;
 use tokio::signal;
 use std::sync::Arc;
 use std::collections::HashMap;
-use crate::config::RiskLevel as ConfigRiskLevel;
-use crate::evaluator::RiskLevel as EvalRiskLevel;
-use crate::monitoring::OPPORTUNITY_LOGGER;
-use crate::evaluator::arbitrage::ArbitrageEvaluator;
-use crate::evaluator::sandwich::SandwichEvaluator;
-use crate::evaluator::token_snipe::TokenSnipeEvaluator;
+use sandoseer::config::RiskLevel as ConfigRiskLevel;
+use sandoseer::evaluator::RiskLevel as EvalRiskLevel;
+use sandoseer::monitoring::OPPORTUNITY_LOGGER;
+use sandoseer::evaluator::arbitrage::ArbitrageEvaluator;
+use sandoseer::evaluator::sandwich::SandwichEvaluator;
+use sandoseer::evaluator::token_snipe::TokenSnipeEvaluator;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 
@@ -122,7 +127,13 @@ async fn main() -> SandoResult<()> {
     info!("Initializing MarketDataCollector...");
     let price_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let historical_data = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let market_data_collector = MarketDataCollector::new(price_cache.clone(), historical_data.clone())
+    
+    // Pass the RPC endpoint and handle the Result with `?`
+    let market_data_collector = MarketDataCollector::new(
+            price_cache.clone(), 
+            historical_data.clone(),
+            &settings.solana_rpc_url, // Add RPC endpoint from settings
+        )? // Use ? to unwrap the Result or propagate the error
         .with_default_ttl(300)         // 5 minute default TTL
         .with_max_retries(3);          // 3 retries with exponential backoff
     
@@ -174,57 +185,53 @@ async fn main() -> SandoResult<()> {
     info!("Initializing OpportunityEvaluator...");
     
     // Convert the risk level from config to evaluator type
-    let eval_risk_level = evaluator::RiskLevel::from(settings.risk_level.clone());
+    let eval_risk_level = EvalRiskLevel::from(settings.risk_level.clone());
+
+    // Prepare execution thresholds
+    let exec_thresholds = {
+        let mut exec_thresholds = ExecutionThresholds::default();
+        // Update global thresholds based on settings.risk_level
+        exec_thresholds.min_profit_threshold = match settings.risk_level {
+            ConfigRiskLevel::Low => 20.0,     
+            ConfigRiskLevel::Medium => 10.0,  
+            ConfigRiskLevel::High => 5.0,     
+        };
+        exec_thresholds.min_confidence = match settings.risk_level {
+            ConfigRiskLevel::Low => 0.85,    
+            ConfigRiskLevel::Medium => 0.75, 
+            ConfigRiskLevel::High => 0.65,   
+        };
+        // Update strategy-specific thresholds (example for Arbitrage)
+        if let Some(arb_params) = exec_thresholds.strategy_params.get_mut(&MevStrategy::Arbitrage) {
+            arb_params.min_profit = match settings.risk_level {
+                ConfigRiskLevel::Low => 25.0,
+                ConfigRiskLevel::Medium => 15.0,
+                ConfigRiskLevel::High => 8.0,
+            };
+        }
+        // Update strategy-specific thresholds (example for Sandwich)
+        if let Some(sandwich_params) = exec_thresholds.strategy_params.get_mut(&MevStrategy::Sandwich) {
+             sandwich_params.min_profit = match settings.risk_level {
+                 ConfigRiskLevel::Low => 120.0,
+                 ConfigRiskLevel::Medium => 80.0,
+                 ConfigRiskLevel::High => 50.0,
+             };
+             sandwich_params.min_confidence = match settings.risk_level {
+                 ConfigRiskLevel::Low => 0.95,
+                 ConfigRiskLevel::Medium => 0.9,
+                 ConfigRiskLevel::High => 0.85,
+             };
+        }
+        exec_thresholds
+    };
     
+    // Corrected call to new_with_thresholds with proper arguments
     let mut evaluator = OpportunityEvaluator::new_with_thresholds(
-        match settings.risk_level {
-            crate::config::RiskLevel::Low => 20.0,     // Min $20 profit for low risk
-            crate::config::RiskLevel::Medium => 10.0,  // Min $10 profit for medium risk
-            crate::config::RiskLevel::High => 5.0,     // Min $5 profit for high risk
-        },
-        eval_risk_level,                // Use converted risk level
-        settings.min_profit_threshold,  // Duplicate setting as a fallback
-        {
-            // Create customized execution thresholds
-            let mut exec_thresholds = ExecutionThresholds::default();
-            
-            // Update global thresholds
-            exec_thresholds.min_profit_threshold = match settings.risk_level {
-                crate::config::RiskLevel::Low => 20.0,     // Min $20 profit for low risk
-                crate::config::RiskLevel::Medium => 10.0,  // Min $10 profit for medium risk
-                crate::config::RiskLevel::High => 5.0,     // Min $5 profit for high risk
-            };
-            exec_thresholds.min_confidence = match settings.risk_level {
-                crate::config::RiskLevel::Low => 0.85,    // Higher confidence for low risk
-                crate::config::RiskLevel::Medium => 0.75, // Medium confidence
-                crate::config::RiskLevel::High => 0.65,   // Lower confidence for high risk
-            };
-            
-            // Strategy-specific improvements for Arbitrage
-            if let Some(arb_params) = exec_thresholds.strategy_params.get_mut(&MevStrategy::Arbitrage) {
-                arb_params.min_profit = match settings.risk_level {
-                    crate::config::RiskLevel::Low => 25.0,
-                    crate::config::RiskLevel::Medium => 15.0,
-                    crate::config::RiskLevel::High => 8.0,
-                };
-            }
-            
-            // Strategy-specific improvements for Sandwich
-            if let Some(sandwich_params) = exec_thresholds.strategy_params.get_mut(&MevStrategy::Sandwich) {
-                sandwich_params.min_profit = match settings.risk_level {
-                    crate::config::RiskLevel::Low => 120.0,
-                    crate::config::RiskLevel::Medium => 80.0,
-                    crate::config::RiskLevel::High => 50.0,
-                };
-                sandwich_params.min_confidence = match settings.risk_level {
-                    crate::config::RiskLevel::Low => 0.95,
-                    crate::config::RiskLevel::Medium => 0.9,
-                    crate::config::RiskLevel::High => 0.85,
-                };
-            }
-            
-            exec_thresholds
-        }, // Use customized thresholds
+        exec_thresholds.min_profit_threshold,
+        eval_risk_level,
+        exec_thresholds,
+        market_data_collector_arc.clone(),
+        Some(rig_agent_arc.clone()),
     )
     .await
     .map_err(|e| SandoError::DependencyError(format!("Failed to create OpportunityEvaluator: {}", e)))?;
@@ -232,26 +239,32 @@ async fn main() -> SandoResult<()> {
     // Register strategy evaluators
     info!("Registering strategy evaluators...");
     
-    // Register ArbitrageEvaluator
-    let arbitrage_evaluator = ArbitrageEvaluator::new();
+    // Create an RpcClient instance for strategy evaluators that need it
+    let rpc_client_arc = Arc::new(RpcClient::new_with_commitment(
+        settings.solana_rpc_url.clone(),
+        CommitmentConfig::confirmed(), // Or use settings.commitment if defined
+    ));
+
+    // Register ArbitrageEvaluator with RpcClient
+    let arbitrage_evaluator = ArbitrageEvaluator::new(rpc_client_arc.clone());
     evaluator.register_evaluator(Box::new(arbitrage_evaluator));
     
     // Register SandwichEvaluator
-    let sandwich_evaluator = SandwichEvaluator::new();
+    let sandwich_evaluator = SandwichEvaluator::new(); // Assuming it doesn't need RpcClient
     evaluator.register_evaluator(Box::new(sandwich_evaluator));
     
     // Register TokenSnipeEvaluator
-    let token_snipe_evaluator = TokenSnipeEvaluator::new();
+    let token_snipe_evaluator = TokenSnipeEvaluator::new(); // Assuming it doesn't need RpcClient
     evaluator.register_evaluator(Box::new(token_snipe_evaluator));
     
     // Set the execution service on the evaluator
     evaluator.set_strategy_executor(execution_service_arc.clone()).await;
     
-    // Set the RIG Agent on the evaluator for AI-powered decision making
-    evaluator.set_rig_agent(rig_agent_arc.clone()).await;
+    // Set the RIG Agent on the evaluator (already passed in constructor, but maybe keep this API?)
+    // evaluator.set_rig_agent(rig_agent_arc.clone()).await; 
     
-    // Set the market data collector on the evaluator for real-time price and liquidity data
-    evaluator.set_market_data_collector(market_data_collector_arc.clone()).await;
+    // Remove the set_market_data_collector call as it's passed in constructor
+    // evaluator.set_market_data_collector(market_data_collector_arc.clone()).await;
 
     // Wrap the evaluator in an Arc for safe sharing between threads
     let evaluator_arc = Arc::new(evaluator);
@@ -318,9 +331,9 @@ async fn main() -> SandoResult<()> {
     
     // Set minimum transaction value based on risk level - increased for better signal-to-noise ratio
     let min_tx_value = match settings.risk_level {
-        crate::config::RiskLevel::Low => 10_000_000,    // 10 SOL in lamports for low risk
-        crate::config::RiskLevel::Medium => 2_500_000,  // 2.5 SOL in lamports for medium risk
-        crate::config::RiskLevel::High => 1_000_000,    // 1 SOL in lamports for high risk
+        ConfigRiskLevel::Low => 10_000_000,    // 10 SOL in lamports for low risk
+        ConfigRiskLevel::Medium => 2_500_000,  // 2.5 SOL in lamports for medium risk
+        ConfigRiskLevel::High => 1_000_000,    // 1 SOL in lamports for high risk
     };
     
     // Configure the block filter with higher standards
@@ -477,7 +490,7 @@ async fn main() -> SandoResult<()> {
     // Start opportunity stats logger for monitoring MEV opportunities and trades
     let logs_dir = "logs".to_string();
     std::fs::create_dir_all(&logs_dir).expect("Failed to create logs directory");
-    tokio::spawn(monitoring::start_opportunity_stats_logger(logs_dir));
+    tokio::spawn(sandoseer::monitoring::start_opportunity_stats_logger(logs_dir));
     
     info!("Started opportunity monitoring service");
 

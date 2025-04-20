@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Sender};
 use solana_transaction_status::{
     EncodedTransaction, 
     UiTransactionEncoding, 

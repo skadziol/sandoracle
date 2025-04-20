@@ -7,9 +7,10 @@ pub mod rig_agent;
 pub mod monitoring;
 pub mod market_data;
 pub mod jupiter_client;
+pub mod types;
 
 // Private modules
-mod listen_bot;
+pub mod listen_bot;
 
 // Re-export common types
 pub use evaluator::{

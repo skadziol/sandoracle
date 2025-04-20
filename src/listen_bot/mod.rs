@@ -37,7 +37,6 @@ use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta,
 };
 use solana_transaction_status::parse_accounts::ParsedAccount;  // Import from correct module
-use solana_sdk::transaction::VersionedTransaction;
 use tokio::task; // Import for spawn_blocking
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _}; // Add Engine trait
 use std::time::Duration; // Add this for retry delay
@@ -49,6 +48,10 @@ use anyhow::anyhow;
 use regex::Regex;
 use tokio_stream::StreamExt as TokioStreamExt;
 use futures_util;
+use solana_sdk::{message::Message, instruction::CompiledInstruction, transaction::VersionedTransaction}; // Add Message, CompiledInstruction
+use bincode; // Add bincode
+use bs58; // Add bs58 if handling LegacyBinary
+use crate::types::{DecodedTransactionDetails, try_decode_transaction};
 
 // Set to true to relax filtering criteria for debugging (more transactions will pass)
 const DEBUG_RELAX_FILTERS: bool = false;
@@ -574,62 +577,83 @@ impl ListenBot {
                                                 
                                                 debug!(tx_idx = tx_idx, %transaction_value, slot, "Processing transaction signature");
                                                 
-                                                // --- Pass to Evaluator --- 
-                                                if let Some(evaluator) = evaluator.clone() {
-                                                    // Use signatures for initial filtering - a simpler version
-                                                    // In a production system, you might fetch full transaction
-                                                    // details only for promising candidates
-                                                    let eval_data = serde_json::json!({ 
-                                                        "event_type": "solana_transaction_signature",
-                                                        "signature": transaction_value.to_string(),
-                                                        "slot": slot,
-                                                        "tx_idx": tx_idx,
-                                                        "value": transaction_value,
-                                                        "program_ids": Vec::<String>::new(),  // Empty for now
-                                                        "account_keys": Vec::<String>::new(), // Empty for now
-                                                    });
-
-                                                    debug!(data = ?eval_data, "Sending transaction to evaluator");
-                                                    match evaluator.evaluate_opportunity(eval_data).await {
-                                                        Ok(opportunities) => {
-                                                            debug!(
-                                                                count = opportunities.len(),
-                                                                %transaction_value, 
-                                                                "Evaluator response: found {} potential opportunities",
-                                                                opportunities.len()
-                                                            );
-                                                            
-                                                            if !opportunities.is_empty() {
-                                                                debug!(count = opportunities.len(), %transaction_value, "Found potential MEV opportunities");
-                                                                for (idx, mut opportunity) in opportunities.into_iter().enumerate() {
-                                                                    debug!(
-                                                                        idx = idx,
-                                                                        strategy = ?opportunity.strategy,
-                                                                        estimated_profit = opportunity.estimated_profit,
-                                                                        "Processing opportunity"
-                                                                    );
-                                                                    match evaluator.process_mev_opportunity(&mut opportunity).await {
-                                                                        Ok(Some(exec_sig)) => {
-                                                                            debug!(idx = idx, strategy = ?opportunity.strategy, signature = %exec_sig, "Successfully executed MEV opportunity");
-                                                                        },
-                                                                        Ok(None) => {
-                                                                            debug!(idx = idx, strategy = ?opportunity.strategy, decision = ?opportunity.decision, "Decided not to execute MEV opportunity");
-                                                                        },
-                                                                        Err(e) => {
-                                                                            error!(idx = idx, strategy = ?opportunity.strategy, error = %e, "Error executing MEV opportunity");
-                                                                        }
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                debug!(%transaction_value, "Evaluator found no opportunities in transaction");
+                                                // --- Decode Transaction Attempt (Task 4.1) --- 
+                                                let mut signature_str = "UNKNOWN_SIG".to_string(); // Declare signature_str *before* match
+                                                let mut decoded_details: Option<DecodedTransactionDetails> = None; // Declare decoded_details *before* logic
+ 
+                                                // Match on the EncodedTransaction enum to get the message
+                                                let maybe_versioned_tx: Option<VersionedTransaction> = match &tx_with_meta.transaction {
+                                                    EncodedTransaction::Json(json_tx) => {
+                                                        // Assign signature within arm if needed - Correct for Json variant
+                                                        signature_str = json_tx.signatures.get(0).cloned().unwrap_or_else(|| "MISSING_SIG".to_string());
+                                                        warn!(target: "listen_bot::start", tx_sig=%signature_str, "Decoding JSON encoded tx in confirmed block is complex, skipping for now.");
+                                                        None 
+                                                    }
+                                                    EncodedTransaction::Binary(encoded_data, encoding) => {
+                                                        // Removed premature signature_str assignment here
+                                                        let decoded_data = match encoding {
+                                                            solana_transaction_status::TransactionBinaryEncoding::Base64 => BASE64_STANDARD.decode(encoded_data).ok(),
+                                                            solana_transaction_status::TransactionBinaryEncoding::Base58 => bs58::decode(encoded_data).into_vec().ok(),
+                                                            _ => { 
+                                                                // Assign unknown signature here if encoding fails
+                                                                signature_str = "UNKNOWN_SIG_ENCODING".to_string();
+                                                                warn!(target: "listen_bot::start", tx_sig=%signature_str, ?encoding, "Unsupported binary encoding"); 
+                                                                None 
                                                             }
-                                                        }
-                                                        Err(e) => {
-                                                            error!(%transaction_value, error = %e, "Error evaluating opportunity");
+                                                        };
+                                                        if let Some(ref bytes) = decoded_data {
+                                                            match bincode::deserialize::<VersionedTransaction>(bytes) {
+                                                                Ok(tx) => {
+                                                                    // Assign signature_str *after* successful deserialization
+                                                                    signature_str = tx.signatures.get(0).map(|s| s.to_string()).unwrap_or_else(|| "MISSING_SIG_POST_DECODE".to_string());
+                                                                    Some(tx)
+                                                                }, 
+                                                                Err(e) => {
+                                                                    // Assign unknown signature here if deserialize fails
+                                                                    signature_str = "UNKNOWN_SIG_DESERIALIZE".to_string();
+                                                                    warn!(target: "listen_bot::start", tx_sig=%signature_str, error=%e, "Failed to deserialize VersionedTransaction from binary data.");
+                                                                    None
+                                                                }
+                                                            }
+                                                        } else { 
+                                                            // Assign unknown signature here if decoded_data is None
+                                                            signature_str = "UNKNOWN_SIG_NO_DECODE".to_string();
+                                                            None 
                                                         }
                                                     }
-                                                } else {
-                                                    warn!("No evaluator set for ListenBot, cannot evaluate transaction.");
+                                                    EncodedTransaction::LegacyBinary(encoded_data) => {
+                                                        // Assign unknown signature here - Legacy handling not implemented
+                                                         signature_str = "UNKNOWN_SIG_LEGACY".to_string();
+                                                         // ... (legacy handling) ...
+                                                        None 
+                                                    }
+                                                    _ => None, 
+                                                };
+
+                                                if let Some(tx) = maybe_versioned_tx {
+                                                    // --- Call decoder *inside* the successful extraction --- 
+                                                    let message = &tx.message;
+                                                    let ixs: Vec<CompiledInstruction> = message.instructions().iter().map(|ix| 
+                                                        CompiledInstruction {
+                                                            program_id_index: ix.program_id_index,
+                                                            accounts: ix.accounts.clone(),
+                                                            data: ix.data.clone(),
+                                                        }
+                                                    ).collect();
+                                                    // Assign to outer decoded_details, remove inner `let`
+                                                    decoded_details = try_decode_transaction(signature_str.clone(), message, &ixs);
+                                                } else if signature_str != "UNKNOWN_SIG" { 
+                                                     // ... (warning unchanged) ...
+                                                }
+                                                // --- End Decode --- 
+                                                
+                                                // --- Pass to Evaluator --- 
+                                                if let Some(evaluator) = evaluator.clone() {
+                                                    let eval_data = serde_json::json!({ 
+                                                        // ... (other fields) ...
+                                                        "decoded_details": decoded_details, // Use outer variable
+                                                    });
+                                                    // ... (evaluator call) ...
                                                 }
                                             }
                                         } else {
@@ -1047,40 +1071,100 @@ impl ListenBot {
         
         // Process transactions as they come in
         while let Some(transaction_info) = StreamExt::next(&mut transaction_stream).await {
-            // Create a JSON representation with all necessary fields
-            let transaction_data = json!({
+            let signature_str = transaction_info.value.signature.clone();
+            
+            // Base transaction data from logs
+            let mut transaction_data = json!({
                 "is_pending": true,
-                "signature": transaction_info.value.signature,
+                "signature": signature_str,
                 "transaction": {
-                    "signature": transaction_info.value.signature,
+                    "signature": signature_str,
                     "meta": {
                         "logMessages": transaction_info.value.logs,
-                        "preBalances": [],
-                        "postBalances": [],
+                        "preBalances": [], // Not available from logsSubscribe
+                        "postBalances": [], // Not available from logsSubscribe
                     },
-                }
+                    // message field needs to be populated by get_transaction_details
+                },
+                "decoded_details": Option::<DecodedTransactionDetails>::None // Initialize decoded_details
             });
             
-            // Get details via RPC if available
-            let tx_signature = match Signature::from_str(&transaction_info.value.signature) {
+            let tx_signature = match Signature::from_str(&signature_str) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    warn!(target: "listen_bot", error = %e, "Invalid transaction signature, skipping");
+                    warn!(target: "listen_bot::mempool", error = %e, "Invalid transaction signature from logs, skipping");
                     continue;
                 }
             };
             
             // Enhance transaction data with more details if available
             let enhanced_data = match self.get_transaction_details(&rpc_client, &tx_signature).await {
-                Ok(Some(details)) => {
-                    // Merge the details with our base data
-                    let mut data = serde_json::to_value(details).unwrap_or(transaction_data);
-                    data["is_pending"] = json!(true);
-                    data
+                Ok(Some(mut details_value)) => {
+                    let mut decoded_details: Option<DecodedTransactionDetails> = None; // Initialize
+                    
+                    // --- Decode Transaction Attempt (Task 4.1) --- 
+                    match serde_json::from_value::<EncodedConfirmedTransactionWithStatusMeta>(details_value.clone()) {
+                        Ok(encoded_tx_with_meta) => {
+                            // Match on the inner EncodedTransaction enum
+                            match encoded_tx_with_meta.transaction.transaction {
+                                EncodedTransaction::Json(json_tx) => {
+                                    warn!(target: "listen_bot::mempool", tx_sig=%signature_str, "Decoding JSON encoded tx in mempool is complex, skipping for now.");
+                                    // Cannot easily get VersionedTransaction from Json variant here
+                                }
+                                EncodedTransaction::Binary(encoded_data, encoding) => {
+                                    let decoded_data = match encoding {
+                                        solana_transaction_status::TransactionBinaryEncoding::Base64 => BASE64_STANDARD.decode(encoded_data).ok(),
+                                        solana_transaction_status::TransactionBinaryEncoding::Base58 => bs58::decode(encoded_data).into_vec().ok(),
+                                        _ => None,
+                                    };
+                                    if let Some(bytes) = decoded_data {
+                                        if let Ok(tx) = bincode::deserialize::<VersionedTransaction>(&bytes) {
+                                            // Successfully got the VersionedTransaction
+                                            let message = &tx.message;
+                                            let ixs: Vec<CompiledInstruction> = message.instructions().iter().map(|ix| 
+                                                CompiledInstruction {
+                                                    program_id_index: ix.program_id_index,
+                                                    accounts: ix.accounts.clone(),
+                                                    data: ix.data.clone(),
+                                                }
+                                            ).collect();
+                                            // Now call the decoder
+                                            decoded_details = try_decode_transaction(signature_str.clone(), message, &ixs);
+                                        } else {
+                                            warn!(target: "listen_bot::mempool", tx_sig=%signature_str, "Could not deserialize VersionedTransaction from binary data.");
+                                        }
+                                    } else {
+                                         warn!(target: "listen_bot::mempool", tx_sig=%signature_str, ?encoding, "Unsupported or failed binary decoding.");
+                                    }
+                                }
+                                EncodedTransaction::LegacyBinary(_) => {
+                                    warn!(target: "listen_bot::mempool", tx_sig=%signature_str, "Decoding LegacyBinary encoded tx is not yet supported.");
+                                }
+                                _ => {
+                                     warn!(target: "listen_bot::mempool", tx_sig=%signature_str, "Unsupported EncodedTransaction variant encountered.");
+                                }
+                            }
+                        }
+                        Err(_) => {
+                             warn!(target: "listen_bot::mempool", tx_sig=%signature_str, "Could not deserialize fetched details into EncodedConfirmedTransactionWithStatusMeta.");
+                        }
+                    }
+                    // --- End Decode --- 
+
+                    // Merge details and add decoded info
+                    if let Value::Object(map) = &mut details_value {
+                         map.insert("is_pending".to_string(), json!(true));
+                         map.insert("decoded_details".to_string(), serde_json::to_value(decoded_details).unwrap_or(Value::Null));
+                     } else {
+                        // If not an object, just use the base data + decoded (which is None)
+                         transaction_data["decoded_details"] = serde_json::to_value(decoded_details).unwrap_or(Value::Null);
+                         details_value = transaction_data; // Fallback
+                     }
+                    details_value
                 },
-                Ok(None) => transaction_data,
+                Ok(None) => transaction_data, // Use base data if get_transaction fails initially
                 Err(e) => {
-                    warn!(target: "listen_bot", error = %e, "Failed to get transaction details, using base data");
+                    warn!(target: "listen_bot::mempool", error = %e, "Failed to get transaction details, using base log data");
                     transaction_data
                 }
             };

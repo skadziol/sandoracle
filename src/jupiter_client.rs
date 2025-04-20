@@ -5,6 +5,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::VersionedTransaction;
+use crate::error::SandoError;
 // Add bincode use statement if not already present transitively
 // use bincode;
 use reqwest;
@@ -194,10 +195,13 @@ impl Jupiter {
     }
     
     // Helper to find token info by mint address
-    fn find_token_info<'a>(token_list: &'a [TokenInfo], mint: &str) -> Result<&'a TokenInfo> {
+    // Make this public so MarketDataCollector can use it
+    pub fn find_token_info<'a>(token_list: &'a [TokenInfo], mint: &str) -> Result<&'a TokenInfo> {
         token_list.iter()
             .find(|token| token.address == mint)
-            .ok_or_else(|| anyhow!("Token with mint {} not found in Jupiter token list", mint))
+            // Use a specific error type or message for not found?
+            // For now, DataProcessing is okay, but could be refined.
+            .ok_or_else(|| SandoError::DataProcessing(format!("Token mint {} not found in Jupiter list", mint)).into())
     }
 
     // Public method to get token list from Jupiter

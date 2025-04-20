@@ -6,6 +6,14 @@ use serde_json::Value;
 use tracing::{debug, info, trace, warn};
 use std::collections::HashMap;
 use anyhow::anyhow;
+use super::utils; // Import the new utils module
+use crate::market_data::MarketData; // Import MarketData
+use crate::types::{DecodedInstructionInfo, DecodedTransactionDetails}; // Path should be correct now
+use solana_client::rpc_client::RpcClient;
+use std::sync::Arc;
+use crate::executor::TransactionExecutor;
+use crate::market_data::MarketDataCollector;
+use crate::config::Settings;
 
 /// Configuration for arbitrage opportunities
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,122 +83,21 @@ pub struct ArbitrageMetadata {
 /// Evaluator for arbitrage opportunities
 pub struct ArbitrageEvaluator {
     config: ArbitrageConfig,
+    rpc_client: Arc<RpcClient>,
 }
 
 impl ArbitrageEvaluator {
     /// Create a new arbitrage evaluator with default configuration
-    pub fn new() -> Self {
+    pub fn new(rpc_client: Arc<RpcClient>) -> Self {
         Self {
             config: ArbitrageConfig::default(),
+            rpc_client,
         }
     }
     
     /// Create a new arbitrage evaluator with custom configuration
-    pub fn with_config(config: ArbitrageConfig) -> Self {
-        Self { config }
-    }
-    
-    /// Extract token pairs from transaction data
-    fn extract_token_pairs(&self, data: &Value) -> Option<(String, String)> {
-        // Define common token patterns at the function level for use in all blocks
-        let token_patterns = [
-            ("SOL", "So11111111111111111111111111111111111111112"),
-            ("USDC", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-            ("USDT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
-            ("ETH", "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"),
-            ("BTC", "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E"),
-            ("JUP", "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"),
-            ("BONK", "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"),
-        ];
-
-        // First, try to extract directly from JSON
-        if let Some(token1) = data.get("token1").and_then(|t| t.as_str()) {
-            if let Some(token2) = data.get("token2").and_then(|t| t.as_str()) {
-                trace!(target: "arbitrage_evaluator", "Found token pair in JSON: {}/{}", token1, token2);
-                return Some((token1.to_string(), token2.to_string()));
-            }
-        }
-        
-        // Extract transaction logs and look for token transfers
-        if let Some(transaction) = data.get("transaction") {
-            if let Some(logs) = transaction.get("logs") {
-                trace!(target: "arbitrage_evaluator", "Analyzing logs for token transfers");
-                
-                // Look for token transfer logs
-                if let Some(logs_array) = logs.as_array() {
-                    let mut found_tokens = Vec::new();
-                    
-                    for log in logs_array {
-                        if let Some(log_str) = log.as_str() {
-                            // Look for token transfers in logs
-                            if log_str.contains("spl-token") && log_str.contains("Transfer") {
-                                // Check for known token mints in the log
-                                for (symbol, mint) in &token_patterns {
-                                    if log_str.contains(mint) {
-                                        found_tokens.push(symbol.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // If we found at least two different tokens, return them as a pair
-                    if found_tokens.len() >= 2 {
-                        // Remove duplicates and ensure we have a distinct pair
-                        found_tokens.sort();
-                        found_tokens.dedup();
-                        
-                        if found_tokens.len() >= 2 {
-                            return Some((found_tokens[0].clone(), found_tokens[1].clone()));
-                        }
-                    }
-                }
-            }
-        }
-        
-        // If we still don't have a pair, try to extract from program IDs and account keys
-        if let Some(transaction) = data.get("transaction") {
-            if let Some(message) = transaction.get("message") {
-                if let Some(account_keys) = message.get("accountKeys") {
-                    if let Some(keys_array) = account_keys.as_array() {
-                        // Check for Jupiter, Raydium, or Orca program IDs
-                        let dex_program_found = keys_array.iter().any(|key| {
-                            key.as_str().map_or(false, |key_str| {
-                                key_str == "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4" ||
-                                key_str == "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" ||
-                                key_str == "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
-                            })
-                        });
-                        
-                        if dex_program_found {
-                            // Check for token mints
-                            let mut token_mints = Vec::new();
-                            for key in keys_array {
-                                if let Some(key_str) = key.as_str() {
-                                    for (symbol, mint) in &token_patterns {
-                                        if key_str == *mint {
-                                            token_mints.push(symbol.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            if token_mints.len() >= 2 {
-                                token_mints.sort();
-                                token_mints.dedup();
-                                if token_mints.len() >= 2 {
-                                    return Some((token_mints[0].clone(), token_mints[1].clone()));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // If we still don't have a pair from transaction data, use default pair only as last resort
-        warn!(target: "arbitrage_evaluator", "Could not extract token pair from transaction data, using default SOL/USDC pair");
-        Some(("SOL".to_string(), "USDC".to_string()))
+    pub fn with_config(config: ArbitrageConfig, rpc_client: Arc<RpcClient>) -> Self {
+        Self { config, rpc_client }
     }
     
     /// Calculate the potential profit from an arbitrage opportunity
@@ -201,11 +108,14 @@ impl ArbitrageEvaluator {
     
     /// Calculate optimal trade size based on pool liquidity and price impact
     fn calculate_optimal_size(&self, source_liquidity: f64, target_liquidity: f64, price_diff_percent: f64) -> f64 {
-        // Determine the limiting pool (smaller of the two)
-        let min_liquidity = source_liquidity.min(target_liquidity);
+        // Note: Liquidity values are now expected to be real (or 0.0 if unavailable)
+        // Remove placeholder warnings/floors
+        // warn!(target: "arbitrage_evaluator", "Using PLACEHOLDER liquidity for optimal size calculation.");
+        // let source_liquidity = source_liquidity.max(10000.0); // Placeholder floor removed
+        // let target_liquidity = target_liquidity.max(10000.0); // Placeholder floor removed
         
-        if min_liquidity <= 0.0 {
-            warn!(target: "arbitrage_evaluator", "Pool liquidity is zero or negative, using minimum trade size");
+        if source_liquidity <= 0.0 || target_liquidity <= 0.0 {
+            warn!(target: "arbitrage_evaluator", source_liq=%source_liquidity, target_liq=%target_liquidity, "Pool liquidity is zero or negative, using minimum trade size");
             return self.config.min_trade_value_usd;
         }
         
@@ -227,39 +137,21 @@ impl ArbitrageEvaluator {
         let percentage = base_percentage.min(self.config.max_pool_utilization_percent);
         
         // Calculate size based on percentage of liquidity
-        let size = min_liquidity * (percentage / 100.0);
+        let size = (source_liquidity + target_liquidity) * (percentage / 200.0);
         
         // Ensure minimum trade size
         size.max(self.config.min_trade_value_usd)
     }
     
-    /// Calculate price impact based on trade size and pool liquidity
-    fn calculate_price_impact(&self, trade_size_usd: f64, pool_liquidity_usd: f64) -> f64 {
-        if pool_liquidity_usd <= 0.0 {
-            warn!(target: "arbitrage_evaluator", "Pool liquidity is zero or negative, assuming high price impact");
-            return 5.0; // Assume 5% impact as a conservative estimate
-        }
-        
-        // Using constant product formula (x * y = k) to calculate price impact
-        // For a trade consuming trade_size_usd of a pool with pool_liquidity_usd
-        let trade_ratio = trade_size_usd / pool_liquidity_usd;
-        
-        // Using a more accurate price impact formula: 
-        // impact = trade_ratio / (2 - trade_ratio) * 100 for x*y=k pools
-        let impact = trade_ratio / (2.0 - trade_ratio.min(1.0)) * 100.0;
-        
-        debug!(target: "arbitrage_evaluator", 
-               trade_size = trade_size_usd, 
-               pool_liquidity = pool_liquidity_usd,
-               trade_ratio = trade_ratio,
-               impact = impact,
-               "Calculated price impact");
-               
-        impact
-    }
-    
     /// Estimate gas cost for arbitrage transaction
-    fn estimate_gas_cost(&self, instruction_count: u64) -> f64 {
+    fn estimate_gas_cost(&self, instruction_count: u64, sol_price_usd: f64) -> f64 {
+        // Note: sol_price_usd is now expected to be real (or a default if fetch failed)
+        // Remove placeholder warnings/floors
+        // if sol_price_usd <= 0.0 {
+        //     warn!(target: "arbitrage_evaluator", "Using PLACEHOLDER SOL price for gas calculation.");
+        // }
+        // let sol_price_usd = sol_price_usd.max(100.0); // Placeholder floor removed
+        
         // Estimate total compute units based on instruction count
         let compute_units = instruction_count * self.config.avg_instruction_cu;
         
@@ -274,9 +166,6 @@ impl ArbitrageEvaluator {
         
         // Convert to SOL
         let gas_cost_sol = total_gas_cost_lamports as f64 / 1_000_000_000.0;
-        
-        // Get SOL price from data or use reasonable default
-        let sol_price_usd = 100.0; // Should be replaced with actual price from market data
         
         let gas_cost_usd = gas_cost_sol * sol_price_usd;
         
@@ -294,6 +183,11 @@ impl ArbitrageEvaluator {
     
     /// Determine risk level based on the arbitrage opportunity
     fn determine_risk_level(&self, price_diff_percent: f64, liquidity_usd: f64, price_impact: f64) -> RiskLevel {
+        // Note: liquidity_usd is now expected to be real (or 0.0)
+        // Remove placeholder warnings/floors
+        // warn!(target: "arbitrage_evaluator", "Using PLACEHOLDER liquidity for risk level determination.");
+        // let liquidity_usd = liquidity_usd.max(10000.0); // Placeholder floor removed
+        
         // Extremely high price differences (> 5%) are suspicious and potentially risky
         if price_diff_percent > 5.0 {
             return RiskLevel::High;
@@ -308,80 +202,6 @@ impl ArbitrageEvaluator {
             return RiskLevel::Low;
         }
     }
-    
-    /// Extract DEX prices from data provided by OpportunityEvaluator
-    fn extract_dex_prices(&self, data: &Value, token_pair: &(String, String)) -> Option<HashMap<String, f64>> {
-        // Check if prices are already available in the data
-        if let Some(prices) = data.get("dex_prices") {
-            if let Some(prices_obj) = prices.as_object() {
-                let mut dex_prices = HashMap::new();
-                
-                for (dex, price_data) in prices_obj {
-                    if let Some(price_value) = price_data.as_f64() {
-                        dex_prices.insert(dex.clone(), price_value);
-                    }
-                }
-                
-                if !dex_prices.is_empty() {
-                    return Some(dex_prices);
-                }
-            }
-        }
-        
-        // If we have pool liquidity data, we can extract prices
-        if let Some(pools) = data.get("dex_pools") {
-            if let Some(pools_obj) = pools.as_object() {
-                let mut dex_prices = HashMap::new();
-                
-                for (dex, pool_data) in pools_obj {
-                    if let Some(pool_obj) = pool_data.as_object() {
-                        if let Some(price) = pool_obj.get("price").and_then(|p| p.as_f64()) {
-                            dex_prices.insert(dex.clone(), price);
-                        }
-                    }
-                }
-                
-                if !dex_prices.is_empty() {
-                    return Some(dex_prices);
-                }
-            }
-        }
-        
-        warn!(target: "arbitrage_evaluator", "No DEX prices found in data, using simulation data");
-        
-        // For simulation/testing, create some sample prices
-        // This should be replaced with actual price data in production
-        let mut simulated_prices = HashMap::new();
-        simulated_prices.insert("Jupiter".to_string(), 1.0);
-        simulated_prices.insert("Raydium".to_string(), 1.005);
-        simulated_prices.insert("Orca".to_string(), 0.995);
-        
-        Some(simulated_prices)
-    }
-    
-    /// Extract pool liquidity from data provided by OpportunityEvaluator
-    fn extract_pool_liquidity(&self, data: &Value, dex: &str) -> f64 {
-        // Check if liquidity data is available in the data
-        if let Some(pools) = data.get("dex_pools") {
-            if let Some(pools_obj) = pools.as_object() {
-                if let Some(pool_data) = pools_obj.get(dex) {
-                    if let Some(pool_obj) = pool_data.as_object() {
-                        if let Some(liquidity) = pool_obj.get("liquidity_usd").and_then(|l| l.as_f64()) {
-                            return liquidity;
-                        }
-                    }
-                }
-            }
-        }
-        
-        // If not found, return a reasonable default based on the DEX
-        match dex {
-            "Jupiter" => 500000.0,  // $500k default for Jupiter
-            "Raydium" => 300000.0,  // $300k default for Raydium
-            "Orca" => 200000.0,     // $200k default for Orca
-            _ => 100000.0,          // $100k default for unknown DEXes
-        }
-    }
 }
 
 #[async_trait]
@@ -393,31 +213,83 @@ impl MevStrategyEvaluator for ArbitrageEvaluator {
     async fn evaluate(&self, data: &Value) -> Result<Option<MevOpportunity>> {
         trace!(target: "arbitrage_evaluator", "Evaluating potential arbitrage opportunity");
         
-        // Extract token pair from the transaction or data
-        let token_pair = match self.extract_token_pairs(data) {
-            Some(pair) => pair,
-            None => {
-                trace!(target: "arbitrage_evaluator", "No token pair found in transaction");
-                return Ok(None);
+        // --- Parse Context Passed from OpportunityEvaluator --- 
+        let market_context = data.get("market_context").ok_or_else(|| {
+            warn!(target: "arbitrage_evaluator", "Missing 'market_context' in input data");
+            anyhow!("Missing 'market_context' in input data")
+        })?;
+        let decoded_context = data.get("decoded_details"); // Optional
+
+        // Extract SOL price (use default if fetch failed)
+        let sol_usd_price = market_context
+            .get("sol_usd_price")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| {
+                 warn!(target: "arbitrage_evaluator", "Missing or invalid SOL price in context, using default.");
+                 150.0 // Default SOL price
+            });
+
+        // Extract pair market data
+        let pair_market_data: Option<MarketData> = market_context
+            .get("pair_market_data")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()); // Deserialize Option<MarketData>
+
+        // Extract liquidity (use 0.0 if MarketData is missing or liquidity is placeholder -1.0)
+        let pool_liquidity = pair_market_data
+            .as_ref()
+            .map_or(0.0, |md| if md.liquidity == -1.0 { 0.0 } else { md.liquidity });
+            
+        // --- Extract Details from Decoded Context (If Available) --- 
+        let mut parsed_token_pair: Option<(String, String)> = None;
+        let mut parsed_input_amount: Option<u64> = None;
+        let mut parsed_min_output_amount: Option<u64> = None;
+        
+        if let Some(decoded_json) = decoded_context {
+            if !decoded_json.is_null() { // Check if it's not null before trying to parse
+                 match serde_json::from_value::<DecodedTransactionDetails>(decoded_json.clone()) {
+                    Ok(details) => {
+                        if let Some(primary_ix) = details.primary_instruction {
+                            // Prefer decoded details if available
+                            if let (Some(input_m), Some(output_m)) = (primary_ix.input_mint, primary_ix.output_mint) {
+                                parsed_token_pair = Some((input_m, output_m));
+                            }
+                            parsed_input_amount = primary_ix.input_amount;
+                            parsed_min_output_amount = primary_ix.minimum_output_amount;
+                             debug!(target: "arbitrage_evaluator", "Parsed details from decoded context");
+                        }
+                    },
+                    Err(e) => {
+                        warn!(target: "arbitrage_evaluator", error=%e, "Failed to deserialize DecodedTransactionDetails from context");
+                    }
+                }
             }
-        };
+        }
         
-        debug!(target: "arbitrage_evaluator", 
-               token_1 = %token_pair.0, 
-               token_2 = %token_pair.1, 
-               "Extracted token pair for arbitrage evaluation");
+        // Use parsed pair or fallback to placeholder
+        let token_pair = parsed_token_pair.unwrap_or_else(|| {
+            warn!(target: "arbitrage_evaluator", "Using PLACEHOLDER token pair (decoding failed or unavailable)");
+            ("SOL".to_string(), "USDC".to_string())
+        });
+
+        // --- Parse Price Data (Legacy - Remove when context passing is complete) --- 
+        let real_dex_prices_value = data.get("real_dex_prices").ok_or_else(|| {
+            warn!(target: "arbitrage_evaluator", "Missing 'real_dex_prices' in input data (legacy)");
+            anyhow!("Missing 'real_dex_prices' in input data (legacy)")
+        })?;
+        let dex_prices_opt: HashMap<String, Option<f64>> = serde_json::from_value(real_dex_prices_value.clone())?;
+        let dex_prices: HashMap<String, f64> = dex_prices_opt
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|price| (k, price)))
+            .collect();
+        // --- End Parsing --- 
         
-        // Extract DEX prices from data
-        let dex_prices = match self.extract_dex_prices(data, &token_pair) {
-            Some(prices) => prices,
-            None => {
-                debug!(target: "arbitrage_evaluator", "No DEX prices available for evaluation");
-                return Ok(None);
-            }
-        };
-        
+        // Remove internal placeholders
+        // let sol_price_usd = 150.0; // Placeholder removed
+        // let placeholder_liquidity = 100000.0; // Placeholder removed
+        // warn!(target: "arbitrage_evaluator", "Using PLACEHOLDER token pair, SOL price, and liquidity values."); // Warning removed
+
         if dex_prices.len() < 2 {
-            debug!(target: "arbitrage_evaluator", "Insufficient DEX price data for arbitrage (need at least 2 DEXes)");
+            debug!(target: "arbitrage_evaluator", "Insufficient valid DEX price data (need at least 2)");
             return Ok(None);
         }
         
@@ -453,69 +325,64 @@ impl MevStrategyEvaluator for ArbitrageEvaluator {
             return Ok(None);
         }
         
-        // Get pool liquidity data
-        let source_liquidity = self.extract_pool_liquidity(data, &source_dex);
-        let target_liquidity = self.extract_pool_liquidity(data, &target_dex);
+        // Use the parsed (potentially 0.0) liquidity data 
+        let source_liquidity = pool_liquidity; 
+        let target_liquidity = pool_liquidity; 
         
-        // Calculate optimal trade size based on liquidity and price difference
+        // Calculate optimal trade size using potentially real liquidity
         let optimal_trade_size = self.calculate_optimal_size(
             source_liquidity, 
             target_liquidity, 
             price_diff_percentage
         );
-        
-        // Calculate price impact for this trade size
-        let source_price_impact = self.calculate_price_impact(optimal_trade_size, source_liquidity);
-        let target_price_impact = self.calculate_price_impact(optimal_trade_size, target_liquidity);
-        
-        // Total price impact
+        // For arbitrage, we use the calculated optimal size
+        let trade_size_usd = optimal_trade_size; 
+
+        // Calculate price impact using calculated trade size and potentially real liquidity
+        let source_price_impact = utils::calculate_price_impact(trade_size_usd, source_liquidity);
+        let target_price_impact = utils::calculate_price_impact(trade_size_usd, target_liquidity);
         let total_price_impact = source_price_impact + target_price_impact;
         
         // Check if price impact is acceptable
         if total_price_impact > self.config.max_price_impact_percent {
-            debug!(target: "arbitrage_evaluator", 
-                   total_price_impact = total_price_impact,
-                   max_impact = self.config.max_price_impact_percent,
-                   "Price impact exceeds maximum allowed");
+             debug!(target: "arbitrage_evaluator", impact=total_price_impact, size=trade_size_usd, "Price impact too high for calculated optimal size");
             return Ok(None);
         }
         
-        // Estimate gas costs
-        let estimated_instruction_count = 8; // Realistic estimate for arbitrage transaction
-        let estimated_gas_cost = self.estimate_gas_cost(estimated_instruction_count);
+        // Estimate gas costs using parsed SOL price
+        let estimated_instruction_count = 8; 
+        let estimated_gas_cost = self.estimate_gas_cost(estimated_instruction_count, sol_usd_price);
         
-        // Calculate expected profit
-        let gross_profit = optimal_trade_size * (price_diff_percentage / 100.0);
+        // Calculate Profit after impact (approximation)
+        // Adjust price diff by impact: effective_diff = diff% - impact%
+        let effective_price_diff_percentage = price_diff_percentage - total_price_impact;
+        let gross_profit = trade_size_usd * (effective_price_diff_percentage / 100.0);
         let net_profit = gross_profit - estimated_gas_cost;
         
-        // Check if net profit is positive
+        // Final Profitability Check
         if net_profit <= 0.0 {
-            debug!(target: "arbitrage_evaluator", 
-                   gross_profit = gross_profit,
-                   gas_cost = estimated_gas_cost,
-                   net_profit = net_profit,
-                   "Arbitrage not profitable after gas costs");
+             debug!(target: "arbitrage_evaluator", profit=net_profit, size=trade_size_usd, "Not profitable after impact and gas");
             return Ok(None);
         }
         
-        // Determine risk level
+        // Determine risk level using potentially real liquidity
         let risk_level = self.determine_risk_level(
             price_diff_percentage, 
             source_liquidity.min(target_liquidity),
             total_price_impact
         );
         
-        // Create metadata
+        // Create metadata using calculated trade size and parsed pair
         let metadata = ArbitrageMetadata {
-            source_dex,
-            target_dex,
-            token_path: vec![token_pair.0.clone(), token_pair.1.clone(), token_pair.0.clone()],
+            source_dex, 
+            target_dex, 
+            token_path: vec![token_pair.0.clone(), token_pair.1.clone(), token_pair.0.clone()], 
             price_difference_percent: price_diff_percentage,
-            estimated_gas_cost_usd: estimated_gas_cost,
-            optimal_trade_size_usd: optimal_trade_size,
-            price_impact_percent: total_price_impact,
-            source_liquidity_usd: source_liquidity,
-            target_liquidity_usd: target_liquidity,
+            estimated_gas_cost_usd: estimated_gas_cost, 
+            optimal_trade_size_usd: trade_size_usd, // Report the calculated optimal size
+            price_impact_percent: total_price_impact, 
+            source_liquidity_usd: source_liquidity, 
+            target_liquidity_usd: target_liquidity, 
             estimated_instruction_count,
             estimated_compute_units: estimated_instruction_count * self.config.avg_instruction_cu,
             timestamp: chrono::Utc::now().timestamp(),
@@ -530,16 +397,16 @@ impl MevStrategyEvaluator for ArbitrageEvaluator {
               estimated_profit = net_profit,
               "Arbitrage opportunity found");
         
-        // Create the opportunity
+        // Create the opportunity using calculated trade size
         let opportunity = MevOpportunity {
             strategy: MevStrategy::Arbitrage,
             estimated_profit: net_profit,
-            confidence: 0.8, // Can be refined based on data quality
+            confidence: 0.8,
             risk_level,
-            required_capital: 0.0,
+            required_capital: trade_size_usd, // Use calculated optimal size
             execution_time: 500,
-            involved_tokens: vec![token_pair.0.clone(), token_pair.1.clone()],
-            allowed_output_tokens: vec![token_pair.0.clone(), token_pair.1.clone()],
+            involved_tokens: vec![token_pair.0.clone(), token_pair.1.clone()], 
+            allowed_output_tokens: vec![token_pair.0.clone(), token_pair.1.clone()], 
             allowed_programs: vec![],
             max_instructions: 10,
             metadata: serde_json::to_value(metadata)?,

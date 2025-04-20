@@ -1,6 +1,7 @@
 pub mod arbitrage;
 pub mod sandwich;
 pub mod token_snipe;
+pub mod utils; // Add this line
 
 // Remove or uncomment these imports
 use arbitrage::ArbitrageEvaluator;
@@ -710,7 +711,7 @@ pub struct OpportunityEvaluator {
     /// RIG Agent for AI-powered decision enhancement
     rig_agent: Option<Arc<RigAgent>>,
     /// Market data collector
-    market_data_collector: Option<Arc<MarketDataCollector>>,
+    market_data_collector: Arc<MarketDataCollector>, // Store Arc<MarketDataCollector> directly
 }
 
 /// This trait defines the interface for strategy execution services
@@ -722,34 +723,37 @@ pub trait StrategyExecutionService: Send + Sync {
 
 impl OpportunityEvaluator {
     /// Creates a new OpportunityEvaluator with default thresholds.
-    pub async fn new() -> Result<Self> {
+    /// Requires essential services like MarketDataCollector.
+    pub async fn new(
+        market_data_collector: Arc<MarketDataCollector>, // Require collector at creation
+        rig_agent: Option<Arc<RigAgent>>, // Keep RigAgent optional
+    ) -> Result<Self> {
         let thresholds = ExecutionThresholds::default();
         Self::new_with_thresholds(
             thresholds.min_profit_threshold, 
             thresholds.max_risk_level, 
-            0.05, // Default min_profit_percentage, adjust if needed
-            thresholds
+            thresholds,
+            market_data_collector,
+            rig_agent,
         ).await
     }
 
-    /// Creates a new OpportunityEvaluator with specified thresholds.
+    /// Creates a new OpportunityEvaluator with specified thresholds and services.
     pub async fn new_with_thresholds(
         min_profit_threshold: f64,
         max_risk_level: RiskLevel,
-        _min_profit_percentage: f64, // Parameter might be unused now or repurposed
+        // _min_profit_percentage: f64, // Removed unused parameter
         execution_thresholds: ExecutionThresholds,
+        market_data_collector: Arc<MarketDataCollector>, // Accept collector
+        rig_agent: Option<Arc<RigAgent>>, // Accept optional RigAgent
     ) -> Result<Self> {
         info!("Initializing OpportunityEvaluator...");
 
         let registry = StrategyRegistry::new();
-        // Add registration logic here if needed later
-
-        // Removed engine initialization
-        // let (engine, _price_rx) = Engine::from_env().await
-        //     .map_err(|e| SandoError::DependencyError(format!("Failed to create listen-engine: {}", e)))?;
+        // TODO: Register actual evaluator instances here if needed at init
+        // For now, registration happens via `register_evaluator` method
 
         let evaluator = Self {
-            // engine: Arc::new(engine), // Removed engine field assignment
             strategy_registry: registry,
             min_confidence: execution_thresholds.min_confidence,
             max_risk_level,
@@ -757,8 +761,8 @@ impl OpportunityEvaluator {
             active_opportunities: Arc::new(RwLock::new(Vec::new())),
             execution_thresholds,
             strategy_executor: RwLock::new(None), // Initialize executor as None
-            rig_agent: None,
-            market_data_collector: None,
+            rig_agent, // Store passed agent
+            market_data_collector, // Store passed collector
         };
 
         info!("OpportunityEvaluator initialized successfully.");
@@ -860,72 +864,133 @@ impl OpportunityEvaluator {
 
     /// Evaluates incoming data for MEV opportunities across all registered strategies
     pub async fn evaluate_opportunity(&self, data: serde_json::Value) -> Result<Vec<MevOpportunity>> {
+        let start_time = std::time::Instant::now();
         let should_log_detailed = OPPORTUNITY_RATE_LOGGER.should_log() || 
             std::env::var("DETAILED_LOGGING").map(|v| v == "true").unwrap_or(false);
+        
         if should_log_detailed {
             debug!(target: "opportunity_evaluation", data_size = data.to_string().len(), "Starting opportunity evaluation");
         } else {
             trace!(target: "opportunity_evaluation", "Evaluating opportunity data");
         }
+
+        // --- Define common constants ---
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+        const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+        // --- Placeholder: Decode Transaction Context (Task 4.1) ---
+        // TODO: Implement proper transaction decoding here
+        // This decoding should determine the actual input/output tokens, amounts, etc.
+        let signature = data.get("signature").and_then(|s| s.as_str()).unwrap_or("UNKNOWN_SIG");
+        // Placeholder: Determine relevant token pair from decoded context
+        let input_token = SOL_MINT.to_string(); // Placeholder
+        let output_token = USDC_MINT.to_string(); // Placeholder
+        debug!(target: "opportunity_evaluation", tx_sig=%signature, input=%input_token, output=%output_token, "Using PLACEHOLDER token pair");
+        // --- End Placeholder Decoding --- 
+
+        // --- Fetch Market Context (Task 4.2) ---
+        let market_collector = &self.market_data_collector; // Get reference
+        
+        // Fetch SOL price in USDC
+        let sol_usd_price_opt = market_collector
+            .fetch_real_market_data(SOL_MINT, USDC_MINT)
+            .await
+            .map_err(|e| { // Wrap error for context
+                error!(target: "opportunity_evaluation", error=%e, "Failed to fetch SOL/USDC price");
+                e
+             })?;
+
+        // Fetch detailed market data for the target pair
+        // Note: Pool discovery happens inside get_market_data now
+        let pair_market_data_opt = market_collector
+            .get_market_data(&input_token, &output_token)
+            .await
+            .map_err(|e| { // Wrap error for context
+                error!(target: "opportunity_evaluation", input=%input_token, output=%output_token, error=%e, "Failed to get market data for pair");
+                e
+            })?;
+            
+        // Prepare market context to pass down
+        let market_context_value = serde_json::json!({
+            "sol_usd_price": sol_usd_price_opt,
+            "pair_market_data": pair_market_data_opt
+        });
+        debug!(target: "opportunity_evaluation", tx_sig=%signature, ?sol_usd_price_opt, has_pair_data=pair_market_data_opt.is_some(), "Fetched market context");
+        // --- End Fetch Market Context --- 
+
         let mut opportunities = Vec::new();
         for (strategy_name, evaluator) in &self.strategy_registry.evaluators {
-            trace!(target: "opportunity_evaluation::strategy", strategy = ?strategy_name, "Evaluating with strategy");
-            let mut strategy_data = data.clone();
-            if *strategy_name == MevStrategy::Arbitrage {
-                // Extract token pair (for demo, use SOL/USDC)
-                let input_token = "So11111111111111111111111111111111111111112"; // SOL
-                let output_token = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
-                // TODO: Use real extraction from data if available
-                // Hardcoded Raydium/Orca pool addresses for SOL/USDC
-                let raydium_pool = Some(Pubkey::from_str("8HoQnePLqPj4M7PUDzfw8e3Yw1E1Z9Qe7bE9i9P6h9bM").unwrap());
-                let orca_pool = Some(Pubkey::from_str("6UeJjQKk5QnKQ2rYZRk5vjnzzakDx4zYdE3KXy3Q3r5E").unwrap());
-                // Get RPC client (assume available globally or via config)
-                let rpc_client = RpcClient::new("https://api.mainnet-beta.solana.com");
-                // Fetch prices from all DEXes
-                let price_map = self.market_data_collector.as_ref().unwrap().fetch_all_dex_prices(
-                    &rpc_client,
-                    input_token,
-                    output_token,
-                    raydium_pool.as_ref(),
-                    orca_pool.as_ref(),
-                ).await;
-                // Inject into strategy data
-                strategy_data["real_dex_prices"] = serde_json::to_value(price_map).unwrap();
+            trace!(target: "opportunity_evaluation::strategy", strategy = ?strategy_name, tx_sig=%signature, "Evaluating with strategy");
+            
+            // Clone original data and merge market context
+            let mut strategy_data = data.clone(); 
+            if let Some(obj) = strategy_data.as_object_mut() {
+                obj.insert("market_context".to_string(), market_context_value.clone());
+                // TODO: Add decoded transaction context here when available (Task 4.1/4.3)
+                // obj.insert("decoded_context".to_string(), decoded_context_value.clone());
+            } else {
+                 warn!(target: "opportunity_evaluation", tx_sig=%signature, "Input data is not a JSON object, cannot inject context.");
+                 continue; // Skip if data format is unexpected
             }
+            
             match evaluator.evaluate(&strategy_data).await {
                 Ok(Some(mut opportunity)) => {
+                    // Enhance with AI if agent available
+                    if self.rig_agent.is_some() {
+                         if let Err(e) = self.enhance_with_ai(&mut opportunity).await {
+                             warn!(target: "opportunity_evaluation::ai", error = %e, "Failed to enhance opportunity with AI");
+                         }
+                    }
+                    
+                    // Calculate score and decision
                     let score = self.calculate_opportunity_score(&opportunity).await;
                     opportunity.score = Some(score);
                     let decision = self.make_execution_decision(&opportunity).await;
                     opportunity.decision = Some(decision);
+
                     if should_log_detailed || decision == ExecutionDecision::Execute {
                         debug!(
                             target: "opportunity_evaluation::result",
                             strategy = ?strategy_name,
+                            tx_sig = %signature,
                             score,
                             decision = ?decision,
-                            estimated_profit = opportunity.estimated_profit,
+                            profit = opportunity.estimated_profit,
                             "Opportunity evaluated"
                         );
+                        // Optionally log detailed metadata for execution candidates
+                        if decision == ExecutionDecision::Execute {
+                             info!(target: "opportunity_execution_log", opportunity = serde_json::to_string(&opportunity).unwrap_or_default());
+                             // OPPORTUNITY_LOGGER.log_opportunity(&opportunity); // Replace this line
+                             if let Err(log_err) = OPPORTUNITY_LOGGER.log_opportunity_to_file(&opportunity, "logs", true) {
+                                  warn!(target: "opportunity_execution_log", error=%log_err, "Failed to log executed opportunity to file");
+                             }
+                        }
                     }
                     opportunities.push(opportunity);
                 }
                 Ok(None) => {
-                    trace!(target: "opportunity_evaluation::strategy", strategy = ?strategy_name, "No opportunity found for strategy");
+                    trace!(target: "opportunity_evaluation::strategy", strategy = ?strategy_name, tx_sig=%signature, "No opportunity found");
                 }
                 Err(e) => {
                     warn!(
                         target: "opportunity_evaluation::error",
-                        error = ?e,
+                        error = %e,
                         strategy = ?strategy_name,
-                        "Error evaluating with strategy"
+                        tx_sig=%signature,
+                        "Error evaluating strategy"
                     );
                 }
             }
         }
+        
+        let elapsed = start_time.elapsed();
         if !opportunities.is_empty() {
-            info!(target: "opportunity_evaluation::summary", count = opportunities.len(), "Opportunities found");
+            info!(target: "opportunity_evaluation::summary", count = opportunities.len(), duration_ms = elapsed.as_millis(), tx_sig=%signature, "Opportunities found");
+        } else if should_log_detailed {
+             debug!(target: "opportunity_evaluation::summary", duration_ms = elapsed.as_millis(), tx_sig=%signature, "No opportunities found");
         }
+        
         Ok(opportunities)
     }
 
@@ -1323,10 +1388,6 @@ impl OpportunityEvaluator {
         
         Ok(())
     }
-
-    pub async fn set_market_data_collector(&mut self, collector: Arc<MarketDataCollector>) {
-        self.market_data_collector = Some(collector);
-    }
 }
 
 /// Factor that considers strategy-specific metrics
@@ -1640,8 +1701,19 @@ mod tests {
 
     // Helper to create evaluator for tests (panics on error for simplicity)
     async fn create_test_evaluator() -> OpportunityEvaluator {
-        let (engine_instance, _) = Engine::from_env().await
-            .expect("Engine creation failed in test - check environment variables");
+        // let (engine_instance, _) = Engine::from_env().await // Removed engine dependency
+        //     .expect("Engine creation failed in test - check environment variables");
+        
+        // Create a mock MarketDataCollector for testing
+        let price_cache = Arc::new(RwLock::new(HashMap::new()));
+        let historical_data = Arc::new(RwLock::new(HashMap::new()));
+        // Provide a dummy RPC endpoint for the test collector
+        let dummy_rpc = "http://localhost:8899"; // Or any valid-looking URL
+        let market_collector = Arc::new(
+            MarketDataCollector::new(price_cache, historical_data, dummy_rpc)
+                .expect("Failed to create test MarketDataCollector")
+        );
+
         OpportunityEvaluator {
             // engine: Arc::new(engine_instance), // Removed engine field assignment
             strategy_registry: StrategyRegistry::new(),
@@ -1652,7 +1724,7 @@ mod tests {
             execution_thresholds: ExecutionThresholds::default(),
             strategy_executor: RwLock::new(None), // Initialize executor as None
             rig_agent: None,
-            market_data_collector: None,
+            market_data_collector: market_collector, // Use the created collector
         }
     }
 
